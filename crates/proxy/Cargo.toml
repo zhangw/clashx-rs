@@ -1,0 +1,17 @@
+[package]
+name = "clashx-rs-proxy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clashx-rs-config = { path = "../config" }
+clashx-rs-dns = { path = "../dns" }
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+hex.workspace = true
+webpki-roots.workspace = true
+serde.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "clashx-rs-dns"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

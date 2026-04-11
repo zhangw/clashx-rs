@@ -1,0 +1,9 @@
+[package]
+name = "clashx-rs-rule"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clashx-rs-config = { path = "../config" }
+tracing.workspace = true
+anyhow.workspace = true

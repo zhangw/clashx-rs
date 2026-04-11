@@ -1,0 +1,9 @@
+[package]
+name = "clashx-rs-sysproxy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
