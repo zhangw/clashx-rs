@@ -135,6 +135,49 @@ impl DaemonState {
         }
     }
 
+    /// Walk the selection chain from `start`, jumping through proxy groups
+    /// until a leaf proxy, `DIRECT`, or `REJECT` is reached. Returns
+    /// `(innermost_group, resolved)` — the innermost group is what callers
+    /// should use as the failover pool so sibling leaves of the selected one
+    /// can be tried on failure. A cycle, an unknown name, or a chain longer
+    /// than `MAX_SELECTION_DEPTH` falls back to `(None, "DIRECT")` so the
+    /// connection is not dropped post-handshake.
+    fn resolve_selection_chain<'a>(&'a self, start: &'a str) -> (Option<&'a str>, &'a str) {
+        if start == "DIRECT" || start == "REJECT" {
+            return (None, start);
+        }
+
+        // Stack-allocated visited set: chain depth is 1-3 in practice, and
+        // this runs under the state read lock on every connection.
+        const MAX_SELECTION_DEPTH: usize = 8;
+        let mut visited: [&'a str; MAX_SELECTION_DEPTH] = [""; MAX_SELECTION_DEPTH];
+        let mut depth = 0usize;
+        let mut cur: &'a str = start;
+        let mut last_group: Option<&'a str> = None;
+
+        loop {
+            if depth == MAX_SELECTION_DEPTH || visited[..depth].contains(&cur) {
+                return (None, "DIRECT");
+            }
+            visited[depth] = cur;
+            depth += 1;
+
+            let Some(selected) = self.selections.get(cur) else {
+                return if self.proxies.contains_key(cur) {
+                    (last_group, cur)
+                } else {
+                    (None, "DIRECT")
+                };
+            };
+            last_group = Some(cur);
+            let next: &'a str = selected.as_str();
+            if next == "DIRECT" || next == "REJECT" {
+                return (last_group, next);
+            }
+            cur = next;
+        }
+    }
+
     /// Resolve routing for a given input. Returns (group_name, proxy_name).
     /// group_name is Some if the route went through a proxy group, None otherwise.
     fn resolve_routing_with_group<'a>(
@@ -143,33 +186,14 @@ impl DaemonState {
     ) -> (Option<&'a str>, &'a str) {
         match self.config.mode {
             Mode::Direct => (None, "DIRECT"),
-            Mode::Global => {
-                let group = self.config.proxy_groups.first();
-                let proxy = group
-                    .and_then(|g| self.selections.get(&g.name).map(|s| s.as_str()))
-                    .unwrap_or("DIRECT");
-                (group.map(|g| g.name.as_str()), proxy)
-            }
-            Mode::Rule => {
-                let rule_target = self.rule_engine.evaluate(input);
-                match rule_target {
-                    Some(target) => {
-                        if target == "DIRECT" || target == "REJECT" {
-                            return (None, target);
-                        }
-                        // target is a group name
-                        if let Some(selected) = self.selections.get(target) {
-                            return (Some(target), selected.as_str());
-                        }
-                        // target is a direct proxy name (no group)
-                        if self.proxies.contains_key(target) {
-                            return (None, target);
-                        }
-                        (None, "DIRECT")
-                    }
-                    None => (None, "DIRECT"),
-                }
-            }
+            Mode::Global => match self.config.proxy_groups.first() {
+                Some(g) => self.resolve_selection_chain(&g.name),
+                None => (None, "DIRECT"),
+            },
+            Mode::Rule => match self.rule_engine.evaluate(input) {
+                Some(target) => self.resolve_selection_chain(target),
+                None => (None, "DIRECT"),
+            },
         }
     }
 
@@ -1011,5 +1035,93 @@ mod tests {
             2,
             "all-cooled-down should still include all"
         );
+    }
+
+    /// Outer Select group whose first member is another Select group.
+    fn nested_group_config() -> Config {
+        let mut config = test_config();
+        config.proxy_groups.push(ProxyGroup {
+            name: "🐟 漏网之鱼".to_string(),
+            group_type: GroupType::Select,
+            proxies: vec!["🚀 节点选择".to_string(), "DIRECT".to_string()],
+        });
+        config.mode = Mode::Rule;
+        config.rules = vec!["MATCH,🐟 漏网之鱼".to_string()];
+        config
+    }
+
+    #[test]
+    fn nested_group_resolves_to_inner_leaf() {
+        let mut state =
+            DaemonState::from_config(nested_group_config(), PathBuf::from("/tmp/test.yaml"));
+        // Pin the inner selection so the expectation doesn't depend on the
+        // default "first proxy" rule.
+        state
+            .parse_and_apply_overrides(&["🚀 节点选择=🇸🇬 新加坡 01".to_string()])
+            .unwrap();
+
+        let input = MatchInput {
+            host: Some("bun.com"),
+            ip: None,
+            process_name: None,
+        };
+        let (group, proxy) = state.resolve_routing_with_group(&input);
+
+        // The innermost group is returned so failover tries siblings of the
+        // selected leaf, not members of the outer fallback group.
+        assert_eq!(group, Some("🚀 节点选择"));
+        assert_eq!(proxy, "🇸🇬 新加坡 01");
+    }
+
+    #[test]
+    fn nested_group_candidate_list_is_non_empty() {
+        let mut state =
+            DaemonState::from_config(nested_group_config(), PathBuf::from("/tmp/test.yaml"));
+        state
+            .parse_and_apply_overrides(&["🚀 节点选择=🇸🇬 新加坡 01".to_string()])
+            .unwrap();
+
+        let input = MatchInput {
+            host: Some("bun.com"),
+            ip: None,
+            process_name: None,
+        };
+        let (group, _proxy) = state.resolve_routing_with_group(&input);
+        let tracker = CooldownTracker::new();
+        let candidates = state.build_candidate_list(group.unwrap(), &tracker);
+
+        assert!(
+            !candidates.is_empty(),
+            "nested-group resolution must yield a non-empty candidate pool"
+        );
+        assert_eq!(candidates[0].0, "🇸🇬 新加坡 01");
+    }
+
+    #[test]
+    fn selection_chain_cycle_does_not_hang() {
+        let mut config = test_config();
+        config.proxy_groups = vec![
+            ProxyGroup {
+                name: "A".to_string(),
+                group_type: GroupType::Select,
+                proxies: vec!["B".to_string()],
+            },
+            ProxyGroup {
+                name: "B".to_string(),
+                group_type: GroupType::Select,
+                proxies: vec!["A".to_string()],
+            },
+        ];
+        config.mode = Mode::Rule;
+        config.rules = vec!["MATCH,A".to_string()];
+        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+
+        let input = MatchInput {
+            host: Some("example.com"),
+            ip: None,
+            process_name: None,
+        };
+        let (_group, proxy) = state.resolve_routing_with_group(&input);
+        assert_eq!(proxy, "DIRECT");
     }
 }
