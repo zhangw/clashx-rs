@@ -74,6 +74,7 @@ fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>) -> bool {
             }
         }
         RuleEntry::Match { .. } => true,
+        RuleEntry::GeoIp { .. } => false,
     }
 }
 
@@ -336,5 +337,17 @@ mod tests {
             process_name: None,
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
+    }
+
+    #[test]
+    fn geoip_stub_never_matches() {
+        let engine = make_engine(&["GEOIP,CN,DIRECT", "MATCH,Proxy"]);
+        let input = MatchInput {
+            host: Some("baidu.com"),
+            ip: Some("114.114.114.114".parse().unwrap()),
+            process_name: None,
+        };
+        // GEOIP stub is a no-op, so MATCH catches it
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
 }

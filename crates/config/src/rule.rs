@@ -26,6 +26,10 @@ pub enum RuleEntry {
     Match {
         target: String,
     },
+    GeoIp {
+        country: String,
+        target: String,
+    },
 }
 
 impl RuleEntry {
@@ -73,6 +77,10 @@ impl RuleEntry {
             ["MATCH", target] => Some(RuleEntry::Match {
                 target: target.trim().to_string(),
             }),
+            ["GEOIP", country, target] => Some(RuleEntry::GeoIp {
+                country: country.trim().to_uppercase(),
+                target: target.trim().to_string(),
+            }),
             _ => None,
         }
     }
@@ -85,6 +93,7 @@ impl RuleEntry {
             RuleEntry::ProcessName { target, .. } => target,
             RuleEntry::DomainKeyword { target, .. } => target,
             RuleEntry::Match { target } => target,
+            RuleEntry::GeoIp { target, .. } => target,
         }
     }
 }
@@ -145,7 +154,19 @@ mod tests {
 
     #[test]
     fn parse_unknown_returns_none() {
-        assert!(RuleEntry::parse("GEOIP,CN,DIRECT").is_none());
+        assert!(RuleEntry::parse("SRC-IP-CIDR,192.168.0.0/16,DIRECT").is_none());
+    }
+
+    #[test]
+    fn parse_geoip() {
+        let entry = RuleEntry::parse("GEOIP,CN,DIRECT").unwrap();
+        assert_eq!(
+            entry,
+            RuleEntry::GeoIp {
+                country: "CN".to_string(),
+                target: "DIRECT".to_string(),
+            }
+        );
     }
 
     #[test]
