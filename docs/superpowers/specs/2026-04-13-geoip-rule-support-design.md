@@ -6,6 +6,8 @@ clashx-rs parses Clash-compatible YAML configs with a top-to-bottom rule engine.
 
 This change implements real GEOIP matching by loading a MaxMind-format mmdb database, looking up the country code for each connection's IP, and comparing it against the rule's country field. It also provides two ways to obtain the mmdb file, solving the chicken-and-egg problem where the proxy itself is needed to download the database.
 
+**Critical prerequisite**: GEOIP rules need an IP address to look up, but most proxy traffic arrives as domain names (e.g., `baidu.com`). Currently `MatchInput.ip` is only set for IP-literal targets — domain targets have `ip: None`. Without DNS resolution before rule evaluation, GEOIP rules would never match domain-based traffic, making them effectively useless. This spec includes pre-resolve DNS integration to fix this.
+
 ## 2. Architecture
 
 ### New crate: `crates/geoip`
@@ -18,12 +20,14 @@ Isolates all mmdb concerns (file loading, IP-to-country lookup, HTTP download) f
 src/main.rs  (adds mmdb-download subcommand, --mmdb/--mmdb-auto-download flags)
     |
     v
-src/daemon.rs  (loads mmdb, passes GeoIpDb to RuleEngine, spawns auto-download)
+src/daemon.rs  (loads mmdb, pre-resolves DNS, passes GeoIpDb to RuleEngine)
     |
     +---> crates/geoip  (GeoIpDb, download_mmdb)
     |         |
     |         +---> maxminddb   (mmdb parsing)
     |         +---> reqwest     (HTTP download, with socks feature)
+    |
+    +---> crates/dns    (resolve host → IP before rule evaluation)
     |
     +---> crates/rule   (RuleEngine gains Option<Arc<GeoIpDb>> field)
               |
@@ -124,7 +128,80 @@ clashx-rs mmdb-download --url https://my-mirror.example.com/Country.mmdb
 | `--mmdb PATH` | `~/.config/clashx-rs/Country.mmdb` | Override mmdb file path |
 | `--mmdb-auto-download` | false | If mmdb missing, download in background after proxy starts |
 
-## 6. Rule Engine Integration
+## 6. DNS Pre-Resolution for Rule Evaluation
+
+### The problem
+
+Currently `MatchInput.host` and `MatchInput.ip` are mutually exclusive — if the target is a domain, `ip` is `None`. GEOIP (and IP-CIDR) rules need an IP to match against. Without DNS resolution, GEOIP rules are useless for domain-based traffic (which is ~99% of real traffic).
+
+### Solution: pre-resolve in daemon before rule evaluation
+
+The daemon resolves the domain to an IP **before** calling `rule_engine.evaluate()`. Both `host` and `ip` are populated on `MatchInput`. The rule engine stays synchronous — no async changes needed.
+
+The existing `crates/dns` crate provides `pub async fn resolve(host: &str) -> Result<IpAddr>` (currently unused). This is exactly what we need.
+
+### MatchInput changes
+
+File: `crates/rule/src/lib.rs`
+
+`host` and `ip` are **no longer mutually exclusive**:
+
+```rust
+pub struct MatchInput<'a> {
+    pub host: Option<&'a str>,       // domain name (if target is a domain)
+    pub ip: Option<IpAddr>,          // IP address (parsed directly OR resolved from domain)
+    pub process_name: Option<&'a str>,
+}
+```
+
+### Daemon connection handling changes
+
+File: `src/daemon.rs`
+
+Before rule evaluation, the daemon now resolves domains:
+
+```rust
+// Before (current):
+let ip: Option<IpAddr> = target_host.parse().ok();
+let match_input = MatchInput {
+    host: if ip.is_some() { None } else { Some(&target_host) },
+    ip,
+    process_name: ...,
+};
+
+// After (new):
+let parsed_ip: Option<IpAddr> = target_host.parse().ok();
+let resolved_ip = if parsed_ip.is_some() {
+    parsed_ip
+} else {
+    // Domain target: resolve DNS to get IP for GEOIP/IP-CIDR rules
+    match clashx_rs_dns::resolve(&target_host).await {
+        Ok(ip) => Some(ip),
+        Err(e) => {
+            tracing::debug!(host = %target_host, err = %e, "DNS pre-resolve failed, IP-based rules will skip");
+            None
+        }
+    }
+};
+
+let match_input = MatchInput {
+    host: if parsed_ip.is_some() { None } else { Some(&target_host) },
+    ip: resolved_ip,  // populated for BOTH IP literals and resolved domains
+    process_name: ...,
+};
+```
+
+**Key behaviors:**
+- IP-literal target: `host=None`, `ip=Some(parsed)` — same as before
+- Domain target, DNS succeeds: `host=Some("baidu.com")`, `ip=Some(resolved)` — **new: both set**
+- Domain target, DNS fails: `host=Some("baidu.com")`, `ip=None` — GEOIP/IP-CIDR rules skip, domain rules still work
+- DNS failure is **not fatal** — just means IP-based rules won't match this connection
+
+### `no-resolve` support (future)
+
+Clash supports a `no-resolve` suffix on GEOIP and IP-CIDR rules to skip DNS resolution. With pre-resolve, DNS happens unconditionally. A `no-resolve` flag could be parsed and stored on the rule entry to mean "only match if the original target was an IP literal, not a DNS-resolved domain". This is deferred — the current implementation always resolves and always checks.
+
+## 7. Rule Engine Integration
 
 ### RuleEngine changes
 
@@ -158,11 +235,9 @@ RuleEntry::GeoIp { country, .. } => {
 }
 ```
 
-### No changes to MatchInput
+The rule engine itself stays fully synchronous. It just reads whatever `ip` value the daemon put into `MatchInput` — it doesn't care whether that IP was parsed from a literal or resolved from DNS.
 
-`ip: Option<IpAddr>` already exists. GEOIP rules only match when IP is known (IP literal targets or post-DNS-resolution). This matches Clash behavior.
-
-## 7. Daemon Startup Flow
+## 8. Daemon Startup Flow
 
 ```
 1. Load config, parse rules                          (existing)
@@ -184,7 +259,7 @@ RuleEntry::GeoIp { country, .. } => {
 
 On `Reload` control command, the daemon re-opens the mmdb from `mmdb_path`. If it fails, reload still succeeds for config changes — GEOIP remains in its previous state.
 
-## 8. Graceful Degradation
+## 9. Graceful Degradation
 
 | Scenario | Behavior |
 |----------|----------|
@@ -192,12 +267,15 @@ On `Reload` control command, the daemon re-opens the mmdb from `mmdb_path`. If i
 | mmdb corrupt/invalid | Same as missing |
 | mmdb missing + `--mmdb-auto-download` | Proxy starts immediately, background download spawned, GEOIP activates when download completes |
 | Auto-download fails all retries | Warning logged, GEOIP rules remain inactive, proxy fully functional |
-| IP not in mmdb (private range) | GEOIP rule doesn't match, next rule evaluated |
-| `input.ip` is None (domain target) | GEOIP rule doesn't match, next rule evaluated |
+| IP not in mmdb (private range) | `lookup_country` returns None, GEOIP rule doesn't match, next rule evaluated |
+| DNS pre-resolve fails (domain target) | `ip` stays None, GEOIP/IP-CIDR rules skip, domain rules still work, connection proceeds |
+| DNS pre-resolve succeeds | `ip` populated, GEOIP matches against resolved IP |
 
-**Key principle: GEOIP is always optional. The proxy never fails to start due to GEOIP issues.**
+**Key principles:**
+- **GEOIP is always optional.** The proxy never fails to start due to GEOIP issues.
+- **DNS failure is not fatal.** If pre-resolve fails, IP-based rules skip but domain rules and the connection itself still work (outbound `TcpStream::connect` does its own resolution).
 
-## 9. Testing Strategy
+## 10. Testing Strategy
 
 ### Unit tests (automated, CI)
 
@@ -223,10 +301,11 @@ On `Reload` control command, the daemon re-opens the mmdb from `mmdb_path`. If i
 
 - Start daemon → `clashx-rs mmdb-download --proxy socks5://127.0.0.1:7890` → verify file appears
 - Start daemon with `--mmdb-auto-download` → observe hot-swap in logs
-- Config with `GEOIP,CN,DIRECT` → connect to CN IP → verify DIRECT routing
+- Config with `GEOIP,CN,DIRECT` + `MATCH,Proxy` → visit `baidu.com` → verify DNS pre-resolves to CN IP → DIRECT routing
+- Config with `GEOIP,CN,DIRECT` + `MATCH,Proxy` → visit `google.com` → verify DNS resolves to non-CN IP → Proxy routing
 - Start without mmdb → verify warning and proxy works for other rules
 
-## 10. Files to Modify
+## 11. Files to Modify
 
 ### New files
 
@@ -245,5 +324,5 @@ On `Reload` control command, the daemon re-opens the mmdb from `mmdb_path`. If i
 | `crates/rule/Cargo.toml` | Add `clashx-rs-geoip` dependency |
 | `crates/rule/src/lib.rs` | Add `geoip_db` field to `RuleEngine`, change `new()` signature, add `set_geoip_db()`, update `matches_rule()` GEOIP arm, update tests |
 | `src/main.rs` | Add `MmdbDownload` subcommand, add `--mmdb`/`--mmdb-auto-download` to `Run`, implement download handler |
-| `src/daemon.rs` | Add `mmdb_path` to `DaemonState`, load mmdb in startup, pass to `RuleEngine::new`, spawn auto-download task, update reload |
+| `src/daemon.rs` | Add `mmdb_path` to `DaemonState`, load mmdb in startup, pass to `RuleEngine::new`, spawn auto-download task, update reload, **add DNS pre-resolve before rule evaluation** (use `clashx_rs_dns::resolve`), populate `MatchInput.ip` for domain targets |
 | `src/paths.rs` | Add `default_mmdb_path()` |
