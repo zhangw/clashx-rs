@@ -16,30 +16,52 @@ pub struct RuleEngine {
 
 impl RuleEngine {
     pub fn new(raw_rules: &[String]) -> Self {
-        let rules = raw_rules
+        let rules: Vec<RuleEntry> = raw_rules
             .iter()
-            .filter_map(|s| RuleEntry::parse(s))
+            .filter_map(|s| match RuleEntry::parse(s) {
+                Some(rule) => Some(rule),
+                None => {
+                    let rule_type = s.split(',').next().unwrap_or("unknown");
+                    tracing::warn!(rule_type = %rule_type, raw = %s, "unrecognized rule type, skipping");
+                    None
+                }
+            })
             .collect();
+
+        let geoip_count = rules
+            .iter()
+            .filter(|r| matches!(r, RuleEntry::GeoIp { .. }))
+            .count();
+        if geoip_count > 0 {
+            tracing::warn!(
+                count = geoip_count,
+                "GEOIP rules parsed but not yet functional (stub), will not match any traffic"
+            );
+        }
+
         Self { rules }
     }
 
     pub fn evaluate<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a str> {
+        let host_lower = input.host.map(|h| h.to_lowercase());
         self.rules
             .iter()
-            .find(|rule| matches_rule(rule, input))
+            .find(|rule| matches_rule(rule, input, host_lower.as_deref()))
             .map(|rule| rule.target())
     }
 }
 
-fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>) -> bool {
+fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>, host_lower: Option<&str>) -> bool {
     match rule {
-        RuleEntry::DomainSuffix { suffix, .. } => {
-            if let Some(host) = input.host {
-                let host_lower = host.to_lowercase();
-                host_lower == *suffix || host_lower.ends_with(&format!(".{suffix}"))
-            } else {
-                false
-            }
+        RuleEntry::Domain { domain, .. } => host_lower.is_some_and(|h| h == domain.as_str()),
+        RuleEntry::DomainSuffix { suffix, .. } => host_lower.is_some_and(|h| {
+            h == suffix.as_str()
+                || (h.len() > suffix.len()
+                    && h.ends_with(suffix.as_str())
+                    && h.as_bytes()[h.len() - suffix.len() - 1] == b'.')
+        }),
+        RuleEntry::DomainKeyword { keyword, .. } => {
+            host_lower.is_some_and(|h| h.contains(keyword.as_str()))
         }
         RuleEntry::IpCidr {
             ip: network,
@@ -59,6 +81,8 @@ fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>) -> bool {
                 false
             }
         }
+        // Stub: parsed but never matches until maxminddb + DNS rewrite land
+        RuleEntry::GeoIp { .. } => false,
         RuleEntry::Match { .. } => true,
     }
 }
@@ -212,5 +236,141 @@ mod tests {
             process_name: None,
         };
         assert_eq!(engine.evaluate(&input), None);
+    }
+
+    #[test]
+    fn domain_exact_match() {
+        let engine = make_engine(&["DOMAIN,mtalk.google.com,Proxy"]);
+        let input = MatchInput {
+            host: Some("mtalk.google.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn domain_no_subdomain_match() {
+        let engine = make_engine(&["DOMAIN,google.com,Proxy"]);
+        let input = MatchInput {
+            host: Some("www.google.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), None);
+    }
+
+    #[test]
+    fn domain_case_insensitive() {
+        let engine = make_engine(&["DOMAIN,mtalk.google.com,Proxy"]);
+        let input = MatchInput {
+            host: Some("MTALK.GOOGLE.COM"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn domain_keyword_match() {
+        let engine = make_engine(&["DOMAIN-KEYWORD,youtube,Proxy"]);
+        let input = MatchInput {
+            host: Some("www.youtube.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn domain_keyword_no_match() {
+        let engine = make_engine(&["DOMAIN-KEYWORD,youtube,Proxy"]);
+        let input = MatchInput {
+            host: Some("www.google.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), None);
+    }
+
+    #[test]
+    fn domain_keyword_case_insensitive() {
+        let engine = make_engine(&["DOMAIN-KEYWORD,youtube,Proxy"]);
+        let input = MatchInput {
+            host: Some("WWW.YOUTUBE.COM"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn domain_keyword_partial_match() {
+        let engine = make_engine(&["DOMAIN-KEYWORD,ali,DIRECT"]);
+        let input = MatchInput {
+            host: Some("cdn.alicdn.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("DIRECT"));
+    }
+
+    #[test]
+    fn ip_cidr6_match() {
+        let engine = make_engine(&["IP-CIDR6,fd00::/8,DIRECT"]);
+        let input = MatchInput {
+            host: None,
+            ip: Some("fd00::1".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("DIRECT"));
+    }
+
+    #[test]
+    fn ip_cidr6_no_match() {
+        let engine = make_engine(&["IP-CIDR6,fd00::/8,DIRECT"]);
+        let input = MatchInput {
+            host: None,
+            ip: Some("2001:db8::1".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), None);
+    }
+
+    #[test]
+    fn ip_cidr6_loopback() {
+        let engine = make_engine(&["IP-CIDR6,::1/128,DIRECT"]);
+        let input = MatchInput {
+            host: None,
+            ip: Some("::1".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("DIRECT"));
+    }
+
+    #[test]
+    fn unrecognized_rules_are_skipped() {
+        let engine = make_engine(&[
+            "SRC-IP-CIDR,192.168.0.0/16,DIRECT",
+            "DOMAIN-SUFFIX,google.com,Proxy",
+            "MATCH,DIRECT",
+        ]);
+        let input = MatchInput {
+            host: Some("google.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn geoip_stub_never_matches() {
+        let engine = make_engine(&["GEOIP,CN,DIRECT", "MATCH,Proxy"]);
+        let input = MatchInput {
+            host: Some("baidu.com"),
+            ip: Some("114.114.114.114".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
 }
