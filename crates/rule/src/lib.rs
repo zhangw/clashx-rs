@@ -66,6 +66,13 @@ fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>) -> bool {
                 false
             }
         }
+        RuleEntry::DomainKeyword { keyword, .. } => {
+            if let Some(host) = input.host {
+                host.to_lowercase().contains(keyword.as_str())
+            } else {
+                false
+            }
+        }
         RuleEntry::Match { .. } => true,
     }
 }
@@ -252,5 +259,49 @@ mod tests {
             process_name: None,
         };
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn domain_keyword_match() {
+        let engine = make_engine(&["DOMAIN-KEYWORD,youtube,Proxy"]);
+        let input = MatchInput {
+            host: Some("www.youtube.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn domain_keyword_no_match() {
+        let engine = make_engine(&["DOMAIN-KEYWORD,youtube,Proxy"]);
+        let input = MatchInput {
+            host: Some("www.google.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), None);
+    }
+
+    #[test]
+    fn domain_keyword_case_insensitive() {
+        let engine = make_engine(&["DOMAIN-KEYWORD,youtube,Proxy"]);
+        let input = MatchInput {
+            host: Some("WWW.YOUTUBE.COM"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn domain_keyword_partial_match() {
+        let engine = make_engine(&["DOMAIN-KEYWORD,ali,DIRECT"]);
+        let input = MatchInput {
+            host: Some("cdn.alicdn.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
 }

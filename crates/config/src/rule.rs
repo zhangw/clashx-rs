@@ -19,6 +19,10 @@ pub enum RuleEntry {
         name: String,
         target: String,
     },
+    DomainKeyword {
+        keyword: String,
+        target: String,
+    },
     Match {
         target: String,
     },
@@ -51,6 +55,10 @@ impl RuleEntry {
                 name: name.trim().to_string(),
                 target: target.trim().to_string(),
             }),
+            ["DOMAIN-KEYWORD", keyword, target] => Some(RuleEntry::DomainKeyword {
+                keyword: keyword.trim().to_lowercase(),
+                target: target.trim().to_string(),
+            }),
             ["MATCH", target] => Some(RuleEntry::Match {
                 target: target.trim().to_string(),
             }),
@@ -64,6 +72,7 @@ impl RuleEntry {
             RuleEntry::Domain { target, .. } => target,
             RuleEntry::IpCidr { target, .. } => target,
             RuleEntry::ProcessName { target, .. } => target,
+            RuleEntry::DomainKeyword { target, .. } => target,
             RuleEntry::Match { target } => target,
         }
     }
@@ -157,6 +166,28 @@ mod tests {
             assert_eq!(domain, "mtalk.google.com");
         } else {
             panic!("expected Domain");
+        }
+    }
+
+    #[test]
+    fn parse_domain_keyword() {
+        let entry = RuleEntry::parse("DOMAIN-KEYWORD,youtube,Proxy").unwrap();
+        assert_eq!(
+            entry,
+            RuleEntry::DomainKeyword {
+                keyword: "youtube".to_string(),
+                target: "Proxy".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn domain_keyword_lowercased() {
+        let entry = RuleEntry::parse("DOMAIN-KEYWORD,YouTube,Proxy").unwrap();
+        if let RuleEntry::DomainKeyword { keyword, .. } = entry {
+            assert_eq!(keyword, "youtube");
+        } else {
+            panic!("expected DomainKeyword");
         }
     }
 }
