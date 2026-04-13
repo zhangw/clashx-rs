@@ -47,6 +47,17 @@ impl RuleEntry {
                     target: target.trim().to_string(),
                 })
             }
+            ["IP-CIDR6", cidr, target] => {
+                let cidr = cidr.trim();
+                let (ip_str, prefix_str) = cidr.split_once('/')?;
+                let ip: IpAddr = ip_str.parse().ok()?;
+                let prefix_len: u8 = prefix_str.parse().ok()?;
+                Some(RuleEntry::IpCidr {
+                    ip,
+                    prefix_len,
+                    target: target.trim().to_string(),
+                })
+            }
             ["DOMAIN", domain, target] => Some(RuleEntry::Domain {
                 domain: domain.trim().to_lowercase(),
                 target: target.trim().to_string(),
@@ -189,5 +200,31 @@ mod tests {
         } else {
             panic!("expected DomainKeyword");
         }
+    }
+
+    #[test]
+    fn parse_ip_cidr6() {
+        let entry = RuleEntry::parse("IP-CIDR6,::1/128,DIRECT").unwrap();
+        assert_eq!(
+            entry,
+            RuleEntry::IpCidr {
+                ip: "::1".parse::<IpAddr>().unwrap(),
+                prefix_len: 128,
+                target: "DIRECT".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_ip_cidr6_ula() {
+        let entry = RuleEntry::parse("IP-CIDR6,fd00::/8,DIRECT").unwrap();
+        assert_eq!(
+            entry,
+            RuleEntry::IpCidr {
+                ip: "fd00::".parse::<IpAddr>().unwrap(),
+                prefix_len: 8,
+                target: "DIRECT".to_string(),
+            }
+        );
     }
 }

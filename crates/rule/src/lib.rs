@@ -304,4 +304,37 @@ mod tests {
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
+
+    #[test]
+    fn ip_cidr6_match() {
+        let engine = make_engine(&["IP-CIDR6,fd00::/8,DIRECT"]);
+        let input = MatchInput {
+            host: None,
+            ip: Some("fd00::1".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("DIRECT"));
+    }
+
+    #[test]
+    fn ip_cidr6_no_match() {
+        let engine = make_engine(&["IP-CIDR6,fd00::/8,DIRECT"]);
+        let input = MatchInput {
+            host: None,
+            ip: Some("2001:db8::1".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), None);
+    }
+
+    #[test]
+    fn ip_cidr6_loopback() {
+        let engine = make_engine(&["IP-CIDR6,::1/128,DIRECT"]);
+        let input = MatchInput {
+            host: None,
+            ip: Some("::1".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("DIRECT"));
+    }
 }
