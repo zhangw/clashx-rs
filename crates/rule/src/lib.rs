@@ -59,6 +59,13 @@ fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>) -> bool {
                 false
             }
         }
+        RuleEntry::Domain { domain, .. } => {
+            if let Some(host) = input.host {
+                host.to_lowercase() == *domain
+            } else {
+                false
+            }
+        }
         RuleEntry::Match { .. } => true,
     }
 }
@@ -212,5 +219,38 @@ mod tests {
             process_name: None,
         };
         assert_eq!(engine.evaluate(&input), None);
+    }
+
+    #[test]
+    fn domain_exact_match() {
+        let engine = make_engine(&["DOMAIN,mtalk.google.com,Proxy"]);
+        let input = MatchInput {
+            host: Some("mtalk.google.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn domain_no_subdomain_match() {
+        let engine = make_engine(&["DOMAIN,google.com,Proxy"]);
+        let input = MatchInput {
+            host: Some("www.google.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), None);
+    }
+
+    #[test]
+    fn domain_case_insensitive() {
+        let engine = make_engine(&["DOMAIN,mtalk.google.com,Proxy"]);
+        let input = MatchInput {
+            host: Some("MTALK.GOOGLE.COM"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
 }

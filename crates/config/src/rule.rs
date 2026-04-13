@@ -6,6 +6,10 @@ pub enum RuleEntry {
         suffix: String,
         target: String,
     },
+    Domain {
+        domain: String,
+        target: String,
+    },
     IpCidr {
         ip: IpAddr,
         prefix_len: u8,
@@ -39,6 +43,10 @@ impl RuleEntry {
                     target: target.trim().to_string(),
                 })
             }
+            ["DOMAIN", domain, target] => Some(RuleEntry::Domain {
+                domain: domain.trim().to_lowercase(),
+                target: target.trim().to_string(),
+            }),
             ["PROCESS-NAME", name, target] => Some(RuleEntry::ProcessName {
                 name: name.trim().to_string(),
                 target: target.trim().to_string(),
@@ -53,6 +61,7 @@ impl RuleEntry {
     pub fn target(&self) -> &str {
         match self {
             RuleEntry::DomainSuffix { target, .. } => target,
+            RuleEntry::Domain { target, .. } => target,
             RuleEntry::IpCidr { target, .. } => target,
             RuleEntry::ProcessName { target, .. } => target,
             RuleEntry::Match { target } => target,
@@ -126,6 +135,28 @@ mod tests {
             assert_eq!(suffix, "example.com");
         } else {
             panic!("expected DomainSuffix");
+        }
+    }
+
+    #[test]
+    fn parse_domain() {
+        let entry = RuleEntry::parse("DOMAIN,mtalk.google.com,Proxy").unwrap();
+        assert_eq!(
+            entry,
+            RuleEntry::Domain {
+                domain: "mtalk.google.com".to_string(),
+                target: "Proxy".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn domain_lowercased() {
+        let entry = RuleEntry::parse("DOMAIN,MTALK.Google.COM,Proxy").unwrap();
+        if let RuleEntry::Domain { domain, .. } = entry {
+            assert_eq!(domain, "mtalk.google.com");
+        } else {
+            panic!("expected Domain");
         }
     }
 }
