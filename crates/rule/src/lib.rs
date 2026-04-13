@@ -43,22 +43,25 @@ impl RuleEngine {
     }
 
     pub fn evaluate<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a str> {
+        let host_lower = input.host.map(|h| h.to_lowercase());
         self.rules
             .iter()
-            .find(|rule| matches_rule(rule, input))
+            .find(|rule| matches_rule(rule, input, host_lower.as_deref()))
             .map(|rule| rule.target())
     }
 }
 
-fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>) -> bool {
+fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>, host_lower: Option<&str>) -> bool {
     match rule {
-        RuleEntry::DomainSuffix { suffix, .. } => {
-            if let Some(host) = input.host {
-                let host_lower = host.to_lowercase();
-                host_lower == *suffix || host_lower.ends_with(&format!(".{suffix}"))
-            } else {
-                false
-            }
+        RuleEntry::Domain { domain, .. } => host_lower.is_some_and(|h| h == domain.as_str()),
+        RuleEntry::DomainSuffix { suffix, .. } => host_lower.is_some_and(|h| {
+            h == suffix.as_str()
+                || (h.len() > suffix.len()
+                    && h.ends_with(suffix.as_str())
+                    && h.as_bytes()[h.len() - suffix.len() - 1] == b'.')
+        }),
+        RuleEntry::DomainKeyword { keyword, .. } => {
+            host_lower.is_some_and(|h| h.contains(keyword.as_str()))
         }
         RuleEntry::IpCidr {
             ip: network,
@@ -78,22 +81,9 @@ fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>) -> bool {
                 false
             }
         }
-        RuleEntry::Domain { domain, .. } => {
-            if let Some(host) = input.host {
-                host.to_lowercase() == *domain
-            } else {
-                false
-            }
-        }
-        RuleEntry::DomainKeyword { keyword, .. } => {
-            if let Some(host) = input.host {
-                host.to_lowercase().contains(keyword.as_str())
-            } else {
-                false
-            }
-        }
-        RuleEntry::Match { .. } => true,
+        // Stub: parsed but never matches until maxminddb + DNS rewrite land
         RuleEntry::GeoIp { .. } => false,
+        RuleEntry::Match { .. } => true,
     }
 }
 
@@ -360,7 +350,6 @@ mod tests {
 
     #[test]
     fn unrecognized_rules_are_skipped() {
-        // Engine should still work — unrecognized rules are dropped, not fatal
         let engine = make_engine(&[
             "SRC-IP-CIDR,192.168.0.0/16,DIRECT",
             "DOMAIN-SUFFIX,google.com,Proxy",
@@ -382,7 +371,6 @@ mod tests {
             ip: Some("114.114.114.114".parse().unwrap()),
             process_name: None,
         };
-        // GEOIP stub is a no-op, so MATCH catches it
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
 }

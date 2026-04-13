@@ -2,12 +2,16 @@ use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleEntry {
+    Domain {
+        domain: String,
+        target: String,
+    },
     DomainSuffix {
         suffix: String,
         target: String,
     },
-    Domain {
-        domain: String,
+    DomainKeyword {
+        keyword: String,
         target: String,
     },
     IpCidr {
@@ -19,15 +23,12 @@ pub enum RuleEntry {
         name: String,
         target: String,
     },
-    DomainKeyword {
-        keyword: String,
+    /// Stub: parsed but never matches. Real implementation deferred until DNS rewrite + maxminddb.
+    GeoIp {
+        country: String,
         target: String,
     },
     Match {
-        target: String,
-    },
-    GeoIp {
-        country: String,
         target: String,
     },
 }
@@ -36,49 +37,38 @@ impl RuleEntry {
     pub fn parse(raw: &str) -> Option<RuleEntry> {
         let parts: Vec<&str> = raw.splitn(3, ',').collect();
         match parts.as_slice() {
-            ["DOMAIN-SUFFIX", suffix, target] => Some(RuleEntry::DomainSuffix {
-                suffix: suffix.trim().to_lowercase(),
-                target: target.trim().to_string(),
-            }),
-            ["IP-CIDR", cidr, target] => {
-                let cidr = cidr.trim();
-                let (ip_str, prefix_str) = cidr.split_once('/')?;
-                let ip: IpAddr = ip_str.parse().ok()?;
-                let prefix_len: u8 = prefix_str.parse().ok()?;
-                Some(RuleEntry::IpCidr {
-                    ip,
-                    prefix_len,
-                    target: target.trim().to_string(),
-                })
-            }
-            ["IP-CIDR6", cidr, target] => {
-                let cidr = cidr.trim();
-                let (ip_str, prefix_str) = cidr.split_once('/')?;
-                let ip: IpAddr = ip_str.parse().ok()?;
-                let prefix_len: u8 = prefix_str.parse().ok()?;
-                Some(RuleEntry::IpCidr {
-                    ip,
-                    prefix_len,
-                    target: target.trim().to_string(),
-                })
-            }
             ["DOMAIN", domain, target] => Some(RuleEntry::Domain {
                 domain: domain.trim().to_lowercase(),
                 target: target.trim().to_string(),
             }),
-            ["PROCESS-NAME", name, target] => Some(RuleEntry::ProcessName {
-                name: name.trim().to_string(),
+            ["DOMAIN-SUFFIX", suffix, target] => Some(RuleEntry::DomainSuffix {
+                suffix: suffix.trim().to_lowercase(),
                 target: target.trim().to_string(),
             }),
             ["DOMAIN-KEYWORD", keyword, target] => Some(RuleEntry::DomainKeyword {
                 keyword: keyword.trim().to_lowercase(),
                 target: target.trim().to_string(),
             }),
-            ["MATCH", target] => Some(RuleEntry::Match {
+            ["IP-CIDR" | "IP-CIDR6", cidr, target] => {
+                let cidr = cidr.trim();
+                let (ip_str, prefix_str) = cidr.split_once('/')?;
+                let ip: IpAddr = ip_str.parse().ok()?;
+                let prefix_len: u8 = prefix_str.parse().ok()?;
+                Some(RuleEntry::IpCidr {
+                    ip,
+                    prefix_len,
+                    target: target.trim().to_string(),
+                })
+            }
+            ["PROCESS-NAME", name, target] => Some(RuleEntry::ProcessName {
+                name: name.trim().to_string(),
                 target: target.trim().to_string(),
             }),
             ["GEOIP", country, target] => Some(RuleEntry::GeoIp {
                 country: country.trim().to_uppercase(),
+                target: target.trim().to_string(),
+            }),
+            ["MATCH", target] => Some(RuleEntry::Match {
                 target: target.trim().to_string(),
             }),
             _ => None,
@@ -87,13 +77,13 @@ impl RuleEntry {
 
     pub fn target(&self) -> &str {
         match self {
-            RuleEntry::DomainSuffix { target, .. } => target,
-            RuleEntry::Domain { target, .. } => target,
-            RuleEntry::IpCidr { target, .. } => target,
-            RuleEntry::ProcessName { target, .. } => target,
-            RuleEntry::DomainKeyword { target, .. } => target,
-            RuleEntry::Match { target } => target,
-            RuleEntry::GeoIp { target, .. } => target,
+            RuleEntry::Domain { target, .. }
+            | RuleEntry::DomainSuffix { target, .. }
+            | RuleEntry::DomainKeyword { target, .. }
+            | RuleEntry::IpCidr { target, .. }
+            | RuleEntry::ProcessName { target, .. }
+            | RuleEntry::GeoIp { target, .. }
+            | RuleEntry::Match { target } => target,
         }
     }
 }
