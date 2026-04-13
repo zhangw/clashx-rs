@@ -16,10 +16,29 @@ pub struct RuleEngine {
 
 impl RuleEngine {
     pub fn new(raw_rules: &[String]) -> Self {
-        let rules = raw_rules
+        let rules: Vec<RuleEntry> = raw_rules
             .iter()
-            .filter_map(|s| RuleEntry::parse(s))
+            .filter_map(|s| match RuleEntry::parse(s) {
+                Some(rule) => Some(rule),
+                None => {
+                    let rule_type = s.split(',').next().unwrap_or("unknown");
+                    tracing::warn!(rule_type = %rule_type, raw = %s, "unrecognized rule type, skipping");
+                    None
+                }
+            })
             .collect();
+
+        let geoip_count = rules
+            .iter()
+            .filter(|r| matches!(r, RuleEntry::GeoIp { .. }))
+            .count();
+        if geoip_count > 0 {
+            tracing::warn!(
+                count = geoip_count,
+                "GEOIP rules parsed but not yet functional (stub), will not match any traffic"
+            );
+        }
+
         Self { rules }
     }
 
@@ -337,6 +356,22 @@ mod tests {
             process_name: None,
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
+    }
+
+    #[test]
+    fn unrecognized_rules_are_skipped() {
+        // Engine should still work — unrecognized rules are dropped, not fatal
+        let engine = make_engine(&[
+            "SRC-IP-CIDR,192.168.0.0/16,DIRECT",
+            "DOMAIN-SUFFIX,google.com,Proxy",
+            "MATCH,DIRECT",
+        ]);
+        let input = MatchInput {
+            host: Some("google.com"),
+            ip: None,
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
 
     #[test]
