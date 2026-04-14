@@ -40,10 +40,28 @@ struct DaemonState {
     startup_overrides: Vec<(String, String)>,
     cooldown: Arc<crate::retry::CooldownTracker>,
     mmdb_path: PathBuf,
+    nameservers: Vec<IpAddr>,
 }
 
 impl DaemonState {
     fn from_config(config: Config, config_path: PathBuf, mmdb_path: PathBuf) -> Self {
+        // Extract plain IP nameservers from dns config for direct DNS queries.
+        // Skip DoH/DoT URLs — only use plain IPs (e.g., 223.5.5.5, 119.29.29.29).
+        let nameservers: Vec<IpAddr> = config
+            .dns
+            .as_ref()
+            .map(|d| {
+                d.nameserver
+                    .iter()
+                    .chain(d.default_nameserver.iter())
+                    .filter_map(|s| s.parse::<IpAddr>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !nameservers.is_empty() {
+            tracing::info!(?nameservers, "using config nameservers for DNS pre-resolve");
+        }
+
         let geoip_db = match GeoIpDb::open(&mmdb_path) {
             Ok(db) => {
                 tracing::info!(path = %mmdb_path.display(), "GeoIP database loaded");
@@ -80,6 +98,7 @@ impl DaemonState {
             startup_overrides: Vec::new(),
             cooldown: Arc::new(crate::retry::CooldownTracker::new()),
             mmdb_path,
+            nameservers,
         }
     }
 
@@ -513,12 +532,18 @@ async fn handle_connection(
     let parsed_ip: Option<std::net::IpAddr> = target_host.parse().ok();
 
     // DNS pre-resolve: if target is a domain and config has IP-based rules (GEOIP/IP-CIDR),
-    // resolve to IP so those rules can match. Skip the resolve entirely when no such rules exist.
-    let needs_resolve = parsed_ip.is_none() && state.read().await.rule_engine.needs_resolved_ip();
+    // resolve to IP so those rules can match. Uses config nameservers directly (bypasses
+    // system proxy) to get accurate IPs for GEOIP matching.
+    let (needs_resolve, nameservers) = if parsed_ip.is_none() {
+        let st = state.read().await;
+        (st.rule_engine.needs_resolved_ip(), st.nameservers.clone())
+    } else {
+        (false, Vec::new())
+    };
     let resolved_ip = if parsed_ip.is_some() {
         parsed_ip
     } else if needs_resolve {
-        match clashx_rs_dns::resolve(&target_host).await {
+        match clashx_rs_dns::resolve_with_nameservers(&target_host, &nameservers).await {
             Ok(ip) => {
                 tracing::debug!(host = %target_host, resolved = %ip, "DNS pre-resolved");
                 Some(ip)
