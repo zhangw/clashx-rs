@@ -43,9 +43,14 @@ impl RuleEngine {
             );
         }
 
-        let has_ip_rules = rules
-            .iter()
-            .any(|r| matches!(r, RuleEntry::GeoIp { .. } | RuleEntry::IpCidr { .. }));
+        // Only count GEOIP rules as "needs IP" when we actually have an mmdb
+        // to evaluate them against — otherwise the rule can never match and
+        // we'd pay for DNS pre-resolve for nothing. IP-CIDR rules always count.
+        let has_ip_rules = rules.iter().any(|r| match r {
+            RuleEntry::IpCidr { .. } => true,
+            RuleEntry::GeoIp { .. } => geoip_db.is_some(),
+            _ => false,
+        });
 
         // Tell the scanner which process names to watch; it skips all others.
         let process_targets: Vec<&str> = rules
