@@ -1,8 +1,10 @@
 pub mod process;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use clashx_rs_config::rule::RuleEntry;
+use clashx_rs_geoip::GeoIpDb;
 
 pub struct MatchInput<'a> {
     pub host: Option<&'a str>,
@@ -12,10 +14,11 @@ pub struct MatchInput<'a> {
 
 pub struct RuleEngine {
     rules: Vec<RuleEntry>,
+    geoip_db: Option<Arc<GeoIpDb>>,
 }
 
 impl RuleEngine {
-    pub fn new(raw_rules: &[String]) -> Self {
+    pub fn new(raw_rules: &[String], geoip_db: Option<Arc<GeoIpDb>>) -> Self {
         let rules: Vec<RuleEntry> = raw_rules
             .iter()
             .filter_map(|s| match RuleEntry::parse(s) {
@@ -32,26 +35,37 @@ impl RuleEngine {
             .iter()
             .filter(|r| matches!(r, RuleEntry::GeoIp { .. }))
             .count();
-        if geoip_count > 0 {
+        if geoip_count > 0 && geoip_db.is_none() {
             tracing::warn!(
                 count = geoip_count,
-                "GEOIP rules parsed but not yet functional (stub), will not match any traffic"
+                "GEOIP rules present but no mmdb loaded — rules will not match"
             );
         }
 
-        Self { rules }
+        Self { rules, geoip_db }
+    }
+
+    /// Hot-swap the GeoIP database (called after background download completes).
+    pub fn set_geoip_db(&mut self, db: Arc<GeoIpDb>) {
+        self.geoip_db = Some(db);
+        tracing::info!("GeoIP database hot-swapped, GEOIP rules now active");
     }
 
     pub fn evaluate<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a str> {
         let host_lower = input.host.map(|h| h.to_lowercase());
         self.rules
             .iter()
-            .find(|rule| matches_rule(rule, input, host_lower.as_deref()))
+            .find(|rule| matches_rule(rule, input, host_lower.as_deref(), self.geoip_db.as_deref()))
             .map(|rule| rule.target())
     }
 }
 
-fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>, host_lower: Option<&str>) -> bool {
+fn matches_rule(
+    rule: &RuleEntry,
+    input: &MatchInput<'_>,
+    host_lower: Option<&str>,
+    geoip_db: Option<&GeoIpDb>,
+) -> bool {
     match rule {
         RuleEntry::Domain { domain, .. } => host_lower.is_some_and(|h| h == domain.as_str()),
         RuleEntry::DomainSuffix { suffix, .. } => host_lower.is_some_and(|h| {
@@ -81,8 +95,13 @@ fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>, host_lower: Option<&st
                 false
             }
         }
-        // Stub: parsed but never matches until maxminddb + DNS rewrite land
-        RuleEntry::GeoIp { .. } => false,
+        RuleEntry::GeoIp { country, .. } => {
+            let Some(db) = geoip_db else { return false };
+            let Some(ip) = input.ip else { return false };
+            db.lookup_country(ip)
+                .map(|c| c == *country)
+                .unwrap_or(false)
+        }
         RuleEntry::Match { .. } => true,
     }
 }
@@ -125,7 +144,18 @@ mod tests {
 
     fn make_engine(rules: &[&str]) -> RuleEngine {
         let raw: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
-        RuleEngine::new(&raw)
+        RuleEngine::new(&raw, None)
+    }
+
+    fn make_engine_with_geoip(rules: &[&str], db: Arc<GeoIpDb>) -> RuleEngine {
+        let raw: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
+        RuleEngine::new(&raw, Some(db))
+    }
+
+    fn test_geoip_db() -> Arc<GeoIpDb> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../geoip/tests/fixtures/GeoIP2-Country-Test.mmdb");
+        Arc::new(GeoIpDb::open(&path).unwrap())
     }
 
     #[test]
@@ -364,13 +394,103 @@ mod tests {
     }
 
     #[test]
-    fn geoip_stub_never_matches() {
-        let engine = make_engine(&["GEOIP,CN,DIRECT", "MATCH,Proxy"]);
+    fn geoip_no_match_when_db_absent() {
+        let engine = make_engine(&["GEOIP,GB,DIRECT", "MATCH,Proxy"]);
         let input = MatchInput {
-            host: Some("baidu.com"),
-            ip: Some("114.114.114.114".parse().unwrap()),
+            host: None,
+            ip: Some("2.125.160.216".parse().unwrap()),
+            process_name: None,
+        };
+        // Without a db, GEOIP rules always return false → falls through to MATCH
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn geoip_matches_when_db_present() {
+        let db = test_geoip_db();
+        let engine = make_engine_with_geoip(&["GEOIP,GB,DIRECT", "MATCH,Proxy"], db);
+        let input = MatchInput {
+            host: None,
+            // 2.125.160.216 → GB in MaxMind test data
+            ip: Some("2.125.160.216".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("DIRECT"));
+    }
+
+    #[test]
+    fn geoip_no_match_wrong_country() {
+        let db = test_geoip_db();
+        let engine = make_engine_with_geoip(&["GEOIP,CN,DIRECT", "MATCH,Proxy"], db);
+        let input = MatchInput {
+            host: None,
+            // 2.125.160.216 → GB, not CN
+            ip: Some("2.125.160.216".parse().unwrap()),
             process_name: None,
         };
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn geoip_no_match_when_ip_none() {
+        let db = test_geoip_db();
+        let engine = make_engine_with_geoip(&["GEOIP,GB,DIRECT", "MATCH,Proxy"], db);
+        let input = MatchInput {
+            host: Some("example.com"),
+            ip: None,
+            process_name: None,
+        };
+        // ip is None → GEOIP can't match → falls through to MATCH
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn geoip_rule_ordering() {
+        let db = test_geoip_db();
+        let engine = make_engine_with_geoip(
+            &[
+                "DOMAIN-SUFFIX,example.com,Proxy",
+                "GEOIP,GB,DIRECT",
+                "MATCH,Fallback",
+            ],
+            db,
+        );
+
+        // Domain rule matches first
+        let input1 = MatchInput {
+            host: Some("example.com"),
+            ip: Some("2.125.160.216".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input1), Some("Proxy"));
+
+        // GEOIP matches for non-domain-matched traffic
+        let input2 = MatchInput {
+            host: Some("other.co.uk"),
+            ip: Some("2.125.160.216".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input2), Some("DIRECT"));
+
+        // Falls through to MATCH for non-GB IP
+        let input3 = MatchInput {
+            host: Some("other.se"),
+            ip: Some("192.168.1.1".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input3), Some("Fallback"));
+    }
+
+    #[test]
+    fn geoip_ipv6_match() {
+        let db = test_geoip_db();
+        let engine = make_engine_with_geoip(&["GEOIP,JP,DIRECT", "MATCH,Proxy"], db);
+        let input = MatchInput {
+            host: None,
+            // 2001:218::1 → JP in MaxMind test data
+            ip: Some("2001:218::1".parse().unwrap()),
+            process_name: None,
+        };
+        assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
 }

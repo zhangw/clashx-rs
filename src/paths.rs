@@ -14,3 +14,7 @@ pub fn socket_path() -> PathBuf {
 pub fn pid_path() -> PathBuf {
     runtime_dir().join("clashx-rs.pid")
 }
+
+pub fn default_mmdb_path() -> PathBuf {
+    runtime_dir().join("Country.mmdb")
+}

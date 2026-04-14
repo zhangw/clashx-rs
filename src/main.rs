@@ -34,6 +34,12 @@ enum Command {
         /// Override the selected proxy in a group at startup (GROUP=PROXY)
         #[arg(long = "select", value_name = "GROUP=PROXY")]
         selections: Vec<String>,
+        /// Path to the GeoIP mmdb database file
+        #[arg(long = "mmdb")]
+        mmdb: Option<String>,
+        /// If mmdb is missing, download it in the background after proxy starts
+        #[arg(long = "mmdb-auto-download")]
+        mmdb_auto_download: bool,
     },
     /// Stop the running daemon
     Stop,
@@ -63,6 +69,18 @@ enum Command {
     Sysproxy {
         #[command(subcommand)]
         action: SysproxyAction,
+    },
+    /// Download the GeoIP mmdb database
+    MmdbDownload {
+        /// SOCKS5 or HTTP proxy URL for the download
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Override the download URL
+        #[arg(long)]
+        url: Option<String>,
+        /// Output file path
+        #[arg(long)]
+        output: Option<String>,
     },
 }
 
@@ -99,15 +117,20 @@ fn main() -> Result<()> {
             config,
             daemon,
             selections,
+            mmdb,
+            mmdb_auto_download,
         } => {
             rustls::crypto::ring::default_provider()
                 .install_default()
                 .ok();
             let config_path = expand_tilde(&config);
+            let mmdb_path = mmdb
+                .map(|p| expand_tilde(&p))
+                .unwrap_or_else(paths::default_mmdb_path);
             if daemon {
-                daemon::start_background(&config_path, &selections)?;
+                daemon::start_background(&config_path, &selections, mmdb_path, mmdb_auto_download)?;
             } else {
-                daemon::start_foreground(&config_path, &selections)?;
+                daemon::start_foreground(&config_path, &selections, mmdb_path, mmdb_auto_download)?;
             }
         }
 
@@ -140,6 +163,30 @@ fn main() -> Result<()> {
                     println!("{status}");
                 }
             }
+        }
+
+        Command::MmdbDownload { proxy, url, output } => {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .ok();
+            let output_path = output
+                .map(|p| expand_tilde(&p))
+                .unwrap_or_else(paths::default_mmdb_path);
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                clashx_rs_geoip::download::download_mmdb(
+                    url.as_deref(),
+                    proxy.as_deref(),
+                    &output_path,
+                )
+                .await
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            println!("mmdb downloaded to {}", output_path.display());
         }
     }
 

@@ -1,10 +1,11 @@
 [package]
-name = "clashx-rs-rule"
+name = "clashx-rs-geoip"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-clashx-rs-config = { path = "../config" }
-clashx-rs-geoip = { path = "../geoip" }
+maxminddb.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true

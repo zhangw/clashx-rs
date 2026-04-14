@@ -4,7 +4,7 @@ use clashx_rs_rule::{MatchInput, RuleEngine};
 
 fn make_engine(rules: &[&str]) -> RuleEngine {
     let raw: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
-    RuleEngine::new(&raw)
+    RuleEngine::new(&raw, None)
 }
 
 /// Rule set derived from the real WgetCloud.yaml config.

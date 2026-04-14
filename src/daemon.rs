@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clashx_rs_config::load_config;
 use clashx_rs_config::types::{Config, Mode, Proxy};
+use clashx_rs_geoip::GeoIpDb;
 use clashx_rs_proxy::inbound::{self, InboundResult};
 use clashx_rs_proxy::outbound::{self, OutboundStream};
 use clashx_rs_proxy::relay::relay;
@@ -38,11 +39,23 @@ struct DaemonState {
     selections: HashMap<String, String>,
     startup_overrides: Vec<(String, String)>,
     cooldown: Arc<crate::retry::CooldownTracker>,
+    mmdb_path: PathBuf,
 }
 
 impl DaemonState {
-    fn from_config(config: Config, config_path: PathBuf) -> Self {
-        let rule_engine = RuleEngine::new(&config.rules);
+    fn from_config(config: Config, config_path: PathBuf, mmdb_path: PathBuf) -> Self {
+        let geoip_db = match GeoIpDb::open(&mmdb_path) {
+            Ok(db) => {
+                tracing::info!(path = %mmdb_path.display(), "GeoIP database loaded");
+                Some(Arc::new(db))
+            }
+            Err(e) => {
+                tracing::warn!(path = %mmdb_path.display(), err = %e, "failed to load GeoIP database");
+                None
+            }
+        };
+
+        let rule_engine = RuleEngine::new(&config.rules, geoip_db);
 
         let mut proxies = HashMap::new();
         for p in &config.proxies {
@@ -66,6 +79,7 @@ impl DaemonState {
             selections,
             startup_overrides: Vec::new(),
             cooldown: Arc::new(crate::retry::CooldownTracker::new()),
+            mmdb_path,
         }
     }
 
@@ -264,14 +278,29 @@ impl DaemonState {
     }
 }
 
-pub fn start_foreground(config_path: &Path, selections: &[String]) -> Result<()> {
+pub fn start_foreground(
+    config_path: &Path,
+    selections: &[String],
+    mmdb_path: PathBuf,
+    mmdb_auto_download: bool,
+) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run_daemon(config_path, selections))
+    rt.block_on(run_daemon(
+        config_path,
+        selections,
+        mmdb_path,
+        mmdb_auto_download,
+    ))
 }
 
-pub fn start_background(_config_path: &Path, _selections: &[String]) -> Result<()> {
+pub fn start_background(
+    _config_path: &Path,
+    _selections: &[String],
+    _mmdb_path: PathBuf,
+    _mmdb_auto_download: bool,
+) -> Result<()> {
     println!("background daemon mode is not yet implemented");
     Ok(())
 }
@@ -280,7 +309,12 @@ pub fn start_background(_config_path: &Path, _selections: &[String]) -> Result<(
 // Core daemon loop
 // ---------------------------------------------------------------------------
 
-async fn run_daemon(config_path: &Path, selections: &[String]) -> Result<()> {
+async fn run_daemon(
+    config_path: &Path,
+    selections: &[String],
+    mmdb_path: PathBuf,
+    mmdb_auto_download: bool,
+) -> Result<()> {
     let config = load_config(config_path)?;
     let port = config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT);
     let allow_lan = config.allow_lan.unwrap_or(false);
@@ -303,7 +337,9 @@ async fn run_daemon(config_path: &Path, selections: &[String]) -> Result<()> {
         "127.0.0.1".to_string()
     };
 
-    let mut daemon_state = DaemonState::from_config(config, config_path.to_path_buf());
+    let geoip_loaded = mmdb_path.exists();
+    let mut daemon_state =
+        DaemonState::from_config(config, config_path.to_path_buf(), mmdb_path.clone());
     daemon_state.parse_and_apply_overrides(selections)?;
     daemon_state.validate();
     let state = Arc::new(RwLock::new(daemon_state));
@@ -344,6 +380,62 @@ async fn run_daemon(config_path: &Path, selections: &[String]) -> Result<()> {
 
     println!("clashx-rs started on {bind_addr}:{port}");
     println!("press Ctrl-C to stop");
+
+    // Auto-download mmdb in background if requested and not already loaded.
+    if mmdb_auto_download && !geoip_loaded {
+        let dl_state = Arc::clone(&state);
+        let dl_mmdb_path = mmdb_path;
+        let dl_port = port;
+        tokio::spawn(async move {
+            // Wait for proxy to fully start before downloading through it.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            let proxy_url = format!("socks5://127.0.0.1:{dl_port}");
+            let backoff = [10u64, 30, 90];
+
+            for (attempt, delay) in backoff.iter().enumerate() {
+                tracing::info!(
+                    attempt = attempt + 1,
+                    max = backoff.len(),
+                    "auto-downloading mmdb"
+                );
+                match clashx_rs_geoip::download::download_mmdb(
+                    None,
+                    Some(&proxy_url),
+                    &dl_mmdb_path,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        match GeoIpDb::open(&dl_mmdb_path) {
+                            Ok(db) => {
+                                let mut st = dl_state.write().await;
+                                st.rule_engine.set_geoip_db(Arc::new(db));
+                            }
+                            Err(e) => {
+                                tracing::warn!(err = %e, "downloaded mmdb but failed to load");
+                            }
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            err = %e,
+                            retry_in_secs = delay,
+                            "mmdb download failed"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                    }
+                }
+            }
+
+            tracing::warn!(
+                "failed to auto-download mmdb after {} attempts, GEOIP rules remain inactive",
+                backoff.len()
+            );
+        });
+    }
 
     let ctrl_state = Arc::clone(&state);
     tokio::spawn(async move {
@@ -418,7 +510,24 @@ async fn handle_connection(
     let target_host = target.host_string();
     let target_port = target.port();
 
-    let ip: Option<std::net::IpAddr> = target_host.parse().ok();
+    let parsed_ip: Option<std::net::IpAddr> = target_host.parse().ok();
+
+    // DNS pre-resolve: if target is a domain, resolve to IP so GEOIP/IP-CIDR rules can match.
+    let resolved_ip = if parsed_ip.is_some() {
+        parsed_ip
+    } else {
+        match clashx_rs_dns::resolve(&target_host).await {
+            Ok(ip) => Some(ip),
+            Err(e) => {
+                tracing::debug!(
+                    host = %target_host,
+                    err = %e,
+                    "DNS pre-resolve failed, IP-based rules will skip"
+                );
+                None
+            }
+        }
+    };
 
     // --- Phase 1: Route resolution (under read lock) ---
     let group_name: Option<String>;
@@ -435,12 +544,12 @@ async fn handle_connection(
         };
 
         let match_input = MatchInput {
-            host: if ip.is_some() {
+            host: if parsed_ip.is_some() {
                 None
             } else {
                 Some(&target_host)
             },
-            ip,
+            ip: resolved_ip,
             process_name: process_name.as_deref(),
         };
 
@@ -744,11 +853,12 @@ async fn dispatch_control(
         ControlRequest::Reload => {
             let mut st = state.write().await;
             let path = st.config_path.clone();
+            let mmdb_path = st.mmdb_path.clone();
             let overrides = std::mem::take(&mut st.startup_overrides);
             let cooldown = Arc::clone(&st.cooldown);
             match load_config(&path) {
                 Ok(new_config) => {
-                    let mut new_state = DaemonState::from_config(new_config, path);
+                    let mut new_state = DaemonState::from_config(new_config, path, mmdb_path);
                     if let Err(e) = new_state.reapply_overrides(overrides) {
                         return ControlResponse::error(format!(
                             "reload succeeded but --select overrides failed: {e}"
@@ -880,7 +990,11 @@ mod tests {
 
     #[test]
     fn default_selection_is_first_proxy() {
-        let state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         assert_eq!(
             state.selections.get("🚀 节点选择").map(|s| s.as_str()),
             Some("🇭🇰 香港 01")
@@ -893,7 +1007,11 @@ mod tests {
 
     #[test]
     fn override_valid_selection() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let overrides = vec!["🚀 节点选择=🇸🇬 新加坡 01".to_string()];
         state.parse_and_apply_overrides(&overrides).unwrap();
         assert_eq!(
@@ -909,7 +1027,11 @@ mod tests {
 
     #[test]
     fn override_multiple_groups() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let overrides = vec![
             "🚀 节点选择=🇸🇬 新加坡 02".to_string(),
             "@hk=🇭🇰 香港 02".to_string(),
@@ -927,7 +1049,11 @@ mod tests {
 
     #[test]
     fn override_unknown_group_errors() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let overrides = vec!["nonexistent=🇸🇬 新加坡 01".to_string()];
         let err = state.parse_and_apply_overrides(&overrides).unwrap_err();
         assert!(err.to_string().contains("group not found"));
@@ -936,7 +1062,11 @@ mod tests {
 
     #[test]
     fn override_unknown_proxy_errors() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let overrides = vec!["🚀 节点选择=🇺🇲 美国 01".to_string()];
         let err = state.parse_and_apply_overrides(&overrides).unwrap_err();
         assert!(err.to_string().contains("proxy"));
@@ -945,7 +1075,11 @@ mod tests {
 
     #[test]
     fn override_missing_separator_errors() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let overrides = vec!["no-separator-here".to_string()];
         let err = state.parse_and_apply_overrides(&overrides).unwrap_err();
         assert!(err.to_string().contains("invalid --select format"));
@@ -953,7 +1087,11 @@ mod tests {
 
     #[test]
     fn override_empty_list_is_noop() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let original = state.selections.clone();
         state.parse_and_apply_overrides(&[]).unwrap();
         assert_eq!(state.selections, original);
@@ -964,7 +1102,11 @@ mod tests {
         let mut config = test_config();
         config.rules = vec!["DOMAIN-SUFFIX,example.com,🚀 节点选择".to_string()];
         config.mode = Mode::Rule;
-        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let input = MatchInput {
             host: Some("test.example.com"),
             ip: None,
@@ -979,7 +1121,11 @@ mod tests {
     fn resolve_with_group_returns_none_for_direct() {
         let mut config = test_config();
         config.mode = Mode::Direct;
-        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let input = MatchInput {
             host: Some("anything.com"),
             ip: None,
@@ -993,7 +1139,11 @@ mod tests {
     #[test]
     fn build_candidates_selected_first_then_rest() {
         let config = test_config();
-        let mut state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         state
             .selections
             .insert("🚀 节点选择".to_string(), "🇸🇬 新加坡 01".to_string());
@@ -1007,7 +1157,11 @@ mod tests {
     #[test]
     fn build_candidates_filters_cooled_down() {
         let config = test_config();
-        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let tracker = CooldownTracker::new();
         for _ in 0..crate::retry::COOLDOWN_FAILURE_THRESHOLD {
             tracker.record_failure("🇭🇰 香港 01");
@@ -1023,7 +1177,11 @@ mod tests {
     fn build_candidates_all_cooled_down_tries_anyway() {
         let mut config = test_config();
         config.proxy_groups.retain(|g| g.name == "@hk");
-        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let tracker = CooldownTracker::new();
         for _ in 0..crate::retry::COOLDOWN_FAILURE_THRESHOLD {
             tracker.record_failure("🇭🇰 香港 01");
@@ -1052,8 +1210,11 @@ mod tests {
 
     #[test]
     fn nested_group_resolves_to_inner_leaf() {
-        let mut state =
-            DaemonState::from_config(nested_group_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            nested_group_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         // Pin the inner selection so the expectation doesn't depend on the
         // default "first proxy" rule.
         state
@@ -1075,8 +1236,11 @@ mod tests {
 
     #[test]
     fn nested_group_candidate_list_is_non_empty() {
-        let mut state =
-            DaemonState::from_config(nested_group_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            nested_group_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         state
             .parse_and_apply_overrides(&["🚀 节点选择=🇸🇬 新加坡 01".to_string()])
             .unwrap();
@@ -1114,7 +1278,11 @@ mod tests {
         ];
         config.mode = Mode::Rule;
         config.rules = vec!["MATCH,A".to_string()];
-        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
 
         let input = MatchInput {
             host: Some("example.com"),
