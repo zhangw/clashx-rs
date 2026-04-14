@@ -3,53 +3,62 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use tokio::sync::Notify;
+
 /// TTL for the port → process_name table snapshot.
 /// Short-lived because a port can be reused by a different process after close.
-/// During a browser page load (<10s), this avoids re-scanning all processes.
 const SNAPSHOT_TTL: Duration = Duration::from_secs(2);
 
 struct Snapshot {
-    /// Maps source port → process name for ESTABLISHED/LISTEN sockets.
     port_to_name: HashMap<u16, String>,
     expires: Instant,
 }
 
 static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
 
-/// Look up the process name synchronously. Only returns a result if the cached
-/// snapshot is fresh. Returns None for both "unknown process" and "snapshot stale".
-/// Use [`lookup_process_name`] from async contexts to trigger a rebuild when needed.
-pub fn lookup_process_name_cached(source_addr: &SocketAddr) -> Option<String> {
-    let port = source_addr.port();
-    let guard = SNAPSHOT.lock().ok()?;
-    let snap = guard.as_ref()?;
-    if Instant::now() >= snap.expires {
-        return None;
-    }
-    snap.port_to_name.get(&port).cloned()
-}
+/// Set when a rebuild is in flight; concurrent misses wait on this instead
+/// of each spawning their own scan.
+static REBUILD_NOTIFY: once_cell::sync::Lazy<Notify> = once_cell::sync::Lazy::new(Notify::new);
+static REBUILDING: Mutex<bool> = Mutex::new(false);
 
 /// Look up the process name that owns the TCP connection from `source_addr`.
 ///
 /// Uses a 2-second port→process table snapshot. Cache hits are O(1) sync
 /// HashMap lookups. Cache misses trigger a full system scan which is offloaded
-/// to a blocking thread so the async runtime is not stalled.
+/// to a blocking thread so the async runtime is not stalled. Concurrent
+/// misses coalesce — only one scan runs at a time.
 pub async fn lookup_process_name(source_addr: SocketAddr) -> Option<String> {
     if let Some(hit) = fast_path_lookup(&source_addr) {
         return hit;
     }
 
-    let port = source_addr.port();
-    let fresh = tokio::task::spawn_blocking(build_snapshot).await.ok()?;
-    let result = fresh.port_to_name.get(&port).cloned();
-    if let Ok(mut guard) = SNAPSHOT.lock() {
-        *guard = Some(fresh);
+    // Coalesce concurrent rebuilds: only one task scans, others wait.
+    let should_rebuild = {
+        let mut flag = REBUILDING.lock().ok()?;
+        if *flag {
+            false
+        } else {
+            *flag = true;
+            true
+        }
+    };
+
+    if should_rebuild {
+        let fresh = tokio::task::spawn_blocking(build_snapshot).await.ok();
+        if let Ok(mut guard) = SNAPSHOT.lock() {
+            *guard = fresh;
+        }
+        if let Ok(mut flag) = REBUILDING.lock() {
+            *flag = false;
+        }
+        REBUILD_NOTIFY.notify_waiters();
+    } else {
+        REBUILD_NOTIFY.notified().await;
     }
-    result
+
+    fast_path_lookup(&source_addr).flatten()
 }
 
-/// Returns `Some(result)` if the cached snapshot answered the query,
-/// or `None` when a rebuild is needed.
 fn fast_path_lookup(source_addr: &SocketAddr) -> Option<Option<String>> {
     let port = source_addr.port();
     let guard = SNAPSHOT.lock().ok()?;
@@ -114,14 +123,10 @@ fn scan_all_tcp_sockets() -> HashMap<u16, String> {
                 continue;
             }
 
-            // Lazily fetch process name once per pid.
             if proc_name.is_none() {
                 proc_name = name(pid).ok();
             }
             if let Some(ref n) = proc_name {
-                // First writer wins — later entries from other processes don't
-                // overwrite an already-recorded port (shouldn't happen for
-                // unique local ports but guards against races during scanning).
                 map.entry(port).or_insert_with(|| n.clone());
             }
         }
@@ -244,15 +249,5 @@ mod tests {
             second_call < first_call / 10 || second_call < Duration::from_micros(500),
             "cached lookup ({second_call:?}) should be much faster than first call ({first_call:?})"
         );
-    }
-
-    #[test]
-    fn cached_only_returns_none_when_no_snapshot() {
-        // Reset snapshot state for this test
-        if let Ok(mut g) = SNAPSHOT.lock() {
-            *g = None;
-        }
-        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        assert_eq!(lookup_process_name_cached(&addr), None);
     }
 }

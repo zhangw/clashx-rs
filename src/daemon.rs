@@ -571,10 +571,7 @@ async fn handle_connection(
         }
     };
 
-    // Look up process name OUTSIDE the state read lock — uses a cached
-    // port→process snapshot so this is O(1) in the fast path, spawn_blocking
-    // for the rare rebuild path. Check the mode+has_process_rules first to
-    // skip the lookup entirely when not needed.
+    // Resolve process name before taking the routing read lock (may block on rescan).
     let process_name = {
         let st = state.read().await;
         let need_process = st.config.mode == Mode::Rule && st.has_process_rules();

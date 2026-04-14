@@ -307,6 +307,7 @@ dependencies = [
  "clashx-rs-config",
  "clashx-rs-geoip",
  "libproc",
+ "once_cell",
  "tokio",
  "tracing",
 ]
