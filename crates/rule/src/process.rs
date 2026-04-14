@@ -1,34 +1,36 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-/// TTL for the port → process_name table snapshot.
-/// Short-lived because a port can be reused by a different process after close.
 const SNAPSHOT_TTL: Duration = Duration::from_secs(2);
 
 struct Snapshot {
     port_to_name: HashMap<u16, String>,
     expires: Instant,
+    target_gen: u64,
 }
 
 static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
 
-/// Set when a rebuild is in flight; concurrent misses wait on this instead
-/// of each spawning their own scan.
 static REBUILD_NOTIFY: once_cell::sync::Lazy<Notify> = once_cell::sync::Lazy::new(Notify::new);
 static REBUILDING: Mutex<bool> = Mutex::new(false);
 
-/// Set of process names that PROCESS-NAME rules care about.
-/// When set, the scanner only walks sockets of matching processes —
-/// a massive speedup when only a handful of apps are referenced.
+/// Global single-engine assumption: the last caller of
+/// `set_process_name_targets` wins. A second RuleEngine would clobber the
+/// first's targets. This daemon constructs one RuleEngine per run, which
+/// matches that assumption.
 static TARGETS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Incremented each time targets change so concurrent in-flight rebuilds
+/// can detect stale results and discard them.
+static TARGET_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// Record the set of process names referenced by PROCESS-NAME rules.
 /// The scanner uses this to skip all non-matching processes' socket lists.
-/// Called once at RuleEngine construction.
 pub fn set_process_name_targets<I, S>(names: I)
 where
     I: IntoIterator<Item = S>,
@@ -38,7 +40,7 @@ where
     if let Ok(mut guard) = TARGETS.lock() {
         *guard = if set.is_empty() { None } else { Some(set) };
     }
-    // Invalidate any existing snapshot — scan criteria changed.
+    TARGET_GEN.fetch_add(1, Ordering::SeqCst);
     if let Ok(mut guard) = SNAPSHOT.lock() {
         *guard = None;
     }
@@ -72,7 +74,10 @@ pub async fn lookup_process_name(source_addr: SocketAddr) -> Option<String> {
     if should_rebuild {
         let fresh = tokio::task::spawn_blocking(build_snapshot).await.ok();
         if let Ok(mut guard) = SNAPSHOT.lock() {
-            *guard = fresh;
+            // Drop the fresh snapshot if targets changed while we were scanning —
+            // it was built with stale filter criteria.
+            let current_gen = TARGET_GEN.load(Ordering::SeqCst);
+            *guard = fresh.filter(|s| s.target_gen == current_gen);
         }
         if let Ok(mut flag) = REBUILDING.lock() {
             *flag = false;
@@ -96,9 +101,12 @@ fn fast_path_lookup(source_addr: &SocketAddr) -> Option<Option<String>> {
 }
 
 fn build_snapshot() -> Snapshot {
+    let target_gen = TARGET_GEN.load(Ordering::SeqCst);
+    let targets = targets_snapshot();
     Snapshot {
-        port_to_name: scan_tcp_sockets(targets_snapshot().as_ref()),
+        port_to_name: scan_tcp_sockets(targets.as_ref()),
         expires: Instant::now() + SNAPSHOT_TTL,
+        target_gen,
     }
 }
 
@@ -119,9 +127,7 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
     for pid in pids {
         let pid = pid as i32;
 
-        // Filter by process name BEFORE walking file descriptors — this is
-        // the aggressive optimization: if the user only has rules for 4 apps,
-        // we skip every other process' fd scan entirely.
+        // Filter by process name first — skip fd walk for non-matches.
         let proc_name = match name(pid) {
             Ok(n) => n,
             Err(_) => continue,
@@ -213,87 +219,44 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
             _ => continue,
         };
 
-        // Filter by process name BEFORE walking fds (the expensive step).
-        if targets.is_some() {
-            let comm_path = format!("/proc/{pid_str}/comm");
-            let proc_name = match std::fs::read_to_string(&comm_path) {
-                Ok(s) => s.trim().to_string(),
-                Err(_) => continue,
-            };
-            if let Some(targets) = targets {
-                if !targets.contains(&proc_name) {
-                    continue;
-                }
+        // Read comm first so we can skip non-matching processes before the
+        // expensive fd walk. Reading /proc/{pid}/comm is a single small file.
+        let comm_path = format!("/proc/{pid_str}/comm");
+        let proc_name = match std::fs::read_to_string(&comm_path) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => continue,
+        };
+        if let Some(targets) = targets {
+            if !targets.contains(&proc_name) {
+                continue;
             }
-            scan_linux_proc_fds(pid_str, &inode_to_port, &proc_name, &mut map);
-        } else {
-            // Slow path: no targets filter, read name only after match.
-            let fd_dir = format!("/proc/{pid_str}/fd");
-            let fds = match std::fs::read_dir(&fd_dir) {
-                Ok(d) => d,
+        }
+
+        let fd_dir = format!("/proc/{pid_str}/fd");
+        let fds = match std::fs::read_dir(&fd_dir) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for fd_entry in fds.flatten() {
+            let link = match std::fs::read_link(fd_entry.path()) {
+                Ok(l) => l,
                 Err(_) => continue,
             };
-            let mut proc_name: Option<String> = None;
-            for fd_entry in fds.flatten() {
-                let link = match std::fs::read_link(fd_entry.path()) {
-                    Ok(l) => l,
-                    Err(_) => continue,
-                };
-                let link_str = link.to_string_lossy();
-                let inode = match link_str
-                    .strip_prefix("socket:[")
-                    .and_then(|s| s.strip_suffix(']'))
-                {
-                    Some(i) => i,
-                    None => continue,
-                };
-                if let Some(&port) = inode_to_port.get(inode) {
-                    if proc_name.is_none() {
-                        let comm_path = format!("/proc/{pid_str}/comm");
-                        proc_name = std::fs::read_to_string(comm_path)
-                            .ok()
-                            .map(|s| s.trim().to_string());
-                    }
-                    if let Some(ref n) = proc_name {
-                        map.entry(port).or_insert_with(|| n.clone());
-                    }
-                }
+            let link_str = link.to_string_lossy();
+            let inode = match link_str
+                .strip_prefix("socket:[")
+                .and_then(|s| s.strip_suffix(']'))
+            {
+                Some(i) => i,
+                None => continue,
+            };
+            if let Some(&port) = inode_to_port.get(inode) {
+                map.entry(port).or_insert_with(|| proc_name.clone());
             }
         }
     }
 
     map
-}
-
-#[cfg(target_os = "linux")]
-fn scan_linux_proc_fds(
-    pid_str: &str,
-    inode_to_port: &HashMap<String, u16>,
-    proc_name: &str,
-    map: &mut HashMap<u16, String>,
-) {
-    let fd_dir = format!("/proc/{pid_str}/fd");
-    let fds = match std::fs::read_dir(&fd_dir) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    for fd_entry in fds.flatten() {
-        let link = match std::fs::read_link(fd_entry.path()) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        let link_str = link.to_string_lossy();
-        let inode = match link_str
-            .strip_prefix("socket:[")
-            .and_then(|s| s.strip_suffix(']'))
-        {
-            Some(i) => i,
-            None => continue,
-        };
-        if let Some(&port) = inode_to_port.get(inode) {
-            map.entry(port).or_insert_with(|| proc_name.to_string());
-        }
-    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
