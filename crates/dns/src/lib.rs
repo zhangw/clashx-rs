@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task;
 
 static DNS_TX_ID: AtomicU16 = AtomicU16::new(1);
@@ -43,9 +44,13 @@ struct CacheEntry {
     expires: Instant,
 }
 
-/// TTL-based DNS cache with negative caching. Thread-safe, bounded size.
+/// TTL-based DNS cache with negative caching and in-flight request coalescing.
+/// Thread-safe, bounded size.
 pub struct DnsCache {
     entries: RwLock<HashMap<String, CacheEntry>>,
+    /// Hostnames with a resolution currently in flight. Concurrent callers
+    /// for the same host share a Notify so only one actually queries upstream.
+    inflight: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 fn normalize(host: &str) -> std::borrow::Cow<'_, str> {
@@ -60,6 +65,7 @@ impl DnsCache {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            inflight: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -71,6 +77,29 @@ impl DnsCache {
             Some(entry.value)
         } else {
             None
+        }
+    }
+
+    /// Singleflight claim: if no one is resolving `host`, mark it as in-flight
+    /// and return Ok. If another task is already resolving it, return Err with
+    /// the Notify to wait on. Caller must call `complete_inflight` on Ok path.
+    fn claim_inflight(&self, host: &str) -> std::result::Result<(), Arc<Notify>> {
+        let key = normalize(host).into_owned();
+        let mut guard = self.inflight.lock().expect("inflight mutex poisoned");
+        match guard.get(&key) {
+            Some(existing) => Err(Arc::clone(existing)),
+            None => {
+                guard.insert(key, Arc::new(Notify::new()));
+                Ok(())
+            }
+        }
+    }
+
+    fn complete_inflight(&self, host: &str) {
+        let key = normalize(host).into_owned();
+        let mut guard = self.inflight.lock().expect("inflight mutex poisoned");
+        if let Some(notify) = guard.remove(&key) {
+            notify.notify_waiters();
         }
     }
 
@@ -159,11 +188,20 @@ pub async fn resolve_via(host: &str, nameserver: IpAddr) -> Result<DnsResult> {
     parse_dns_response(&buf[..n], host, tx_id)
 }
 
-/// Call the system resolver, caching any failure so repeated misses
-/// don't keep paying the getaddrinfo cost within NEGATIVE_TTL.
+/// Default TTL used when caching system-resolver results. The OS resolver
+/// doesn't expose a TTL, so we pick a conservative middle value — long
+/// enough to avoid hammering getaddrinfo, short enough to react to DNS
+/// changes. Clamped in `put()` anyway.
+const SYSTEM_RESOLVE_TTL_SECS: u32 = 300;
+
+/// Call the system resolver, caching the outcome (success or failure) so
+/// repeated lookups don't keep paying the getaddrinfo cost.
 async fn system_resolve_cached(host: &str, cache: &DnsCache) -> Result<IpAddr> {
     match resolve(host).await {
-        Ok(ip) => Ok(ip),
+        Ok(ip) => {
+            cache.put(host, ip, SYSTEM_RESOLVE_TTL_SECS).await;
+            Ok(ip)
+        }
         Err(e) => {
             cache.put_failure(host).await;
             Err(e)
@@ -173,11 +211,16 @@ async fn system_resolve_cached(host: &str, cache: &DnsCache) -> Result<IpAddr> {
 
 /// Resolve by racing all nameservers concurrently with caching.
 /// Falls back to the system resolver if nameservers is empty or all fail.
+///
+/// Concurrent callers for the same host coalesce via a singleflight guard —
+/// only one task actually queries upstream; others wait for the result and
+/// read it from the cache.
 pub async fn resolve_with_nameservers(
     host: &str,
     nameservers: &[IpAddr],
     cache: &DnsCache,
 ) -> Result<IpAddr> {
+    // Fast path: already cached.
     match cache.lookup(host).await {
         Some(CacheValue::Resolved(ip)) => return Ok(ip),
         Some(CacheValue::Failed) => {
@@ -185,6 +228,43 @@ pub async fn resolve_with_nameservers(
         }
         None => {}
     }
+
+    // Singleflight: if someone else is already resolving, wait and then
+    // re-consult the cache. On wake, the cache entry should be present.
+    match cache.claim_inflight(host) {
+        Ok(()) => {}
+        Err(notify) => {
+            notify.notified().await;
+            return match cache.lookup(host).await {
+                Some(CacheValue::Resolved(ip)) => Ok(ip),
+                Some(CacheValue::Failed) => {
+                    anyhow::bail!(
+                        "DNS for {host} failed recently; suppressed for ~{NEGATIVE_TTL:?}"
+                    )
+                }
+                None => {
+                    // The leader finished but its entry was already evicted
+                    // — rare edge case, fall through and resolve ourselves.
+                    // Re-recurse; a new singleflight claim will succeed or
+                    // we'll wait on a fresh leader.
+                    Box::pin(resolve_with_nameservers(host, nameservers, cache)).await
+                }
+            };
+        }
+    }
+
+    // We're the leader. Ensure the in-flight slot is cleared even on panic/
+    // early-return so waiters can proceed.
+    struct LeaderGuard<'a> {
+        cache: &'a DnsCache,
+        host: &'a str,
+    }
+    impl Drop for LeaderGuard<'_> {
+        fn drop(&mut self) {
+            self.cache.complete_inflight(self.host);
+        }
+    }
+    let _leader = LeaderGuard { cache, host };
 
     if nameservers.is_empty() {
         return system_resolve_cached(host, cache).await;

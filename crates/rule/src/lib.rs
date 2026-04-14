@@ -89,10 +89,45 @@ impl RuleEngine {
             .map(|r| (r.target(), r.description()))
     }
 
+    /// Two-phase evaluation: walk rules; if an IP-dependent rule is reached
+    /// before any host/process rule matched, return `NeedsIp(rule_index)` so
+    /// the caller can do DNS resolution and resume. Skips IP work entirely
+    /// when an earlier domain rule matches.
+    pub fn evaluate_until_ip_needed<'a>(&'a self, input: &MatchInput<'_>) -> EvalStep<'a> {
+        let host_lower_owned = input
+            .host
+            .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
+            .map(|h| h.to_ascii_lowercase());
+        let host_lower = host_lower_owned.as_deref().or(input.host);
+        for (idx, rule) in self.rules.iter().enumerate() {
+            if rule_needs_ip(rule) && input.ip.is_none() {
+                return EvalStep::NeedsIp { resume_from: idx };
+            }
+            if matches_rule(rule, input, host_lower, self.geoip_db.as_deref()) {
+                return EvalStep::Matched(rule);
+            }
+        }
+        EvalStep::NoMatch
+    }
+
+    /// Resume evaluation after DNS resolution, starting from the rule index
+    /// returned by `evaluate_until_ip_needed`.
+    pub fn resume_from<'a>(
+        &'a self,
+        input: &MatchInput<'_>,
+        start: usize,
+    ) -> Option<&'a RuleEntry> {
+        let host_lower_owned = input
+            .host
+            .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
+            .map(|h| h.to_ascii_lowercase());
+        let host_lower = host_lower_owned.as_deref().or(input.host);
+        self.rules[start..]
+            .iter()
+            .find(|rule| matches_rule(rule, input, host_lower, self.geoip_db.as_deref()))
+    }
+
     fn find_match<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a RuleEntry> {
-        // Avoid allocation when the host is already ASCII-lowercase (the common
-        // case — browsers normalize hostnames). Only pay the to_lowercase()
-        // cost when there is actually an uppercase ASCII byte to fold.
         let host_lower_owned = input
             .host
             .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
@@ -102,6 +137,21 @@ impl RuleEngine {
             .iter()
             .find(|rule| matches_rule(rule, input, host_lower, self.geoip_db.as_deref()))
     }
+}
+
+/// Outcome of the first evaluation pass.
+pub enum EvalStep<'a> {
+    /// A rule matched — no DNS needed.
+    Matched(&'a RuleEntry),
+    /// Reached an IP-dependent rule without a resolved IP. Caller should
+    /// resolve DNS and call `resume_from(input, resume_from)`.
+    NeedsIp { resume_from: usize },
+    /// Walked all rules without matching.
+    NoMatch,
+}
+
+fn rule_needs_ip(rule: &RuleEntry) -> bool {
+    matches!(rule, RuleEntry::IpCidr { .. } | RuleEntry::GeoIp { .. })
 }
 
 fn matches_rule(
