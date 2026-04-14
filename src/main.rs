@@ -7,7 +7,7 @@ mod retry;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use clashx_rs_sysproxy::SysProxy;
 use tracing_subscriber::EnvFilter;
 
@@ -69,12 +69,6 @@ enum Command {
     Sysproxy {
         #[command(subcommand)]
         action: SysproxyAction,
-        /// Config file to read mixed-port from
-        #[arg(short, long, default_value = "~/.config/clashx-rs/config.yaml")]
-        config: String,
-        /// Subnets/domains to bypass the proxy (default: private ranges + localhost)
-        #[arg(long = "bypass")]
-        bypass: Vec<String>,
     },
     /// Download the GeoIP mmdb database
     MmdbDownload {
@@ -90,10 +84,17 @@ enum Command {
     },
 }
 
-#[derive(Debug, Subcommand, Clone, ValueEnum)]
+#[derive(Debug, Subcommand, Clone)]
 enum SysproxyAction {
     /// Enable system proxy
-    On,
+    On {
+        /// Config file to read mixed-port from
+        #[arg(short, long, default_value = "~/.config/clashx-rs/config.yaml")]
+        config: String,
+        /// Subnets/domains to bypass the proxy (default: private ranges + localhost)
+        #[arg(long = "bypass")]
+        bypass: Vec<String>,
+    },
     /// Disable system proxy
     Off,
     /// Show system proxy status
@@ -153,37 +154,34 @@ fn main() -> Result<()> {
 
         Command::Test { domain } => client::send_command(ControlRequest::Test { domain })?,
 
-        Command::Sysproxy {
-            action,
-            config,
-            bypass,
-        } => {
-            let config_path = expand_tilde(&config);
-            let cfg = match clashx_rs_config::load_config(&config_path) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    eprintln!(
-                        "warning: failed to load config {}: {e}, using defaults",
-                        config_path.display()
-                    );
-                    None
-                }
-            };
-            let port = cfg
-                .as_ref()
-                .and_then(|c| c.mixed_port)
-                .unwrap_or(paths::DEFAULT_MIXED_PORT);
-            // Priority: CLI --bypass > config skip-proxy > built-in defaults
-            let bypass_rules = if !bypass.is_empty() {
-                bypass
-            } else {
-                cfg.as_ref()
-                    .map(|c| c.skip_proxy.clone())
-                    .unwrap_or_default()
-            };
-            let sp = SysProxy::new(port);
+        Command::Sysproxy { action } => {
+            let sp = SysProxy::new(paths::DEFAULT_MIXED_PORT);
             match action {
-                SysproxyAction::On => {
+                SysproxyAction::On { config, bypass } => {
+                    let config_path = expand_tilde(&config);
+                    let cfg = match clashx_rs_config::load_config(&config_path) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            eprintln!(
+                                "warning: failed to load config {}: {e}, using defaults",
+                                config_path.display()
+                            );
+                            None
+                        }
+                    };
+                    let port = cfg
+                        .as_ref()
+                        .and_then(|c| c.mixed_port)
+                        .unwrap_or(paths::DEFAULT_MIXED_PORT);
+                    // Priority: CLI --bypass > config skip-proxy > built-in defaults
+                    let bypass_rules = if !bypass.is_empty() {
+                        bypass
+                    } else {
+                        cfg.as_ref()
+                            .map(|c| c.skip_proxy.clone())
+                            .unwrap_or_default()
+                    };
+                    let sp = SysProxy::new(port);
                     sp.enable_with_bypass(&bypass_rules)?;
                     if bypass_rules.is_empty() {
                         println!("system proxy enabled on port {port} (default bypass rules)");
