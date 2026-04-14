@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
@@ -23,18 +23,38 @@ const MIN_TTL_SECS: u32 = 10;
 /// upstream returning huge TTLs (e.g., u32::MAX) that would pin cache entries.
 const MAX_TTL_SECS: u32 = 3600;
 
+/// Negative cache TTL — how long to remember a DNS lookup failure.
+/// Prevents a broken or unreachable hostname from triggering repeated
+/// full nameserver-race queries on every connection attempt.
+const NEGATIVE_TTL: Duration = Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // DNS cache
 // ---------------------------------------------------------------------------
 
+enum CacheValue {
+    Resolved(IpAddr),
+    Failed,
+}
+
 struct CacheEntry {
-    ip: IpAddr,
+    value: CacheValue,
     expires: Instant,
 }
 
-/// TTL-based DNS cache. Thread-safe, bounded size.
+/// TTL-based DNS cache with negative caching. Thread-safe, bounded size.
 pub struct DnsCache {
     entries: RwLock<HashMap<String, CacheEntry>>,
+}
+
+/// Result of a cache lookup.
+pub(crate) enum CacheHit {
+    /// Positive hit — cached successful resolution.
+    Resolved(IpAddr),
+    /// Negative hit — recent failure, don't retry yet.
+    Failed,
+    /// Miss or expired — caller should perform the lookup.
+    Miss,
 }
 
 impl DnsCache {
@@ -44,40 +64,52 @@ impl DnsCache {
         }
     }
 
-    async fn get(&self, host: &str) -> Option<IpAddr> {
+    pub(crate) async fn lookup(&self, host: &str) -> CacheHit {
         let entries = self.entries.read().await;
-        // Fast path: no uppercase → skip allocation, look up the borrowed slice.
-        if !host.bytes().any(|b| b.is_ascii_uppercase()) {
-            let entry = entries.get(host)?;
-            if Instant::now() < entry.expires {
-                return Some(entry.ip);
+        let lookup = |key: &str| -> CacheHit {
+            match entries.get(key) {
+                Some(entry) if Instant::now() < entry.expires => match entry.value {
+                    CacheValue::Resolved(ip) => CacheHit::Resolved(ip),
+                    CacheValue::Failed => CacheHit::Failed,
+                },
+                _ => CacheHit::Miss,
             }
-            return None;
-        }
-        let key = host.to_ascii_lowercase();
-        let entry = entries.get(&key)?;
-        if Instant::now() < entry.expires {
-            Some(entry.ip)
+        };
+        if !host.bytes().any(|b| b.is_ascii_uppercase()) {
+            lookup(host)
         } else {
-            None
+            lookup(&host.to_ascii_lowercase())
         }
     }
 
     async fn put(&self, host: &str, ip: IpAddr, ttl_secs: u32) {
+        let ttl = ttl_secs.clamp(MIN_TTL_SECS, MAX_TTL_SECS);
+        self.insert(
+            host,
+            CacheValue::Resolved(ip),
+            Duration::from_secs(ttl as u64),
+        )
+        .await;
+    }
+
+    /// Record a DNS failure so repeated lookups of the same hostname don't
+    /// all trigger fresh nameserver races within the negative-TTL window.
+    async fn put_failure(&self, host: &str) {
+        self.insert(host, CacheValue::Failed, NEGATIVE_TTL).await;
+    }
+
+    async fn insert(&self, host: &str, value: CacheValue, ttl: Duration) {
         let key = if host.bytes().any(|b| b.is_ascii_uppercase()) {
             host.to_ascii_lowercase()
         } else {
             host.to_string()
         };
-        let ttl = ttl_secs.clamp(MIN_TTL_SECS, MAX_TTL_SECS);
         let mut entries = self.entries.write().await;
 
-        // Evict expired entries if we're at capacity
         if entries.len() >= MAX_CACHE_SIZE {
             let now = Instant::now();
             entries.retain(|_, v| now < v.expires);
         }
-        // If still at capacity after eviction, drop oldest 25%
         if entries.len() >= MAX_CACHE_SIZE {
             let mut by_expiry: Vec<_> = entries.keys().cloned().collect();
             by_expiry.sort_by_key(|k| entries.get(k).map(|e| e.expires));
@@ -89,8 +121,8 @@ impl DnsCache {
         entries.insert(
             key,
             CacheEntry {
-                ip,
-                expires: Instant::now() + std::time::Duration::from_secs(ttl as u64),
+                value,
+                expires: Instant::now() + ttl,
             },
         );
     }
@@ -146,13 +178,20 @@ pub async fn resolve_with_nameservers(
     nameservers: &[IpAddr],
     cache: &DnsCache,
 ) -> Result<IpAddr> {
-    // Check cache first
-    if let Some(ip) = cache.get(host).await {
-        return Ok(ip);
+    match cache.lookup(host).await {
+        CacheHit::Resolved(ip) => return Ok(ip),
+        CacheHit::Failed => anyhow::bail!("cached DNS failure for {host}"),
+        CacheHit::Miss => {}
     }
 
     if nameservers.is_empty() {
-        return resolve(host).await;
+        return match resolve(host).await {
+            Ok(ip) => Ok(ip),
+            Err(e) => {
+                cache.put_failure(host).await;
+                Err(e)
+            }
+        };
     }
 
     // Race all nameservers concurrently, take the first success.
@@ -180,7 +219,13 @@ pub async fn resolve_with_nameservers(
         host,
         "all nameservers failed, falling back to system resolver"
     );
-    resolve(host).await
+    match resolve(host).await {
+        Ok(ip) => Ok(ip),
+        Err(e) => {
+            cache.put_failure(host).await;
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -580,49 +625,68 @@ mod tests {
 
     // --- Cache tests ---
 
+    fn lookup_ip(hit: CacheHit) -> Option<IpAddr> {
+        match hit {
+            CacheHit::Resolved(ip) => Some(ip),
+            CacheHit::Failed | CacheHit::Miss => None,
+        }
+    }
+
     #[tokio::test]
     async fn cache_hit_returns_cached_ip() {
         let cache = DnsCache::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         cache.put("example.com", ip, 60).await;
-
-        assert_eq!(cache.get("example.com").await, Some(ip));
+        assert_eq!(lookup_ip(cache.lookup("example.com").await), Some(ip));
     }
 
     #[tokio::test]
-    async fn cache_miss_returns_none() {
+    async fn cache_miss_returns_miss() {
         let cache = DnsCache::new();
-        assert_eq!(cache.get("unknown.com").await, None);
+        assert!(matches!(cache.lookup("unknown.com").await, CacheHit::Miss));
     }
 
     #[tokio::test]
-    async fn cache_expired_returns_none() {
+    async fn cache_expired_returns_miss() {
         let cache = DnsCache::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-
-        // Insert with 0 TTL (clamped to MIN_TTL_SECS=10, but we can test expiry logic
-        // by directly inserting an already-expired entry)
         {
             let mut entries = cache.entries.write().await;
             entries.insert(
                 "expired.com".to_string(),
                 CacheEntry {
-                    ip,
-                    expires: Instant::now() - std::time::Duration::from_secs(1),
+                    value: CacheValue::Resolved(ip),
+                    expires: Instant::now() - Duration::from_secs(1),
                 },
             );
         }
-
-        assert_eq!(cache.get("expired.com").await, None);
+        assert!(matches!(cache.lookup("expired.com").await, CacheHit::Miss));
     }
 
     #[tokio::test]
     async fn cache_respects_min_ttl() {
         let cache = DnsCache::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        cache.put("example.com", ip, 0).await; // TTL=0, should be clamped to MIN_TTL_SECS
+        cache.put("example.com", ip, 0).await;
+        assert_eq!(lookup_ip(cache.lookup("example.com").await), Some(ip));
+    }
 
-        // Should still be cached (min TTL is 10s)
-        assert_eq!(cache.get("example.com").await, Some(ip));
+    #[tokio::test]
+    async fn negative_cache_blocks_repeated_lookup() {
+        let cache = DnsCache::new();
+        cache.put_failure("broken.example").await;
+        assert!(matches!(
+            cache.lookup("broken.example").await,
+            CacheHit::Failed
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolved_shadows_failed_on_put() {
+        let cache = DnsCache::new();
+        cache.put_failure("example.com").await;
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        cache.put("example.com", ip, 60).await;
+        assert_eq!(lookup_ip(cache.lookup("example.com").await), Some(ip));
     }
 }
