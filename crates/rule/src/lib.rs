@@ -72,16 +72,20 @@ impl RuleEngine {
     }
 
     pub fn evaluate<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a str> {
-        self.evaluate_verbose(input).map(|(target, _)| target)
+        self.find_match(input).map(|r| r.target())
     }
 
     /// Evaluate rules top-to-bottom, returning the target and matched rule description.
     pub fn evaluate_verbose<'a>(&'a self, input: &MatchInput<'_>) -> Option<(&'a str, String)> {
+        self.find_match(input)
+            .map(|r| (r.target(), r.description()))
+    }
+
+    fn find_match<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a RuleEntry> {
         let host_lower = input.host.map(|h| h.to_lowercase());
         self.rules
             .iter()
             .find(|rule| matches_rule(rule, input, host_lower.as_deref(), self.geoip_db.as_deref()))
-            .map(|rule| (rule.target(), rule.description()))
     }
 }
 
