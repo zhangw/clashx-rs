@@ -282,20 +282,38 @@ fn scan_tcp_sockets(_targets: Option<&HashSet<String>>) -> HashMap<u16, String> 
 mod tests {
     use super::*;
 
+    /// Cargo runs tests in parallel by default, but every test in this module
+    /// touches the same process-global SNAPSHOT/TARGETS/REBUILDING state.
+    /// Acquire this mutex at the top of any test that mutates that state to
+    /// force serial execution and prevent cross-test poisoning.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drop all global state so a test starts from a known-empty world.
+    fn reset_globals() {
+        if let Ok(mut g) = SNAPSHOT.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = TARGETS.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = REBUILDING.lock() {
+            *g = false;
+        }
+        TARGET_GEN.fetch_add(1, Ordering::SeqCst);
+    }
+
     #[tokio::test]
     async fn lookup_returns_option() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_globals();
         let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let _ = lookup_process_name(addr).await;
     }
 
     #[tokio::test]
     async fn first_lookup_populates_snapshot() {
-        // Reset global state then verify SNAPSHOT is None before first call
-        // and Some(fresh) after — observable proof the cache was populated,
-        // not a wall-clock measurement.
-        if let Ok(mut g) = SNAPSHOT.lock() {
-            *g = None;
-        }
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_globals();
         set_process_name_targets(["nonexistent_process_xyz"]);
 
         {
@@ -316,8 +334,8 @@ mod tests {
 
     #[tokio::test]
     async fn second_lookup_reuses_snapshot() {
-        // Verify the snapshot isn't rebuilt on the second call by checking
-        // `expires` is unchanged.
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_globals();
         set_process_name_targets(["nonexistent_process_xyz"]);
         let addr: SocketAddr = "127.0.0.1:54322".parse().unwrap();
 
