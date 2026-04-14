@@ -19,6 +19,10 @@ const MAX_CACHE_SIZE: usize = 4096;
 /// Minimum TTL to cache (even if the server says 0).
 const MIN_TTL_SECS: u32 = 10;
 
+/// Maximum TTL we'll honor from a DNS response. Protects against a hostile
+/// upstream returning huge TTLs (e.g., u32::MAX) that would pin cache entries.
+const MAX_TTL_SECS: u32 = 3600;
+
 // ---------------------------------------------------------------------------
 // DNS cache
 // ---------------------------------------------------------------------------
@@ -65,7 +69,7 @@ impl DnsCache {
         } else {
             host.to_string()
         };
-        let ttl = ttl_secs.max(MIN_TTL_SECS);
+        let ttl = ttl_secs.clamp(MIN_TTL_SECS, MAX_TTL_SECS);
         let mut entries = self.entries.write().await;
 
         // Evict expired entries if we're at capacity

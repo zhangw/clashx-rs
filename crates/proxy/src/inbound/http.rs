@@ -4,6 +4,45 @@ use tokio::net::TcpStream;
 
 use super::TargetAddr;
 
+/// Max length of a single HTTP request line or header line (bytes).
+/// Well above typical browser headers; bounds malicious slowloris-style
+/// unbounded-line attacks.
+const MAX_LINE_LEN: usize = 8 * 1024;
+
+/// Max number of header lines in one HTTP request.
+/// Real browsers send 20-40; 128 gives headroom without permitting DoS.
+const MAX_HEADERS: usize = 128;
+
+/// Read a single line, bailing if it exceeds MAX_LINE_LEN bytes.
+/// Guards against slowloris-style unbounded-line DoS attacks.
+async fn read_bounded_line<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    out: &mut String,
+) -> Result<()> {
+    out.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break;
+        }
+        let (consumed, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(idx) => (idx + 1, true),
+            None => (available.len(), false),
+        };
+        if out.len() + consumed > MAX_LINE_LEN {
+            bail!("HTTP line exceeded {MAX_LINE_LEN} bytes");
+        }
+        let s = std::str::from_utf8(&available[..consumed])
+            .map_err(|_| anyhow::anyhow!("invalid UTF-8 in HTTP line"))?;
+        out.push_str(s);
+        reader.consume(consumed);
+        if done {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Parse "host:port" where port is required.
 fn parse_host_port(s: &str) -> Result<TargetAddr> {
     // Try to split off the last ":port" component, handling IPv6 bracketed addresses.
@@ -69,7 +108,7 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<(TargetAddr, Option<Vec
 
     // Read the request line.
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).await?;
+    read_bounded_line(&mut reader, &mut request_line).await?;
     let trimmed = request_line.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() {
         bail!("empty HTTP request");
@@ -85,13 +124,18 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<(TargetAddr, Option<Vec
         let target = parse_host_port(&uri)?;
 
         // Read and discard headers until we see an empty line.
+        let mut line = String::new();
+        let mut header_count = 0usize;
         loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).await?;
+            if header_count >= MAX_HEADERS {
+                bail!("HTTP headers exceeded {MAX_HEADERS}");
+            }
+            read_bounded_line(&mut reader, &mut line).await?;
             let l = line.trim_end_matches(['\r', '\n']);
             if l.is_empty() {
                 break;
             }
+            header_count += 1;
         }
 
         // Preserve any bytes the BufReader read ahead (early client data).
@@ -112,14 +156,16 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<(TargetAddr, Option<Vec
         // Collect all headers.
         let mut headers: Vec<String> = Vec::new();
         let mut host_header: Option<String> = None;
+        let mut line = String::new();
         loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).await?;
+            if headers.len() >= MAX_HEADERS {
+                bail!("HTTP headers exceeded {MAX_HEADERS}");
+            }
+            read_bounded_line(&mut reader, &mut line).await?;
             let trimmed_line = line.trim_end_matches(['\r', '\n']).to_string();
             if trimmed_line.is_empty() {
                 break;
             }
-            // Extract Host header value.
             if host_header.is_none() {
                 let lower = trimmed_line.to_lowercase();
                 if let Some(rest) = lower.strip_prefix("host:") {
