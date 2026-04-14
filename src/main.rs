@@ -154,54 +154,50 @@ fn main() -> Result<()> {
 
         Command::Test { domain } => client::send_command(ControlRequest::Test { domain })?,
 
-        Command::Sysproxy { action } => {
-            let sp = SysProxy::new(paths::DEFAULT_MIXED_PORT);
-            match action {
-                SysproxyAction::On { config, bypass } => {
-                    let config_path = expand_tilde(&config);
-                    let cfg = match clashx_rs_config::load_config(&config_path) {
-                        Ok(c) => Some(c),
-                        Err(e) => {
-                            eprintln!(
-                                "warning: failed to load config {}: {e}, using defaults",
-                                config_path.display()
-                            );
-                            None
-                        }
-                    };
-                    let port = cfg
-                        .as_ref()
-                        .and_then(|c| c.mixed_port)
-                        .unwrap_or(paths::DEFAULT_MIXED_PORT);
-                    // Priority: CLI --bypass > config skip-proxy > built-in defaults
-                    let bypass_rules = if !bypass.is_empty() {
-                        bypass
-                    } else {
-                        cfg.as_ref()
-                            .map(|c| c.skip_proxy.clone())
-                            .unwrap_or_default()
-                    };
-                    let sp = SysProxy::new(port);
-                    sp.enable_with_bypass(&bypass_rules)?;
-                    if bypass_rules.is_empty() {
-                        println!("system proxy enabled on port {port} (default bypass rules)");
-                    } else {
-                        println!(
-                            "system proxy enabled on port {port} (bypass: {})",
-                            bypass_rules.join(", ")
+        Command::Sysproxy { action } => match action {
+            SysproxyAction::On { config, bypass } => {
+                let config_path = expand_tilde(&config);
+                let cfg = match clashx_rs_config::load_config(&config_path) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: failed to load config {}: {e}, using defaults",
+                            config_path.display()
                         );
+                        None
                     }
-                }
-                SysproxyAction::Off => {
-                    sp.disable()?;
-                    println!("system proxy disabled");
-                }
-                SysproxyAction::Status => {
-                    let status = sp.status()?;
-                    println!("{status}");
+                };
+                let port = cfg
+                    .as_ref()
+                    .and_then(|c| c.mixed_port)
+                    .unwrap_or(paths::DEFAULT_MIXED_PORT);
+                // Priority: CLI --bypass > config skip-proxy > built-in defaults
+                let bypass_rules = if !bypass.is_empty() {
+                    bypass
+                } else {
+                    cfg.as_ref()
+                        .map(|c| c.skip_proxy.clone())
+                        .unwrap_or_default()
+                };
+                SysProxy::new(port).enable_with_bypass(&bypass_rules)?;
+                if bypass_rules.is_empty() {
+                    println!("system proxy enabled on port {port} (default bypass rules)");
+                } else {
+                    println!(
+                        "system proxy enabled on port {port} (bypass: {})",
+                        bypass_rules.join(", ")
+                    );
                 }
             }
-        }
+            SysproxyAction::Off => {
+                SysProxy::new(paths::DEFAULT_MIXED_PORT).disable()?;
+                println!("system proxy disabled");
+            }
+            SysproxyAction::Status => {
+                let status = SysProxy::new(paths::DEFAULT_MIXED_PORT).status()?;
+                println!("{status}");
+            }
+        },
 
         Command::MmdbDownload { proxy, url, output } => {
             rustls::crypto::ring::default_provider()
