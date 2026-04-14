@@ -539,17 +539,21 @@ async fn handle_connection(
 
     let parsed_ip: Option<std::net::IpAddr> = target_host.parse().ok();
 
-    // DNS pre-resolve: if target is a domain and config has IP-based rules (GEOIP/IP-CIDR),
-    // resolve to IP so those rules can match. Uses config nameservers directly (bypasses
-    // system proxy) to get accurate IPs for GEOIP matching.
-    let resolved_ip = if let Some(ip) = parsed_ip {
-        Some(ip)
-    } else {
+    // Single lock acquisition: capture everything needed for DNS + process
+    // pre-work, then run both concurrently outside the lock.
+    let (need_dns, nameservers, dns_cache, need_process) = {
         let st = state.read().await;
-        if st.rule_engine.needs_resolved_ip() {
-            let nameservers = Arc::clone(&st.nameservers);
-            let dns_cache = Arc::clone(&st.dns_cache);
-            drop(st); // release read lock before async DNS query
+        (
+            parsed_ip.is_none() && st.rule_engine.needs_resolved_ip(),
+            Arc::clone(&st.nameservers),
+            Arc::clone(&st.dns_cache),
+            st.config.mode == Mode::Rule && st.has_process_rules(),
+        )
+    };
+
+    // Run DNS pre-resolve and process name lookup concurrently — independent I/O.
+    let dns_fut = async {
+        if need_dns {
             match clashx_rs_dns::resolve_with_nameservers(&target_host, &nameservers, &dns_cache)
                 .await
             {
@@ -567,21 +571,17 @@ async fn handle_connection(
                 }
             }
         } else {
-            None
+            parsed_ip
         }
     };
-
-    // Resolve process name before taking the routing read lock (may block on rescan).
-    let process_name = {
-        let st = state.read().await;
-        let need_process = st.config.mode == Mode::Rule && st.has_process_rules();
-        drop(st);
+    let process_fut = async {
         if need_process {
             lookup_process_name(source_addr).await
         } else {
             None
         }
     };
+    let (resolved_ip, process_name) = tokio::join!(dns_fut, process_fut);
 
     // --- Phase 1: Route resolution (under read lock) ---
     let group_name: Option<String>;

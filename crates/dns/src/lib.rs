@@ -41,8 +41,16 @@ impl DnsCache {
     }
 
     async fn get(&self, host: &str) -> Option<IpAddr> {
-        let key = host.to_ascii_lowercase();
         let entries = self.entries.read().await;
+        // Fast path: no uppercase → skip allocation, look up the borrowed slice.
+        if !host.bytes().any(|b| b.is_ascii_uppercase()) {
+            let entry = entries.get(host)?;
+            if Instant::now() < entry.expires {
+                return Some(entry.ip);
+            }
+            return None;
+        }
+        let key = host.to_ascii_lowercase();
         let entry = entries.get(&key)?;
         if Instant::now() < entry.expires {
             Some(entry.ip)
@@ -52,7 +60,11 @@ impl DnsCache {
     }
 
     async fn put(&self, host: &str, ip: IpAddr, ttl_secs: u32) {
-        let key = host.to_ascii_lowercase();
+        let key = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            host.to_ascii_lowercase()
+        } else {
+            host.to_string()
+        };
         let ttl = ttl_secs.max(MIN_TTL_SECS);
         let mut entries = self.entries.write().await;
 

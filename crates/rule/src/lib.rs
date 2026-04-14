@@ -92,10 +92,17 @@ impl RuleEngine {
     }
 
     fn find_match<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a RuleEntry> {
-        let host_lower = input.host.map(|h| h.to_lowercase());
+        // Avoid allocation when the host is already ASCII-lowercase (the common
+        // case — browsers normalize hostnames). Only pay the to_lowercase()
+        // cost when there is actually an uppercase ASCII byte to fold.
+        let host_lower_owned = input
+            .host
+            .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
+            .map(|h| h.to_ascii_lowercase());
+        let host_lower = host_lower_owned.as_deref().or(input.host);
         self.rules
             .iter()
-            .find(|rule| matches_rule(rule, input, host_lower.as_deref(), self.geoip_db.as_deref()))
+            .find(|rule| matches_rule(rule, input, host_lower, self.geoip_db.as_deref()))
     }
 }
 
