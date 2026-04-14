@@ -6,6 +6,8 @@ use std::sync::Arc;
 use clashx_rs_config::rule::RuleEntry;
 use clashx_rs_geoip::GeoIpDb;
 
+use crate::process::ProcessLookup;
+
 pub struct MatchInput<'a> {
     pub host: Option<&'a str>,
     pub ip: Option<IpAddr>,
@@ -16,6 +18,7 @@ pub struct RuleEngine {
     rules: Vec<RuleEntry>,
     geoip_db: Option<Arc<GeoIpDb>>,
     has_ip_rules: bool,
+    process_lookup: Arc<ProcessLookup>,
 }
 
 impl RuleEngine {
@@ -52,7 +55,7 @@ impl RuleEngine {
             _ => false,
         });
 
-        // Tell the scanner which process names to watch; it skips all others.
+        let process_lookup = Arc::new(ProcessLookup::new());
         let process_targets: Vec<&str> = rules
             .iter()
             .filter_map(|r| match r {
@@ -60,13 +63,20 @@ impl RuleEngine {
                 _ => None,
             })
             .collect();
-        process::set_process_name_targets(process_targets);
+        process_lookup.set_targets(process_targets);
 
         Self {
             rules,
             geoip_db,
             has_ip_rules,
+            process_lookup,
         }
+    }
+
+    /// Handle to the per-engine process-name lookup cache. Daemon uses this
+    /// to resolve process names lazily during rule evaluation.
+    pub fn process_lookup(&self) -> &Arc<ProcessLookup> {
+        &self.process_lookup
     }
 
     /// Whether the config has any GEOIP or IP-CIDR rules that need a resolved IP.

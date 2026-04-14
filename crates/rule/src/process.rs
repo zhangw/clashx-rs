@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -28,99 +28,114 @@ struct Snapshot {
     target_gen: u64,
 }
 
-static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
-
-static REBUILD_NOTIFY: once_cell::sync::Lazy<Notify> = once_cell::sync::Lazy::new(Notify::new);
-static REBUILDING: Mutex<bool> = Mutex::new(false);
-
-/// Global single-engine assumption: the last caller of
-/// `set_process_name_targets` wins. A second RuleEngine would clobber the
-/// first's targets. This daemon constructs one RuleEngine per run, which
-/// matches that assumption.
-static TARGETS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-
-/// Incremented each time targets change so concurrent in-flight rebuilds
-/// can detect stale results and discard them.
-static TARGET_GEN: AtomicU64 = AtomicU64::new(0);
-
-/// Record the set of process names referenced by PROCESS-NAME rules.
-/// The scanner uses this to skip all non-matching processes' socket lists.
-pub fn set_process_name_targets<I, S>(names: I)
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let set: HashSet<String> = names.into_iter().map(Into::into).collect();
-    if let Ok(mut guard) = TARGETS.lock() {
-        *guard = if set.is_empty() { None } else { Some(set) };
-    }
-    TARGET_GEN.fetch_add(1, Ordering::SeqCst);
-    if let Ok(mut guard) = SNAPSHOT.lock() {
-        *guard = None;
-    }
+/// Per-engine cache of port → process_name lookups. Owning this on
+/// `RuleEngine` (instead of process-globals) means each test or daemon
+/// instance has isolated state — no cross-test pollution.
+pub struct ProcessLookup {
+    snapshot: Mutex<Option<Snapshot>>,
+    rebuilding: Mutex<bool>,
+    rebuild_notify: Notify,
+    targets: Mutex<Option<HashSet<String>>>,
+    target_gen: AtomicU64,
 }
 
-fn targets_snapshot() -> Option<HashSet<String>> {
-    TARGETS.lock().ok().and_then(|g| g.clone())
-}
-
-/// Look up the process name that owns the TCP connection from `source_addr`.
-///
-/// Uses a 2-second port→process table snapshot restricted to processes whose
-/// names appear in any PROCESS-NAME rule. Cache hits are O(1) sync HashMap
-/// lookups. Cache misses trigger a scan offloaded to a blocking thread.
-/// Concurrent misses coalesce — only one scan runs at a time.
-pub async fn lookup_process_name(source_addr: SocketAddr) -> Option<String> {
-    if let Some(hit) = fast_path_lookup(&source_addr) {
-        return hit;
+impl ProcessLookup {
+    pub fn new() -> Self {
+        Self {
+            snapshot: Mutex::new(None),
+            rebuilding: Mutex::new(false),
+            rebuild_notify: Notify::new(),
+            targets: Mutex::new(None),
+            target_gen: AtomicU64::new(0),
+        }
     }
 
-    let should_rebuild = {
-        let mut flag = REBUILDING.lock().ok()?;
-        if *flag {
-            false
+    /// Record the set of process names referenced by PROCESS-NAME rules.
+    /// The scanner uses this to skip all non-matching processes' socket lists.
+    pub fn set_targets<I, S>(&self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let set: HashSet<String> = names.into_iter().map(Into::into).collect();
+        if let Ok(mut guard) = self.targets.lock() {
+            *guard = if set.is_empty() { None } else { Some(set) };
+        }
+        self.target_gen.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut guard) = self.snapshot.lock() {
+            *guard = None;
+        }
+    }
+
+    fn targets_snapshot(&self) -> Option<HashSet<String>> {
+        self.targets.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Look up the process name that owns the TCP connection from `source_addr`.
+    ///
+    /// Uses a 2-second port→process table snapshot restricted to processes whose
+    /// names appear in any PROCESS-NAME rule. Cache hits are O(1) sync HashMap
+    /// lookups. Cache misses trigger a scan offloaded to a blocking thread.
+    /// Concurrent misses coalesce — only one scan runs at a time.
+    pub async fn lookup(self: &Arc<Self>, source_addr: SocketAddr) -> Option<String> {
+        if let Some(hit) = self.fast_path_lookup(&source_addr) {
+            return hit;
+        }
+
+        let should_rebuild = {
+            let mut flag = self.rebuilding.lock().ok()?;
+            if *flag {
+                false
+            } else {
+                *flag = true;
+                true
+            }
+        };
+
+        if should_rebuild {
+            let me = Arc::clone(self);
+            let fresh = tokio::task::spawn_blocking(move || me.build_snapshot())
+                .await
+                .ok();
+            if let Ok(mut guard) = self.snapshot.lock() {
+                let current_gen = self.target_gen.load(Ordering::SeqCst);
+                *guard = fresh.filter(|s| s.target_gen == current_gen);
+            }
+            if let Ok(mut flag) = self.rebuilding.lock() {
+                *flag = false;
+            }
+            self.rebuild_notify.notify_waiters();
         } else {
-            *flag = true;
-            true
+            self.rebuild_notify.notified().await;
         }
-    };
 
-    if should_rebuild {
-        let fresh = tokio::task::spawn_blocking(build_snapshot).await.ok();
-        if let Ok(mut guard) = SNAPSHOT.lock() {
-            // Drop the fresh snapshot if targets changed while we were scanning —
-            // it was built with stale filter criteria.
-            let current_gen = TARGET_GEN.load(Ordering::SeqCst);
-            *guard = fresh.filter(|s| s.target_gen == current_gen);
-        }
-        if let Ok(mut flag) = REBUILDING.lock() {
-            *flag = false;
-        }
-        REBUILD_NOTIFY.notify_waiters();
-    } else {
-        REBUILD_NOTIFY.notified().await;
+        self.fast_path_lookup(&source_addr).flatten()
     }
 
-    fast_path_lookup(&source_addr).flatten()
-}
-
-fn fast_path_lookup(source_addr: &SocketAddr) -> Option<Option<String>> {
-    let port = source_addr.port();
-    let guard = SNAPSHOT.lock().ok()?;
-    let snap = guard.as_ref()?;
-    if Instant::now() >= snap.expires {
-        return None;
+    fn fast_path_lookup(&self, source_addr: &SocketAddr) -> Option<Option<String>> {
+        let port = source_addr.port();
+        let guard = self.snapshot.lock().ok()?;
+        let snap = guard.as_ref()?;
+        if Instant::now() >= snap.expires {
+            return None;
+        }
+        Some(snap.port_to_name.get(&port).cloned())
     }
-    Some(snap.port_to_name.get(&port).cloned())
+
+    fn build_snapshot(&self) -> Snapshot {
+        let target_gen = self.target_gen.load(Ordering::SeqCst);
+        let targets = self.targets_snapshot();
+        Snapshot {
+            port_to_name: scan_tcp_sockets(targets.as_ref()),
+            expires: Instant::now() + SNAPSHOT_TTL,
+            target_gen,
+        }
+    }
 }
 
-fn build_snapshot() -> Snapshot {
-    let target_gen = TARGET_GEN.load(Ordering::SeqCst);
-    let targets = targets_snapshot();
-    Snapshot {
-        port_to_name: scan_tcp_sockets(targets.as_ref()),
-        expires: Instant::now() + SNAPSHOT_TTL,
-        target_gen,
+impl Default for ProcessLookup {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -282,49 +297,27 @@ fn scan_tcp_sockets(_targets: Option<&HashSet<String>>) -> HashMap<u16, String> 
 mod tests {
     use super::*;
 
-    /// Cargo runs tests in parallel by default, but every test in this module
-    /// touches the same process-global SNAPSHOT/TARGETS/REBUILDING state.
-    /// Acquire this mutex at the top of any test that mutates that state to
-    /// force serial execution and prevent cross-test poisoning.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Drop all global state so a test starts from a known-empty world.
-    fn reset_globals() {
-        if let Ok(mut g) = SNAPSHOT.lock() {
-            *g = None;
-        }
-        if let Ok(mut g) = TARGETS.lock() {
-            *g = None;
-        }
-        if let Ok(mut g) = REBUILDING.lock() {
-            *g = false;
-        }
-        TARGET_GEN.fetch_add(1, Ordering::SeqCst);
-    }
-
     #[tokio::test]
     async fn lookup_returns_option() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        reset_globals();
+        let lookup = Arc::new(ProcessLookup::new());
         let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let _ = lookup_process_name(addr).await;
+        let _ = lookup.lookup(addr).await;
     }
 
     #[tokio::test]
     async fn first_lookup_populates_snapshot() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        reset_globals();
-        set_process_name_targets(["nonexistent_process_xyz"]);
+        let lookup = Arc::new(ProcessLookup::new());
+        lookup.set_targets(["nonexistent_process_xyz"]);
 
         {
-            let guard = SNAPSHOT.lock().unwrap();
+            let guard = lookup.snapshot.lock().unwrap();
             assert!(guard.is_none(), "snapshot should start empty");
         }
 
         let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
-        let _ = lookup_process_name(addr).await;
+        let _ = lookup.lookup(addr).await;
 
-        let guard = SNAPSHOT.lock().unwrap();
+        let guard = lookup.snapshot.lock().unwrap();
         let snap = guard.as_ref().expect("snapshot should be populated");
         assert!(
             Instant::now() < snap.expires,
@@ -334,20 +327,19 @@ mod tests {
 
     #[tokio::test]
     async fn second_lookup_reuses_snapshot() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        reset_globals();
-        set_process_name_targets(["nonexistent_process_xyz"]);
+        let lookup = Arc::new(ProcessLookup::new());
+        lookup.set_targets(["nonexistent_process_xyz"]);
         let addr: SocketAddr = "127.0.0.1:54322".parse().unwrap();
 
-        let _ = lookup_process_name(addr).await;
+        let _ = lookup.lookup(addr).await;
         let first_expires = {
-            let g = SNAPSHOT.lock().unwrap();
+            let g = lookup.snapshot.lock().unwrap();
             g.as_ref().expect("snapshot populated").expires
         };
 
-        let _ = lookup_process_name(addr).await;
+        let _ = lookup.lookup(addr).await;
         let second_expires = {
-            let g = SNAPSHOT.lock().unwrap();
+            let g = lookup.snapshot.lock().unwrap();
             g.as_ref().expect("snapshot populated").expires
         };
 

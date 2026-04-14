@@ -10,7 +10,7 @@ use clashx_rs_geoip::GeoIpDb;
 use clashx_rs_proxy::inbound::{self, InboundResult};
 use clashx_rs_proxy::outbound::{self, OutboundStream};
 use clashx_rs_proxy::relay::relay;
-use clashx_rs_rule::{process::lookup_process_name, MatchInput, RuleEngine};
+use clashx_rs_rule::{MatchInput, RuleEngine};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
@@ -630,7 +630,7 @@ async fn handle_connection(
                         };
                     }
                     if need_process {
-                        owned_process = lookup_process_name(source_addr).await;
+                        owned_process = rule_engine.process_lookup().lookup(source_addr).await;
                     }
                     start = resume_from;
                 }
