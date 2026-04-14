@@ -1,14 +1,92 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::Instant;
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
+use tokio::sync::RwLock;
 use tokio::task;
 
 static DNS_TX_ID: AtomicU16 = AtomicU16::new(1);
 
 /// Max DNS label length per RFC 1035.
 const MAX_LABEL_LEN: usize = 63;
+
+/// Max cache entries to prevent unbounded memory growth.
+const MAX_CACHE_SIZE: usize = 4096;
+
+/// Minimum TTL to cache (even if the server says 0).
+const MIN_TTL_SECS: u32 = 10;
+
+// ---------------------------------------------------------------------------
+// DNS cache
+// ---------------------------------------------------------------------------
+
+struct CacheEntry {
+    ip: IpAddr,
+    expires: Instant,
+}
+
+/// TTL-based DNS cache. Thread-safe, bounded size.
+pub struct DnsCache {
+    entries: RwLock<HashMap<String, CacheEntry>>,
+}
+
+impl DnsCache {
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+        }
+    }
+
+    async fn get(&self, host: &str) -> Option<IpAddr> {
+        let entries = self.entries.read().await;
+        let entry = entries.get(host)?;
+        if Instant::now() < entry.expires {
+            Some(entry.ip)
+        } else {
+            None
+        }
+    }
+
+    async fn put(&self, host: &str, ip: IpAddr, ttl_secs: u32) {
+        let ttl = ttl_secs.max(MIN_TTL_SECS);
+        let mut entries = self.entries.write().await;
+
+        // Evict expired entries if we're at capacity
+        if entries.len() >= MAX_CACHE_SIZE {
+            let now = Instant::now();
+            entries.retain(|_, v| now < v.expires);
+        }
+        // If still at capacity after eviction, drop oldest 25%
+        if entries.len() >= MAX_CACHE_SIZE {
+            let mut by_expiry: Vec<_> = entries.keys().cloned().collect();
+            by_expiry.sort_by_key(|k| entries.get(k).map(|e| e.expires));
+            for key in by_expiry.iter().take(MAX_CACHE_SIZE / 4) {
+                entries.remove(key);
+            }
+        }
+
+        entries.insert(
+            host.to_string(),
+            CacheEntry {
+                ip,
+                expires: Instant::now() + std::time::Duration::from_secs(ttl as u64),
+            },
+        );
+    }
+}
+
+impl Default for DnsCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resolution functions
+// ---------------------------------------------------------------------------
 
 /// Resolve a hostname to an IP address using the system resolver.
 pub async fn resolve(host: &str) -> Result<IpAddr> {
@@ -25,10 +103,8 @@ pub async fn resolve(host: &str) -> Result<IpAddr> {
     Ok(ip)
 }
 
-/// Resolve a hostname by sending a UDP DNS query directly to the given nameserver,
-/// bypassing the system resolver. This avoids DNS queries being routed through the
-/// system proxy, which is critical for GEOIP accuracy.
-pub async fn resolve_via(host: &str, nameserver: IpAddr) -> Result<IpAddr> {
+/// Resolve a hostname by sending a UDP DNS query directly to the given nameserver.
+pub async fn resolve_via(host: &str, nameserver: IpAddr) -> Result<DnsResult> {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
     let ns_addr = SocketAddr::new(nameserver, 53);
 
@@ -45,32 +121,41 @@ pub async fn resolve_via(host: &str, nameserver: IpAddr) -> Result<IpAddr> {
     parse_dns_response(&buf[..n], host, tx_id)
 }
 
-/// Resolve by racing all nameservers concurrently — first successful response wins.
+/// Resolve by racing all nameservers concurrently with caching.
 /// Falls back to the system resolver if nameservers is empty or all fail.
-pub async fn resolve_with_nameservers(host: &str, nameservers: &[IpAddr]) -> Result<IpAddr> {
+pub async fn resolve_with_nameservers(
+    host: &str,
+    nameservers: &[IpAddr],
+    cache: &DnsCache,
+) -> Result<IpAddr> {
+    // Check cache first
+    if let Some(ip) = cache.get(host).await {
+        return Ok(ip);
+    }
+
     if nameservers.is_empty() {
         return resolve(host).await;
     }
 
     // Race all nameservers concurrently, take the first success.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<IpAddr>(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DnsResult>(1);
 
     for ns in nameservers {
         let ns = *ns;
         let host = host.to_string();
         let tx = tx.clone();
         tokio::spawn(async move {
-            if let Ok(ip) = resolve_via(&host, ns).await {
-                let _ = tx.send(ip).await;
+            if let Ok(result) = resolve_via(&host, ns).await {
+                let _ = tx.send(result).await;
             }
         });
     }
-    drop(tx); // drop our sender so rx closes when all spawned tasks finish
+    drop(tx);
 
-    // Wait for the first result, or timeout if all fail.
     let timeout = std::time::Duration::from_secs(2) + std::time::Duration::from_millis(100);
-    if let Ok(Some(ip)) = tokio::time::timeout(timeout, rx.recv()).await {
-        return Ok(ip);
+    if let Ok(Some(result)) = tokio::time::timeout(timeout, rx.recv()).await {
+        cache.put(host, result.ip, result.ttl).await;
+        return Ok(result.ip);
     }
 
     tracing::debug!(
@@ -78,6 +163,17 @@ pub async fn resolve_with_nameservers(host: &str, nameservers: &[IpAddr]) -> Res
         "all nameservers failed, falling back to system resolver"
     );
     resolve(host).await
+}
+
+// ---------------------------------------------------------------------------
+// DNS wire format
+// ---------------------------------------------------------------------------
+
+/// Result of a DNS lookup including TTL for caching.
+#[derive(Debug)]
+pub struct DnsResult {
+    pub ip: IpAddr,
+    pub ttl: u32,
 }
 
 /// Build a minimal DNS A-record query packet.
@@ -113,10 +209,8 @@ fn build_dns_query(host: &str, tx_id: u16) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Parse a DNS response and extract the first A record.
-/// Handles CNAME chains: if the answer section contains CNAME records followed
-/// by A records (common with CDN domains like www.baidu.com), the A record is found.
-fn parse_dns_response(data: &[u8], host: &str, expected_id: u16) -> Result<IpAddr> {
+/// Parse a DNS response and extract the first A record with its TTL.
+fn parse_dns_response(data: &[u8], host: &str, expected_id: u16) -> Result<DnsResult> {
     if data.len() < 12 {
         anyhow::bail!("DNS response too short");
     }
@@ -165,6 +259,7 @@ fn parse_dns_response(data: &[u8], host: &str, expected_id: u16) -> Result<IpAdd
         }
 
         let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
         let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
         pos += 10;
 
@@ -180,7 +275,7 @@ fn parse_dns_response(data: &[u8], host: &str, expected_id: u16) -> Result<IpAdd
                 data[pos + 2],
                 data[pos + 3],
             ));
-            return Ok(ip);
+            return Ok(DnsResult { ip, ttl });
         }
 
         pos += rdlength;
@@ -237,13 +332,13 @@ mod tests {
     #[test]
     fn build_query_encodes_labels() {
         let query = build_dns_query("www.example.com", 0x1234).unwrap();
-        assert_eq!(query[12], 3); // "www" length
+        assert_eq!(query[12], 3);
         assert_eq!(&query[13..16], b"www");
-        assert_eq!(query[16], 7); // "example" length
+        assert_eq!(query[16], 7);
         assert_eq!(&query[17..24], b"example");
-        assert_eq!(query[24], 3); // "com" length
+        assert_eq!(query[24], 3);
         assert_eq!(&query[25..28], b"com");
-        assert_eq!(query[28], 0); // root
+        assert_eq!(query[28], 0);
     }
 
     #[test]
@@ -255,7 +350,6 @@ mod tests {
 
     #[test]
     fn build_query_trailing_dot() {
-        // "example.com." should produce the same packet as "example.com"
         let q1 = build_dns_query("example.com.", 1).unwrap();
         let q2 = build_dns_query("example.com", 1).unwrap();
         assert_eq!(q1, q2);
@@ -276,39 +370,37 @@ mod tests {
 
     #[test]
     fn skip_name_handles_labels() {
-        // "www" (3 bytes) + null
         let data = [3, b'w', b'w', b'w', 0];
         assert_eq!(skip_dns_name(&data, 0).unwrap(), 5);
     }
 
     #[test]
     fn skip_name_rejects_truncated() {
-        // Label says 10 bytes but only 3 available
         let data = [10, b'a', b'b', b'c'];
         assert!(skip_dns_name(&data, 0).is_err());
     }
 
     #[test]
     fn skip_name_rejects_oversized_label() {
-        // Label length 64 (> MAX_LABEL_LEN=63)
         let mut data = vec![64];
         data.extend(vec![b'a'; 64]);
         data.push(0);
         assert!(skip_dns_name(&data, 0).is_err());
     }
 
-    /// Build a synthetic DNS response for testing the parser.
+    // --- Test helpers for building synthetic DNS responses ---
+
     fn build_test_response(
         tx_id: u16,
         flags: u16,
-        questions: &[&[u8]], // each: encoded name + QTYPE(2) + QCLASS(2)
-        answers: &[&[u8]], // each: encoded name + TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) + RDATA
+        questions: &[&[u8]],
+        answers: &[&[u8]],
     ) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&tx_id.to_be_bytes());
         buf.extend_from_slice(&flags.to_be_bytes());
-        buf.extend_from_slice(&(questions.len() as u16).to_be_bytes()); // QDCOUNT
-        buf.extend_from_slice(&(answers.len() as u16).to_be_bytes()); // ANCOUNT
+        buf.extend_from_slice(&(questions.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&(answers.len() as u16).to_be_bytes());
         buf.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
         buf.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
         for q in questions {
@@ -335,18 +427,22 @@ mod tests {
 
     fn make_question(name: &str) -> Vec<u8> {
         let mut buf = encode_name(name);
-        buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE=A, QCLASS=IN
+        buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        buf
+    }
+
+    fn make_a_record_with_ttl(name: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
+        let mut buf = encode_name(name);
+        buf.extend_from_slice(&[0x00, 0x01]); // TYPE=A
+        buf.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        buf.extend_from_slice(&ttl.to_be_bytes());
+        buf.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
+        buf.extend_from_slice(&ip);
         buf
     }
 
     fn make_a_record(name: &str, ip: [u8; 4]) -> Vec<u8> {
-        let mut buf = encode_name(name);
-        buf.extend_from_slice(&[0x00, 0x01]); // TYPE=A
-        buf.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
-        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL=60
-        buf.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
-        buf.extend_from_slice(&ip);
-        buf
+        make_a_record_with_ttl(name, ip, 60)
     }
 
     fn make_cname_record(name: &str, target: &str) -> Vec<u8> {
@@ -360,33 +456,43 @@ mod tests {
         buf
     }
 
+    // --- Response parsing tests ---
+
     #[test]
     fn parse_simple_a_response() {
         let q = make_question("example.com");
         let a = make_a_record("example.com", [93, 184, 216, 34]);
         let resp = build_test_response(0x1234, 0x8180, &[&q], &[&a]);
 
-        let ip = parse_dns_response(&resp, "example.com", 0x1234).unwrap();
-        assert_eq!(ip, "93.184.216.34".parse::<IpAddr>().unwrap());
+        let result = parse_dns_response(&resp, "example.com", 0x1234).unwrap();
+        assert_eq!(result.ip, "93.184.216.34".parse::<IpAddr>().unwrap());
+        assert_eq!(result.ttl, 60);
+    }
+
+    #[test]
+    fn parse_response_preserves_ttl() {
+        let q = make_question("example.com");
+        let a = make_a_record_with_ttl("example.com", [1, 2, 3, 4], 300);
+        let resp = build_test_response(0x0001, 0x8180, &[&q], &[&a]);
+
+        let result = parse_dns_response(&resp, "example.com", 0x0001).unwrap();
+        assert_eq!(result.ttl, 300);
     }
 
     #[test]
     fn parse_cname_then_a_response() {
-        // www.baidu.com → CNAME www.a.shifen.com → A 180.101.51.73
         let q = make_question("www.baidu.com");
         let cname = make_cname_record("www.baidu.com", "www.a.shifen.com");
         let a = make_a_record("www.a.shifen.com", [180, 101, 51, 73]);
         let resp = build_test_response(0x0001, 0x8180, &[&q], &[&cname, &a]);
 
-        let ip = parse_dns_response(&resp, "www.baidu.com", 0x0001).unwrap();
-        assert_eq!(ip, "180.101.51.73".parse::<IpAddr>().unwrap());
+        let result = parse_dns_response(&resp, "www.baidu.com", 0x0001).unwrap();
+        assert_eq!(result.ip, "180.101.51.73".parse::<IpAddr>().unwrap());
     }
 
     #[test]
     fn parse_response_with_pointer_names() {
-        // Simulate compressed name using pointer 0xC00C (offset 12 = start of question name)
         let q = make_question("example.com");
-        // Answer uses pointer to offset 12 instead of full name
         let mut a = vec![0xC0, 0x0C]; // pointer to question name
         a.extend_from_slice(&[0x00, 0x01]); // TYPE=A
         a.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
@@ -395,8 +501,8 @@ mod tests {
         a.extend_from_slice(&[1, 2, 3, 4]);
         let resp = build_test_response(0x0042, 0x8180, &[&q], &[&a]);
 
-        let ip = parse_dns_response(&resp, "example.com", 0x0042).unwrap();
-        assert_eq!(ip, "1.2.3.4".parse::<IpAddr>().unwrap());
+        let result = parse_dns_response(&resp, "example.com", 0x0042).unwrap();
+        assert_eq!(result.ip, "1.2.3.4".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -412,7 +518,6 @@ mod tests {
     #[test]
     fn parse_response_nxdomain() {
         let q = make_question("nonexistent.example.com");
-        // rcode=3 (NXDOMAIN), no answers
         let resp = build_test_response(0x0001, 0x8183, &[&q], &[]);
 
         let err = parse_dns_response(&resp, "nonexistent.example.com", 0x0001).unwrap_err();
@@ -422,7 +527,6 @@ mod tests {
     #[test]
     fn parse_response_truncated_tc_bit() {
         let q = make_question("example.com");
-        // TC bit set (0x0200)
         let resp = build_test_response(0x0001, 0x8380, &[&q], &[]);
 
         let err = parse_dns_response(&resp, "example.com", 0x0001).unwrap_err();
@@ -431,7 +535,6 @@ mod tests {
 
     #[test]
     fn parse_response_no_a_record_only_cname() {
-        // Server returns CNAME only, no A record (client expected to follow)
         let q = make_question("alias.example.com");
         let cname = make_cname_record("alias.example.com", "real.example.com");
         let resp = build_test_response(0x0001, 0x8180, &[&q], &[&cname]);
@@ -447,13 +550,61 @@ mod tests {
         let a2 = make_a_record("multi.example.com", [10, 0, 0, 2]);
         let resp = build_test_response(0x0001, 0x8180, &[&q], &[&a1, &a2]);
 
-        let ip = parse_dns_response(&resp, "multi.example.com", 0x0001).unwrap();
-        assert_eq!(ip, "10.0.0.1".parse::<IpAddr>().unwrap());
+        let result = parse_dns_response(&resp, "multi.example.com", 0x0001).unwrap();
+        assert_eq!(result.ip, "10.0.0.1".parse::<IpAddr>().unwrap());
     }
 
     #[test]
     fn parse_response_too_short() {
         let err = parse_dns_response(&[0u8; 6], "x.com", 0).unwrap_err();
         assert!(err.to_string().contains("too short"));
+    }
+
+    // --- Cache tests ---
+
+    #[tokio::test]
+    async fn cache_hit_returns_cached_ip() {
+        let cache = DnsCache::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        cache.put("example.com", ip, 60).await;
+
+        assert_eq!(cache.get("example.com").await, Some(ip));
+    }
+
+    #[tokio::test]
+    async fn cache_miss_returns_none() {
+        let cache = DnsCache::new();
+        assert_eq!(cache.get("unknown.com").await, None);
+    }
+
+    #[tokio::test]
+    async fn cache_expired_returns_none() {
+        let cache = DnsCache::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        // Insert with 0 TTL (clamped to MIN_TTL_SECS=10, but we can test expiry logic
+        // by directly inserting an already-expired entry)
+        {
+            let mut entries = cache.entries.write().await;
+            entries.insert(
+                "expired.com".to_string(),
+                CacheEntry {
+                    ip,
+                    expires: Instant::now() - std::time::Duration::from_secs(1),
+                },
+            );
+        }
+
+        assert_eq!(cache.get("expired.com").await, None);
+    }
+
+    #[tokio::test]
+    async fn cache_respects_min_ttl() {
+        let cache = DnsCache::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        cache.put("example.com", ip, 0).await; // TTL=0, should be clamped to MIN_TTL_SECS
+
+        // Should still be cached (min TTL is 10s)
+        assert_eq!(cache.get("example.com").await, Some(ip));
     }
 }

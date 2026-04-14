@@ -41,6 +41,7 @@ struct DaemonState {
     cooldown: Arc<crate::retry::CooldownTracker>,
     mmdb_path: PathBuf,
     nameservers: Arc<[IpAddr]>,
+    dns_cache: Arc<clashx_rs_dns::DnsCache>,
 }
 
 impl DaemonState {
@@ -100,6 +101,7 @@ impl DaemonState {
             cooldown: Arc::new(crate::retry::CooldownTracker::new()),
             mmdb_path,
             nameservers,
+            dns_cache: Arc::new(clashx_rs_dns::DnsCache::new()),
         }
     }
 
@@ -535,19 +537,25 @@ async fn handle_connection(
     // DNS pre-resolve: if target is a domain and config has IP-based rules (GEOIP/IP-CIDR),
     // resolve to IP so those rules can match. Uses config nameservers directly (bypasses
     // system proxy) to get accurate IPs for GEOIP matching.
-    let (needs_resolve, nameservers) = if parsed_ip.is_none() {
+    let (needs_resolve, nameservers, dns_cache) = if parsed_ip.is_none() {
         let st = state.read().await;
         (
             st.rule_engine.needs_resolved_ip(),
             Arc::clone(&st.nameservers),
+            Arc::clone(&st.dns_cache),
         )
     } else {
-        (false, Arc::from([]))
+        (
+            false,
+            Arc::from([]),
+            Arc::new(clashx_rs_dns::DnsCache::new()),
+        )
     };
     let resolved_ip = if parsed_ip.is_some() {
         parsed_ip
     } else if needs_resolve {
-        match clashx_rs_dns::resolve_with_nameservers(&target_host, &nameservers).await {
+        match clashx_rs_dns::resolve_with_nameservers(&target_host, &nameservers, &dns_cache).await
+        {
             Ok(ip) => {
                 tracing::debug!(host = %target_host, resolved = %ip, "DNS pre-resolved");
                 Some(ip)
