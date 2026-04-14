@@ -17,36 +17,44 @@ use control::ControlRequest;
 #[derive(Debug, Parser)]
 #[command(name = "clashx-rs", version, about)]
 struct Cli {
-    /// Daemon mixed-port to target for control commands (stop/reload/status/...).
-    /// If omitted, the port is read from the config file.
+    /// Config file path (used by `run`, `sysproxy on`, and to resolve port for control commands)
+    #[arg(
+        short,
+        long,
+        global = true,
+        default_value = "~/.config/clashx-rs/config.yaml"
+    )]
+    config: String,
+    /// Override the daemon mixed-port (falls back to config, then default)
     #[arg(long, global = true)]
     port: Option<u16>,
-    /// Config file to read mixed-port from when --port is not given.
-    #[arg(long, global = true, default_value = "~/.config/clashx-rs/config.yaml")]
-    config_for_port: String,
     #[command(subcommand)]
     command: Command,
 }
 
-/// Resolve the daemon port from CLI flag or config file, falling back to default.
+/// Resolve the daemon port: explicit --port wins, else config mixed-port, else default.
 fn resolve_port(cli: &Cli) -> u16 {
     if let Some(p) = cli.port {
         return p;
     }
-    let path = expand_tilde(&cli.config_for_port);
-    clashx_rs_config::load_config(&path)
-        .ok()
-        .and_then(|c| c.mixed_port)
-        .unwrap_or(paths::DEFAULT_MIXED_PORT)
+    let path = expand_tilde(&cli.config);
+    match clashx_rs_config::load_config(&path) {
+        Ok(c) => c.mixed_port.unwrap_or(paths::DEFAULT_MIXED_PORT),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                err = %e,
+                "failed to load config, using default port"
+            );
+            paths::DEFAULT_MIXED_PORT
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the proxy daemon
     Run {
-        /// Path to the configuration file
-        #[arg(short, long, default_value = "~/.config/clashx-rs/config.yaml")]
-        config: String,
         /// Run as a background daemon
         #[arg(short = 'd', long)]
         daemon: bool,
@@ -107,9 +115,6 @@ enum Command {
 enum SysproxyAction {
     /// Enable system proxy
     On {
-        /// Config file to read mixed-port from
-        #[arg(short, long, default_value = "~/.config/clashx-rs/config.yaml")]
-        config: String,
         /// Subnets/domains to bypass the proxy (default: private ranges + localhost)
         #[arg(long = "bypass")]
         bypass: Vec<String>,
@@ -137,11 +142,11 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let config_path = expand_tilde(&cli.config);
     let ctrl_port = resolve_port(&cli);
 
     match cli.command {
         Command::Run {
-            config,
             daemon,
             selections,
             mmdb,
@@ -150,7 +155,6 @@ fn main() -> Result<()> {
             rustls::crypto::ring::default_provider()
                 .install_default()
                 .ok();
-            let config_path = expand_tilde(&config);
             let mmdb_path = mmdb
                 .map(|p| expand_tilde(&p))
                 .unwrap_or_else(paths::default_mmdb_path);
@@ -177,46 +181,32 @@ fn main() -> Result<()> {
         }
 
         Command::Sysproxy { action } => match action {
-            SysproxyAction::On { config, bypass } => {
-                let config_path = expand_tilde(&config);
-                let cfg = match clashx_rs_config::load_config(&config_path) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        eprintln!(
-                            "warning: failed to load config {}: {e}, using defaults",
-                            config_path.display()
-                        );
-                        None
-                    }
-                };
-                let port = cfg
-                    .as_ref()
-                    .and_then(|c| c.mixed_port)
-                    .unwrap_or(paths::DEFAULT_MIXED_PORT);
+            SysproxyAction::On { bypass } => {
                 // Priority: CLI --bypass > config skip-proxy > built-in defaults
                 let bypass_rules = if !bypass.is_empty() {
                     bypass
                 } else {
-                    cfg.as_ref()
-                        .map(|c| c.skip_proxy.clone())
+                    clashx_rs_config::load_config(&config_path)
+                        .ok()
+                        .map(|c| c.skip_proxy)
                         .unwrap_or_default()
                 };
-                SysProxy::new(port).enable_with_bypass(&bypass_rules)?;
+                SysProxy::new(ctrl_port).enable_with_bypass(&bypass_rules)?;
                 if bypass_rules.is_empty() {
-                    println!("system proxy enabled on port {port} (default bypass rules)");
+                    println!("system proxy enabled on port {ctrl_port} (default bypass rules)");
                 } else {
                     println!(
-                        "system proxy enabled on port {port} (bypass: {})",
+                        "system proxy enabled on port {ctrl_port} (bypass: {})",
                         bypass_rules.join(", ")
                     );
                 }
             }
             SysproxyAction::Off => {
-                SysProxy::new(paths::DEFAULT_MIXED_PORT).disable()?;
+                SysProxy::new(ctrl_port).disable()?;
                 println!("system proxy disabled");
             }
             SysproxyAction::Status => {
-                let status = SysProxy::new(paths::DEFAULT_MIXED_PORT).status()?;
+                let status = SysProxy::new(ctrl_port).status()?;
                 println!("{status}");
             }
         },
