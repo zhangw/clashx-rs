@@ -17,8 +17,27 @@ use control::ControlRequest;
 #[derive(Debug, Parser)]
 #[command(name = "clashx-rs", version, about)]
 struct Cli {
+    /// Daemon mixed-port to target for control commands (stop/reload/status/...).
+    /// If omitted, the port is read from the config file.
+    #[arg(long, global = true)]
+    port: Option<u16>,
+    /// Config file to read mixed-port from when --port is not given.
+    #[arg(long, global = true, default_value = "~/.config/clashx-rs/config.yaml")]
+    config_for_port: String,
     #[command(subcommand)]
     command: Command,
+}
+
+/// Resolve the daemon port from CLI flag or config file, falling back to default.
+fn resolve_port(cli: &Cli) -> u16 {
+    if let Some(p) = cli.port {
+        return p;
+    }
+    let path = expand_tilde(&cli.config_for_port);
+    clashx_rs_config::load_config(&path)
+        .ok()
+        .and_then(|c| c.mixed_port)
+        .unwrap_or(paths::DEFAULT_MIXED_PORT)
 }
 
 #[derive(Debug, Subcommand)]
@@ -118,6 +137,7 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let ctrl_port = resolve_port(&cli);
 
     match cli.command {
         Command::Run {
@@ -141,18 +161,20 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Stop => client::send_command(ControlRequest::Stop)?,
-        Command::Reload => client::send_command(ControlRequest::Reload)?,
-        Command::Status => client::send_command(ControlRequest::Status)?,
-        Command::Proxies => client::send_command(ControlRequest::Proxies)?,
-        Command::Groups => client::send_command(ControlRequest::Groups)?,
-        Command::Rules => client::send_command(ControlRequest::Rules)?,
+        Command::Stop => client::send_command(ControlRequest::Stop, ctrl_port)?,
+        Command::Reload => client::send_command(ControlRequest::Reload, ctrl_port)?,
+        Command::Status => client::send_command(ControlRequest::Status, ctrl_port)?,
+        Command::Proxies => client::send_command(ControlRequest::Proxies, ctrl_port)?,
+        Command::Groups => client::send_command(ControlRequest::Groups, ctrl_port)?,
+        Command::Rules => client::send_command(ControlRequest::Rules, ctrl_port)?,
 
         Command::Switch { group, proxy } => {
-            client::send_command(ControlRequest::Switch { group, proxy })?
+            client::send_command(ControlRequest::Switch { group, proxy }, ctrl_port)?
         }
 
-        Command::Test { domain } => client::send_command(ControlRequest::Test { domain })?,
+        Command::Test { domain } => {
+            client::send_command(ControlRequest::Test { domain }, ctrl_port)?
+        }
 
         Command::Sysproxy { action } => match action {
             SysproxyAction::On { config, bypass } => {

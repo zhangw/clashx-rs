@@ -383,7 +383,7 @@ async fn run_daemon(
             .with_context(|| format!("failed to chmod runtime dir: {}", rt_dir.display()))?;
     }
 
-    let sock = paths::socket_path();
+    let sock = paths::socket_path(port);
     let _ = std::fs::remove_file(&sock);
     let control_listener = UnixListener::bind(&sock)
         .with_context(|| format!("failed to bind control socket: {}", sock.display()))?;
@@ -396,7 +396,7 @@ async fn run_daemon(
     }
     tracing::info!(path = %sock.display(), "control socket bound");
 
-    let pid_file = paths::pid_path();
+    let pid_file = paths::pid_path(port);
     std::fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write PID file: {}", pid_file.display()))?;
 
@@ -891,8 +891,8 @@ async fn dispatch_control(
                 if let Err(e) = sysproxy.disable() {
                     tracing::warn!("failed to disable system proxy on stop: {e}");
                 }
-                let _ = std::fs::remove_file(paths::socket_path());
-                let _ = std::fs::remove_file(paths::pid_path());
+                let _ = std::fs::remove_file(paths::socket_path(port));
+                let _ = std::fs::remove_file(paths::pid_path(port));
                 tracing::info!("cleanup complete");
                 std::process::exit(0);
             });
