@@ -25,6 +25,8 @@ pub struct Config {
     pub proxy_groups: Vec<ProxyGroup>,
     #[serde(default)]
     pub rules: Vec<String>,
+    #[serde(default)]
+    pub skip_proxy: Vec<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }

@@ -69,6 +69,9 @@ enum Command {
     Sysproxy {
         #[command(subcommand)]
         action: SysproxyAction,
+        /// Config file to read skip-proxy bypass rules from
+        #[arg(short, long, default_value = "~/.config/clashx-rs/config.yaml")]
+        config: String,
     },
     /// Download the GeoIP mmdb database
     MmdbDownload {
@@ -147,12 +150,29 @@ fn main() -> Result<()> {
 
         Command::Test { domain } => client::send_command(ControlRequest::Test { domain })?,
 
-        Command::Sysproxy { action } => {
-            let sp = SysProxy::new(paths::DEFAULT_MIXED_PORT);
+        Command::Sysproxy { action, config } => {
+            let config_path = expand_tilde(&config);
+            let cfg = clashx_rs_config::load_config(&config_path).ok();
+            let port = cfg
+                .as_ref()
+                .and_then(|c| c.mixed_port)
+                .unwrap_or(paths::DEFAULT_MIXED_PORT);
+            let bypass = cfg
+                .as_ref()
+                .map(|c| c.skip_proxy.clone())
+                .unwrap_or_default();
+            let sp = SysProxy::new(port);
             match action {
                 SysproxyAction::On => {
-                    sp.enable()?;
-                    println!("system proxy enabled on port 7890");
+                    sp.enable_with_bypass(&bypass)?;
+                    if bypass.is_empty() {
+                        println!("system proxy enabled on port {port} (default bypass rules)");
+                    } else {
+                        println!(
+                            "system proxy enabled on port {port} (bypass: {})",
+                            bypass.join(", ")
+                        );
+                    }
                 }
                 SysproxyAction::Off => {
                     sp.disable()?;
