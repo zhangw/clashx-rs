@@ -93,18 +93,33 @@ impl ProcessLookup {
         };
 
         if should_rebuild {
+            // Drop guard ensures `rebuilding` is reset and waiters are
+            // notified even if this future is cancelled mid-await — without
+            // it, a cancelled rebuild would deadlock all other lookups
+            // forever (flag stuck true, no notify fired).
+            struct RebuildGuard<'a>(&'a ProcessLookup);
+            impl Drop for RebuildGuard<'_> {
+                fn drop(&mut self) {
+                    if let Ok(mut flag) = self.0.rebuilding.lock() {
+                        *flag = false;
+                    }
+                    self.0.rebuild_notify.notify_waiters();
+                }
+            }
+            let _guard = RebuildGuard(self);
+
             let me = Arc::clone(self);
             let fresh = tokio::task::spawn_blocking(move || me.build_snapshot())
                 .await
                 .ok();
             if let Ok(mut guard) = self.snapshot.lock() {
+                // Discard a stale-by-target_gen snapshot: if set_targets
+                // bumped the generation while we were scanning, the result
+                // was built with stale filter criteria.
                 let current_gen = self.target_gen.load(Ordering::SeqCst);
                 *guard = fresh.filter(|s| s.target_gen == current_gen);
             }
-            if let Ok(mut flag) = self.rebuilding.lock() {
-                *flag = false;
-            }
-            self.rebuild_notify.notify_waiters();
+            // RebuildGuard runs here, clearing the flag and notifying.
         } else {
             self.rebuild_notify.notified().await;
         }
@@ -112,6 +127,9 @@ impl ProcessLookup {
         self.fast_path_lookup(&source_addr).flatten()
     }
 
+    /// Returns `Some(Some(name))` for a hit, `Some(None)` for a known miss
+    /// within the snapshot, and `None` when the snapshot is stale or absent
+    /// (caller should trigger a rebuild).
     fn fast_path_lookup(&self, source_addr: &SocketAddr) -> Option<Option<String>> {
         let port = source_addr.port();
         let guard = self.snapshot.lock().ok()?;
