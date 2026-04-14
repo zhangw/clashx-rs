@@ -519,7 +519,10 @@ async fn handle_connection(
         parsed_ip
     } else if needs_resolve {
         match clashx_rs_dns::resolve(&target_host).await {
-            Ok(ip) => Some(ip),
+            Ok(ip) => {
+                tracing::debug!(host = %target_host, resolved = %ip, "DNS pre-resolved");
+                Some(ip)
+            }
             Err(e) => {
                 tracing::debug!(
                     host = %target_host,
