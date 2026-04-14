@@ -89,36 +89,34 @@ impl RuleEngine {
             .map(|r| (r.target(), r.description()))
     }
 
-    /// Two-phase evaluation: walk rules; if an IP-dependent rule is reached
-    /// before any host/process rule matched, return `NeedsIp(rule_index)` so
-    /// the caller can do DNS resolution and resume. Skips IP work entirely
-    /// when an earlier domain rule matches.
-    pub fn evaluate_until_ip_needed<'a>(&'a self, input: &MatchInput<'_>) -> EvalStep<'a> {
+    /// Lazy evaluation. Walk rules from `start`; when a rule needs data
+    /// `input` doesn't carry yet (resolved IP, or process name), pause and
+    /// return `NeedsData { resume_from, need_ip, need_process }`. Caller
+    /// populates the requested field(s) and re-invokes with the new input
+    /// and the returned `resume_from` index.
+    ///
+    /// Rules that cheaply match on existing input (host / already-known IP /
+    /// already-known process) still run and can short-circuit.
+    pub fn evaluate_from<'a>(&'a self, input: &MatchInput<'_>, start: usize) -> EvalStep<'a> {
         let host_lower = self.host_lower(input);
         let host_lower = host_lower.as_deref().or(input.host);
-        for (idx, rule) in self.rules.iter().enumerate() {
-            if self.rule_needs_ip(rule) && input.ip.is_none() {
-                return EvalStep::NeedsIp { resume_from: idx };
+        for (offset, rule) in self.rules[start..].iter().enumerate() {
+            let idx = start + offset;
+            let needs_ip = self.rule_needs_ip(rule) && input.ip.is_none();
+            let needs_process =
+                matches!(rule, RuleEntry::ProcessName { .. }) && input.process_name.is_none();
+            if needs_ip || needs_process {
+                return EvalStep::NeedsData {
+                    resume_from: idx,
+                    need_ip: needs_ip,
+                    need_process: needs_process,
+                };
             }
             if matches_rule(rule, input, host_lower, self.geoip_db.as_deref()) {
                 return EvalStep::Matched(rule);
             }
         }
         EvalStep::NoMatch
-    }
-
-    /// Resume evaluation after DNS resolution, starting from the rule index
-    /// returned by `evaluate_until_ip_needed`.
-    pub fn resume_from<'a>(
-        &'a self,
-        input: &MatchInput<'_>,
-        start: usize,
-    ) -> Option<&'a RuleEntry> {
-        let host_lower = self.host_lower(input);
-        let host_lower = host_lower.as_deref().or(input.host);
-        self.rules[start..]
-            .iter()
-            .find(|rule| matches_rule(rule, input, host_lower, self.geoip_db.as_deref()))
     }
 
     fn find_match<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a RuleEntry> {
@@ -152,11 +150,15 @@ impl RuleEngine {
 
 /// Outcome of the first evaluation pass.
 pub enum EvalStep<'a> {
-    /// A rule matched — no DNS needed.
+    /// A rule matched — no further lookups needed.
     Matched(&'a RuleEntry),
-    /// Reached an IP-dependent rule without a resolved IP. Caller should
-    /// resolve DNS and call `resume_from(input, resume_from)`.
-    NeedsIp { resume_from: usize },
+    /// Reached a rule whose required input is not yet available. The caller
+    /// should populate the requested fields and call `resume_from`.
+    NeedsData {
+        resume_from: usize,
+        need_ip: bool,
+        need_process: bool,
+    },
     /// Walked all rules without matching.
     NoMatch,
 }

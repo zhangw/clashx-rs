@@ -47,8 +47,6 @@ struct DaemonState {
     mmdb_path: PathBuf,
     nameservers: Arc<[IpAddr]>,
     dns_cache: Arc<clashx_rs_dns::DnsCache>,
-    /// Cached at construction: true iff any PROCESS-NAME rule exists.
-    has_process_rules: bool,
 }
 
 impl DaemonState {
@@ -82,7 +80,6 @@ impl DaemonState {
             }
         };
 
-        let has_process_rules = config.rules.iter().any(|r| r.starts_with("PROCESS-NAME,"));
         let rule_engine = Arc::new(RuleEngine::new(&config.rules, geoip_db));
 
         let mut proxies = HashMap::new();
@@ -110,7 +107,6 @@ impl DaemonState {
             mmdb_path,
             nameservers,
             dns_cache: Arc::new(clashx_rs_dns::DnsCache::new()),
-            has_process_rules,
         }
     }
 
@@ -562,25 +558,14 @@ async fn handle_connection(
 
     let parsed_ip: Option<std::net::IpAddr> = target_host.parse().ok();
 
-    let (nameservers, dns_cache, need_process, rule_engine, mode) = {
+    let (nameservers, dns_cache, rule_engine, mode) = {
         let st = state.read().await;
         (
             Arc::clone(&st.nameservers),
             Arc::clone(&st.dns_cache),
-            st.config.mode == Mode::Rule && st.has_process_rules,
             Arc::clone(&st.rule_engine),
             st.config.mode,
         )
-    };
-
-    // Process lookup must complete before rule eval because PROCESS-NAME
-    // rules can short-circuit both later domain and IP rules. libproc lookup
-    // is <1ms on a cache hit (the common case), so this is not a hot-path
-    // concern.
-    let process_name = if need_process {
-        lookup_process_name(source_addr).await
-    } else {
-        None
     };
 
     let host_field: Option<&str> = if parsed_ip.is_some() {
@@ -589,52 +574,76 @@ async fn handle_connection(
         Some(&target_host)
     };
 
-    let (rule_target, matched_rule, resolved_ip): (Option<&str>, Option<String>, Option<IpAddr>) =
-        if mode == Mode::Rule {
-            use clashx_rs_rule::EvalStep;
-            let mut input = MatchInput {
+    let (rule_target, matched_rule, resolved_ip, _process_name): (
+        Option<String>,
+        Option<String>,
+        Option<IpAddr>,
+        Option<String>,
+    ) = if mode == Mode::Rule {
+        use clashx_rs_rule::EvalStep;
+        let mut owned_process: Option<String> = None;
+        let mut ip = parsed_ip;
+
+        // Lazy-eval loop. We rebuild MatchInput each iteration so the borrow
+        // of owned_process stays scoped to the current evaluate_from call.
+        let mut start = 0usize;
+        let mut target_str: Option<String> = None;
+        let mut desc: Option<String> = None;
+        loop {
+            let input = MatchInput {
                 host: host_field,
-                ip: parsed_ip,
-                process_name: process_name.as_deref(),
+                ip,
+                process_name: owned_process.as_deref(),
             };
-            match rule_engine.evaluate_until_ip_needed(&input) {
+            match rule_engine.evaluate_from(&input, start) {
                 EvalStep::Matched(rule) => {
-                    (Some(rule.target()), Some(rule.description()), parsed_ip)
+                    target_str = Some(rule.target().to_string());
+                    desc = Some(rule.description());
+                    break;
                 }
-                EvalStep::NoMatch => (None, None, parsed_ip),
-                EvalStep::NeedsIp { resume_from } => {
-                    // Only pay DNS when rule eval actually reaches an IP-dependent
-                    // rule. Domain/process rules before it have already been checked.
-                    let ip = match clashx_rs_dns::resolve_with_nameservers(
-                        &target_host,
-                        &nameservers,
-                        &dns_cache,
-                    )
-                    .await
-                    {
-                        Ok(ip) => {
-                            tracing::debug!(host = %target_host, resolved = %ip, "DNS pre-resolved");
-                            Some(ip)
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                host = %target_host,
-                                err = %e,
-                                "DNS pre-resolve failed, IP-based rules will skip"
-                            );
-                            None
-                        }
-                    };
-                    input.ip = ip;
-                    match rule_engine.resume_from(&input, resume_from) {
-                        Some(rule) => (Some(rule.target()), Some(rule.description()), ip),
-                        None => (None, None, ip),
+                EvalStep::NoMatch => break,
+                EvalStep::NeedsData {
+                    resume_from,
+                    need_ip,
+                    need_process,
+                } => {
+                    if need_ip {
+                        ip = match clashx_rs_dns::resolve_with_nameservers(
+                            &target_host,
+                            &nameservers,
+                            &dns_cache,
+                        )
+                        .await
+                        {
+                            Ok(r) => {
+                                tracing::debug!(host = %target_host, resolved = %r, "DNS pre-resolved");
+                                Some(r)
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    host = %target_host,
+                                    err = %e,
+                                    "DNS pre-resolve failed, IP-based rules will skip"
+                                );
+                                None
+                            }
+                        };
                     }
+                    if need_process {
+                        owned_process = lookup_process_name(source_addr).await;
+                    }
+                    start = resume_from;
                 }
             }
-        } else {
-            (None, None, parsed_ip)
-        };
+        }
+
+        match target_str {
+            Some(t) => (Some(t), desc, ip, owned_process),
+            None => (None, None, ip, owned_process),
+        }
+    } else {
+        (None, None, parsed_ip, None)
+    };
 
     // Selection-chain + candidate-list resolution (brief read lock — O(1) lookups).
     let group_name: Option<String>;
@@ -647,7 +656,7 @@ async fn handle_connection(
         let chain_start: Option<&str> = match mode {
             Mode::Direct => None,
             Mode::Global => st.config.proxy_groups.first().map(|g| g.name.as_str()),
-            Mode::Rule => rule_target,
+            Mode::Rule => rule_target.as_deref(),
         };
         let (grp, resolved): (Option<String>, String) = match chain_start {
             Some(target) => {

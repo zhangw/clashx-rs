@@ -289,39 +289,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_lookup_uses_cached_snapshot() {
-        set_process_name_targets::<_, &str>([]);
+    async fn first_lookup_populates_snapshot() {
+        // Reset global state then verify SNAPSHOT is None before first call
+        // and Some(fresh) after — observable proof the cache was populated,
+        // not a wall-clock measurement.
+        if let Ok(mut g) = SNAPSHOT.lock() {
+            *g = None;
+        }
+        set_process_name_targets(["nonexistent_process_xyz"]);
+
+        {
+            let guard = SNAPSHOT.lock().unwrap();
+            assert!(guard.is_none(), "snapshot should start empty");
+        }
+
         let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
-        let start = Instant::now();
         let _ = lookup_process_name(addr).await;
-        let first_call = start.elapsed();
 
-        let start = Instant::now();
-        let _ = lookup_process_name(addr).await;
-        let second_call = start.elapsed();
-
+        let guard = SNAPSHOT.lock().unwrap();
+        let snap = guard.as_ref().expect("snapshot should be populated");
         assert!(
-            second_call < first_call / 10 || second_call < Duration::from_micros(500),
-            "cached lookup ({second_call:?}) should be much faster than first call ({first_call:?})"
+            Instant::now() < snap.expires,
+            "fresh snapshot must not be already-expired"
         );
     }
 
     #[tokio::test]
-    async fn targeted_scan_is_fast() {
-        // When we only care about a tiny set of process names, the scan should
-        // be dramatically faster than the unfiltered scan.
+    async fn second_lookup_reuses_snapshot() {
+        // Verify the snapshot isn't rebuilt on the second call by checking
+        // `expires` is unchanged.
         set_process_name_targets(["nonexistent_process_xyz"]);
-        let addr: SocketAddr = "127.0.0.1:44444".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:54322".parse().unwrap();
 
-        let start = Instant::now();
         let _ = lookup_process_name(addr).await;
-        let elapsed = start.elapsed();
+        let first_expires = {
+            let g = SNAPSHOT.lock().unwrap();
+            g.as_ref().expect("snapshot populated").expires
+        };
 
-        // With only one nonexistent target, scan should finish very fast
-        // (no fd walks at all on macOS, single comm read per pid on Linux).
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "targeted scan took too long: {elapsed:?}"
+        let _ = lookup_process_name(addr).await;
+        let second_expires = {
+            let g = SNAPSHOT.lock().unwrap();
+            g.as_ref().expect("snapshot populated").expires
+        };
+
+        assert_eq!(
+            first_expires, second_expires,
+            "second lookup within TTL must not rebuild the snapshot"
         );
     }
 }
