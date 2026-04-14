@@ -64,13 +64,6 @@ impl RuleEngine {
         }
     }
 
-    /// Hot-swap the GeoIP database (called after background download completes).
-    pub fn set_geoip_db(&mut self, db: Arc<GeoIpDb>) {
-        self.geoip_db = Some(db);
-        self.has_ip_rules = true;
-        tracing::info!("GeoIP database hot-swapped, GEOIP rules now active");
-    }
-
     /// Whether the config has any GEOIP or IP-CIDR rules that need a resolved IP.
     pub fn needs_resolved_ip(&self) -> bool {
         self.has_ip_rules

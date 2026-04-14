@@ -47,6 +47,8 @@ struct DaemonState {
     mmdb_path: PathBuf,
     nameservers: Arc<[IpAddr]>,
     dns_cache: Arc<clashx_rs_dns::DnsCache>,
+    /// Cached at construction: true iff any PROCESS-NAME rule exists.
+    has_process_rules: bool,
 }
 
 impl DaemonState {
@@ -80,6 +82,7 @@ impl DaemonState {
             }
         };
 
+        let has_process_rules = config.rules.iter().any(|r| r.starts_with("PROCESS-NAME,"));
         let rule_engine = Arc::new(RuleEngine::new(&config.rules, geoip_db));
 
         let mut proxies = HashMap::new();
@@ -107,6 +110,7 @@ impl DaemonState {
             mmdb_path,
             nameservers,
             dns_cache: Arc::new(clashx_rs_dns::DnsCache::new()),
+            has_process_rules,
         }
     }
 
@@ -241,14 +245,6 @@ impl DaemonState {
                 None => (None, "DIRECT", None),
             },
         }
-    }
-
-    /// True if the config contains any PROCESS-NAME rules.
-    fn has_process_rules(&self) -> bool {
-        self.config
-            .rules
-            .iter()
-            .any(|r| r.starts_with("PROCESS-NAME,"))
     }
 
     /// Build a list of (proxy_name, Proxy) candidates for retry/failover.
@@ -566,19 +562,21 @@ async fn handle_connection(
 
     let parsed_ip: Option<std::net::IpAddr> = target_host.parse().ok();
 
-    // Single lock acquisition: capture everything needed for DNS + process
-    // pre-work, then run both concurrently outside the lock.
-    let (need_dns, nameservers, dns_cache, need_process) = {
+    // Single upfront lock — capture everything needed for both pre-work
+    // (DNS + process lookup) and rule matching. Both run outside the lock.
+    let (need_dns, nameservers, dns_cache, need_process, rule_engine, mode) = {
         let st = state.read().await;
         (
             parsed_ip.is_none() && st.rule_engine.needs_resolved_ip(),
             Arc::clone(&st.nameservers),
             Arc::clone(&st.dns_cache),
-            st.config.mode == Mode::Rule && st.has_process_rules(),
+            st.config.mode == Mode::Rule && st.has_process_rules,
+            Arc::clone(&st.rule_engine),
+            st.config.mode,
         )
     };
 
-    // Run DNS pre-resolve and process name lookup concurrently — independent I/O.
+    // DNS pre-resolve and process name lookup run concurrently — independent I/O.
     let dns_fut = async {
         if need_dns {
             match clashx_rs_dns::resolve_with_nameservers(&target_host, &nameservers, &dns_cache)
@@ -610,16 +608,9 @@ async fn handle_connection(
     };
     let (resolved_ip, process_name) = tokio::join!(dns_fut, process_fut);
 
-    // --- Phase 1a: Rule matching (lock-free) ---
-    // Clone the Arc<RuleEngine> and mode under a brief read lock, then evaluate
-    // outside the lock. Rule evaluation is a linear scan that can be O(N) for
-    // large rule sets; holding the state lock during that would serialize
-    // concurrent connections and block writers (config reload) needlessly.
-    let (rule_engine, mode) = {
-        let st = state.read().await;
-        (Arc::clone(&st.rule_engine), st.config.mode)
-    };
-
+    // Rule matching happens lock-free against the cloned Arc<RuleEngine>.
+    // For large rule sets this scan is O(N); doing it outside the state
+    // lock keeps concurrent connections and config reloads unblocked.
     let match_input = MatchInput {
         host: if parsed_ip.is_some() {
             None
@@ -629,17 +620,15 @@ async fn handle_connection(
         ip: resolved_ip,
         process_name: process_name.as_deref(),
     };
-
-    let (rule_target, matched_rule) = match mode {
-        Mode::Direct => (None, None),
-        Mode::Global => (None, None), // resolved below from proxy_groups
+    let (rule_target, matched_rule): (Option<&str>, Option<String>) = match mode {
         Mode::Rule => match rule_engine.evaluate_verbose(&match_input) {
-            Some((t, d)) => (Some(t.to_string()), Some(d)),
+            Some((t, d)) => (Some(t), Some(d)),
             None => (None, None),
         },
+        Mode::Direct | Mode::Global => (None, None),
     };
 
-    // --- Phase 1b: Selection-chain and candidate-list resolution (under read lock) ---
+    // Selection-chain + candidate-list resolution (brief read lock — O(1) lookups).
     let group_name: Option<String>;
     let proxy_name: String;
     let candidates: Vec<(String, Proxy)>;
@@ -647,22 +636,17 @@ async fn handle_connection(
     {
         let st = state.read().await;
 
-        let (grp, resolved): (Option<String>, String) = match mode {
-            Mode::Direct => (None, "DIRECT".to_string()),
-            Mode::Global => match st.config.proxy_groups.first() {
-                Some(g) => {
-                    let (gg, p) = st.resolve_selection_chain(&g.name);
-                    (gg.map(|s| s.to_string()), p.to_string())
-                }
-                None => (None, "DIRECT".to_string()),
-            },
-            Mode::Rule => match rule_target.as_deref() {
-                Some(target) => {
-                    let (gg, p) = st.resolve_selection_chain(target);
-                    (gg.map(|s| s.to_string()), p.to_string())
-                }
-                None => (None, "DIRECT".to_string()),
-            },
+        let chain_start: Option<&str> = match mode {
+            Mode::Direct => None,
+            Mode::Global => st.config.proxy_groups.first().map(|g| g.name.as_str()),
+            Mode::Rule => rule_target,
+        };
+        let (grp, resolved): (Option<String>, String) = match chain_start {
+            Some(target) => {
+                let (gg, p) = st.resolve_selection_chain(target);
+                (gg.map(|s| s.to_string()), p.to_string())
+            }
+            None => (None, "DIRECT".to_string()),
         };
         group_name = grp;
         proxy_name = resolved;
