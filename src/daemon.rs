@@ -571,6 +571,21 @@ async fn handle_connection(
         }
     };
 
+    // Look up process name OUTSIDE the state read lock — uses a cached
+    // port→process snapshot so this is O(1) in the fast path, spawn_blocking
+    // for the rare rebuild path. Check the mode+has_process_rules first to
+    // skip the lookup entirely when not needed.
+    let process_name = {
+        let st = state.read().await;
+        let need_process = st.config.mode == Mode::Rule && st.has_process_rules();
+        drop(st);
+        if need_process {
+            lookup_process_name(source_addr).await
+        } else {
+            None
+        }
+    };
+
     // --- Phase 1: Route resolution (under read lock) ---
     let group_name: Option<String>;
     let proxy_name: String;
@@ -578,12 +593,6 @@ async fn handle_connection(
     let cooldown: Arc<crate::retry::CooldownTracker>;
     {
         let st = state.read().await;
-
-        let process_name = if st.config.mode == Mode::Rule && st.has_process_rules() {
-            lookup_process_name(&source_addr)
-        } else {
-            None
-        };
 
         let match_input = MatchInput {
             host: if parsed_ip.is_some() {

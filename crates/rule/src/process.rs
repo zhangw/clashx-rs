@@ -1,123 +1,258 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// TTL for the port → process_name table snapshot.
+/// Short-lived because a port can be reused by a different process after close.
+/// During a browser page load (<10s), this avoids re-scanning all processes.
+const SNAPSHOT_TTL: Duration = Duration::from_secs(2);
+
+struct Snapshot {
+    /// Maps source port → process name for ESTABLISHED/LISTEN sockets.
+    port_to_name: HashMap<u16, String>,
+    expires: Instant,
+}
+
+static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
+
+/// Look up the process name synchronously. Only returns a result if the cached
+/// snapshot is fresh. Returns None for both "unknown process" and "snapshot stale".
+/// Use [`lookup_process_name`] from async contexts to trigger a rebuild when needed.
+pub fn lookup_process_name_cached(source_addr: &SocketAddr) -> Option<String> {
+    let port = source_addr.port();
+    let guard = SNAPSHOT.lock().ok()?;
+    let snap = guard.as_ref()?;
+    if Instant::now() >= snap.expires {
+        return None;
+    }
+    snap.port_to_name.get(&port).cloned()
+}
 
 /// Look up the process name that owns the TCP connection from `source_addr`.
-/// Returns None if the lookup fails (best-effort).
-pub fn lookup_process_name(source_addr: &SocketAddr) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    return macos_lookup(source_addr);
-    #[cfg(target_os = "linux")]
-    return linux_lookup(source_addr);
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = source_addr;
-        None
+///
+/// Uses a 2-second port→process table snapshot. Cache hits are O(1) sync
+/// HashMap lookups. Cache misses trigger a full system scan which is offloaded
+/// to a blocking thread so the async runtime is not stalled.
+pub async fn lookup_process_name(source_addr: SocketAddr) -> Option<String> {
+    if let Some(hit) = fast_path_lookup(&source_addr) {
+        return hit;
+    }
+
+    let port = source_addr.port();
+    let fresh = tokio::task::spawn_blocking(build_snapshot).await.ok()?;
+    let result = fresh.port_to_name.get(&port).cloned();
+    if let Ok(mut guard) = SNAPSHOT.lock() {
+        *guard = Some(fresh);
+    }
+    result
+}
+
+/// Returns `Some(result)` if the cached snapshot answered the query,
+/// or `None` when a rebuild is needed.
+fn fast_path_lookup(source_addr: &SocketAddr) -> Option<Option<String>> {
+    let port = source_addr.port();
+    let guard = SNAPSHOT.lock().ok()?;
+    let snap = guard.as_ref()?;
+    if Instant::now() >= snap.expires {
+        return None;
+    }
+    Some(snap.port_to_name.get(&port).cloned())
+}
+
+fn build_snapshot() -> Snapshot {
+    Snapshot {
+        port_to_name: scan_all_tcp_sockets(),
+        expires: Instant::now() + SNAPSHOT_TTL,
     }
 }
 
 #[cfg(target_os = "macos")]
-fn macos_lookup(source_addr: &SocketAddr) -> Option<String> {
-    use std::process::Command;
-    // Use lsof to find process by source port
-    let port = source_addr.port();
-    let output = Command::new("lsof")
-        .args(["-iTCP", "-sTCP:ESTABLISHED", "-nP", &format!("-i:{port}")])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Parse lsof output: first column is process name
-    for line in stdout.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() > 1 {
-            return Some(parts[0].to_string());
+fn scan_all_tcp_sockets() -> HashMap<u16, String> {
+    use libproc::bsd_info::BSDInfo;
+    use libproc::file_info::{pidfdinfo, ListFDs, ProcFDType};
+    use libproc::net_info::{SocketFDInfo, SocketInfoKind};
+    use libproc::proc_pid::{listpidinfo, name, pidinfo};
+    use libproc::processes::{pids_by_type, ProcFilter};
+
+    let mut map: HashMap<u16, String> = HashMap::new();
+    let pids = match pids_by_type(ProcFilter::All) {
+        Ok(p) => p,
+        Err(_) => return map,
+    };
+
+    for pid in pids {
+        let pid = pid as i32;
+        let info: BSDInfo = match pidinfo(pid, 0) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        let fds = match listpidinfo::<ListFDs>(pid, info.pbi_nfiles as usize) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+
+        let mut proc_name: Option<String> = None;
+
+        for fd in fds {
+            if !matches!(ProcFDType::from(fd.proc_fdtype), ProcFDType::Socket) {
+                continue;
+            }
+            let sock: SocketFDInfo = match pidfdinfo(pid, fd.proc_fd) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let kind = SocketInfoKind::from(sock.psi.soi_kind);
+            let local_port = match kind {
+                SocketInfoKind::Tcp => unsafe { sock.psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport },
+                SocketInfoKind::In => unsafe { sock.psi.soi_proto.pri_in.insi_lport },
+                _ => continue,
+            };
+            // insi_lport is in network byte order stored as i32.
+            let port = u16::from_be(local_port as u16);
+            if port == 0 {
+                continue;
+            }
+
+            // Lazily fetch process name once per pid.
+            if proc_name.is_none() {
+                proc_name = name(pid).ok();
+            }
+            if let Some(ref n) = proc_name {
+                // First writer wins — later entries from other processes don't
+                // overwrite an already-recorded port (shouldn't happen for
+                // unique local ports but guards against races during scanning).
+                map.entry(port).or_insert_with(|| n.clone());
+            }
         }
     }
-    None
+
+    map
 }
 
 #[cfg(target_os = "linux")]
-fn linux_lookup(source_addr: &SocketAddr) -> Option<String> {
-    let (proc_file, hex_addr, hex_port) = match source_addr {
-        SocketAddr::V4(v4) => {
-            let ip_bytes = v4.ip().octets();
-            // /proc/net/tcp uses little-endian hex for IPv4
-            let hex = format!(
-                "{:02X}{:02X}{:02X}{:02X}",
-                ip_bytes[3], ip_bytes[2], ip_bytes[1], ip_bytes[0]
-            );
-            let port = format!("{:04X}", v4.port());
-            ("/proc/net/tcp", hex, port)
+fn scan_all_tcp_sockets() -> HashMap<u16, String> {
+    let mut map: HashMap<u16, String> = HashMap::new();
+
+    // Parse both /proc/net/tcp and /proc/net/tcp6 to build inode → port map
+    let mut inode_to_port: HashMap<String, u16> = HashMap::new();
+    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let content = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 10 {
+                continue;
+            }
+            let local = fields[1];
+            let inode = fields[9];
+            if inode == "0" {
+                continue;
+            }
+            // local = "HEXADDR:HEXPORT"
+            let port_hex = match local.rsplit_once(':') {
+                Some((_, p)) => p,
+                None => continue,
+            };
+            if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+                inode_to_port.insert(inode.to_string(), port);
+            }
         }
-        SocketAddr::V6(v6) => {
-            let octets = v6.ip().octets();
-            // /proc/net/tcp6 uses 32 hex chars in 4-word little-endian groups
-            let hex = format!(
-                "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                octets[3], octets[2], octets[1], octets[0],
-                octets[7], octets[6], octets[5], octets[4],
-                octets[11], octets[10], octets[9], octets[8],
-                octets[15], octets[14], octets[13], octets[12],
-            );
-            let port = format!("{:04X}", v6.port());
-            ("/proc/net/tcp6", hex, port)
-        }
+    }
+
+    if inode_to_port.is_empty() {
+        return map;
+    }
+
+    // Scan /proc/*/fd/ to match inodes to PIDs
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return map,
     };
 
-    // Step 1: Find the inode for this source addr:port in /proc/net/tcp
-    let tcp_content = std::fs::read_to_string(proc_file).ok()?;
-    let local_addr_port = format!("{hex_addr}:{hex_port}");
-
-    let mut inode: Option<String> = None;
-    for line in tcp_content.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 10 && fields[1] == local_addr_port {
-            inode = Some(fields[9].to_string());
-            break;
-        }
-    }
-    let inode = inode?;
-    if inode == "0" {
-        return None;
-    }
-
-    // Step 2: Scan /proc/*/fd/ to find which PID owns this inode
-    let socket_needle = format!("socket:[{inode}]");
-    let proc_dir = std::fs::read_dir("/proc").ok()?;
     for entry in proc_dir.flatten() {
-        let pid_str = entry.file_name();
-        let pid_str = pid_str.to_str()?;
-        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
+        let pid_name = entry.file_name();
+        let pid_str = match pid_name.to_str() {
+            Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
+            _ => continue,
+        };
         let fd_dir = format!("/proc/{pid_str}/fd");
         let fds = match std::fs::read_dir(&fd_dir) {
             Ok(d) => d,
             Err(_) => continue,
         };
+        let mut proc_name: Option<String> = None;
         for fd_entry in fds.flatten() {
             let link = match std::fs::read_link(fd_entry.path()) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
-            if link.to_string_lossy().contains(&socket_needle) {
-                let comm_path = format!("/proc/{pid_str}/comm");
-                return std::fs::read_to_string(comm_path)
-                    .ok()
-                    .map(|s| s.trim().to_string());
+            let link_str = link.to_string_lossy();
+            let inode = match link_str
+                .strip_prefix("socket:[")
+                .and_then(|s| s.strip_suffix(']'))
+            {
+                Some(i) => i,
+                None => continue,
+            };
+            if let Some(&port) = inode_to_port.get(inode) {
+                if proc_name.is_none() {
+                    let comm_path = format!("/proc/{pid_str}/comm");
+                    proc_name = std::fs::read_to_string(comm_path)
+                        .ok()
+                        .map(|s| s.trim().to_string());
+                }
+                if let Some(ref n) = proc_name {
+                    map.entry(port).or_insert_with(|| n.clone());
+                }
             }
         }
     }
 
-    None
+    map
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn scan_all_tcp_sockets() -> HashMap<u16, String> {
+    HashMap::new()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn lookup_returns_option() {
-        // Just verify the function doesn't panic with a random address
+    #[tokio::test]
+    async fn lookup_returns_option() {
         let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let _ = lookup_process_name(&addr); // Should return None or Some, but not panic
+        let _ = lookup_process_name(addr).await;
+    }
+
+    #[tokio::test]
+    async fn second_lookup_uses_cached_snapshot() {
+        let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let start = Instant::now();
+        let _ = lookup_process_name(addr).await;
+        let first_call = start.elapsed();
+
+        let start = Instant::now();
+        let _ = lookup_process_name(addr).await;
+        let second_call = start.elapsed();
+
+        assert!(
+            second_call < first_call / 10 || second_call < Duration::from_micros(500),
+            "cached lookup ({second_call:?}) should be much faster than first call ({first_call:?})"
+        );
+    }
+
+    #[test]
+    fn cached_only_returns_none_when_no_snapshot() {
+        // Reset snapshot state for this test
+        if let Ok(mut g) = SNAPSHOT.lock() {
+            *g = None;
+        }
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        assert_eq!(lookup_process_name_cached(&addr), None);
     }
 }
