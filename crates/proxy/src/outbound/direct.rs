@@ -15,27 +15,21 @@ use crate::timeout::CONNECT_TIMEOUT;
 /// with the proxy set as system proxy can route DNS queries back through
 /// clashx-rs itself, creating recursive lookups and significant latency.
 pub async fn connect(target: &TargetAddr, resolved_ip: Option<IpAddr>) -> Result<OutboundStream> {
-    let stream = match (resolved_ip, target) {
-        // Prefer the caller-provided resolved IP (from DNS pre-resolve)
-        (Some(ip), _) => {
-            let addr = SocketAddr::new(ip, target.port());
-            tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-                .await
-                .context("direct connect timed out")??
-        }
-        (None, TargetAddr::Ip(ip, port)) => {
-            let addr = SocketAddr::new(*ip, *port);
-            tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-                .await
-                .context("direct connect timed out")??
-        }
-        // Fallback: domain target without pre-resolved IP → system resolver
-        (None, TargetAddr::Domain(host, port)) => {
-            tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), *port)))
-                .await
-                .context("direct connect timed out")??
+    let connect = async {
+        match (resolved_ip, target) {
+            (Some(ip), _) => TcpStream::connect(SocketAddr::new(ip, target.port())).await,
+            (None, TargetAddr::Ip(ip, port)) => {
+                TcpStream::connect(SocketAddr::new(*ip, *port)).await
+            }
+            // Domain target with no pre-resolve → fallback to system resolver.
+            (None, TargetAddr::Domain(host, port)) => {
+                TcpStream::connect((host.as_str(), *port)).await
+            }
         }
     };
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect)
+        .await
+        .context("direct connect timed out")??;
     Ok(OutboundStream::Tcp(stream))
 }
 
@@ -45,7 +39,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test]
-    async fn direct_connect_with_ip_target() {
+    async fn connect_to_ip_target() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -60,13 +54,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_connect_with_resolved_ip_skips_getaddrinfo() {
+    async fn resolved_ip_wins_over_domain() {
+        // Verifies the (Some(ip), _) arm is taken: domain is bogus and would
+        // fail if system resolver were used; connection succeeds because we
+        // connect to the provided SocketAddr directly.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        // Target is a bogus domain that would fail getaddrinfo — proves we used resolved_ip
         let target = TargetAddr::Domain(
             "this.domain.does.not.exist.invalid".to_string(),
             addr.port(),
