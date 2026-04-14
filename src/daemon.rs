@@ -14,7 +14,7 @@ use clashx_rs_rule::{process::lookup_process_name, MatchInput, RuleEngine};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::control::{ControlRequest, ControlResponse};
 use crate::paths::{self, DEFAULT_MIXED_PORT};
@@ -31,10 +31,15 @@ fn match_input_from_host(host: &str) -> MatchInput<'_> {
     }
 }
 
+/// Max concurrent connections before admission control starts rejecting.
+/// For a desktop local proxy this is far above normal browser workloads
+/// (hundreds of parallel fetches). Abusive/buggy clients are bounded here.
+const MAX_CONCURRENT_CONNECTIONS: usize = 2048;
+
 struct DaemonState {
     config: Config,
     config_path: PathBuf,
-    rule_engine: RuleEngine,
+    rule_engine: Arc<RuleEngine>,
     proxies: HashMap<String, Proxy>,
     selections: HashMap<String, String>,
     startup_overrides: Vec<(String, String)>,
@@ -75,7 +80,7 @@ impl DaemonState {
             }
         };
 
-        let rule_engine = RuleEngine::new(&config.rules, geoip_db);
+        let rule_engine = Arc::new(RuleEngine::new(&config.rules, geoip_db));
 
         let mut proxies = HashMap::new();
         for p in &config.proxies {
@@ -437,7 +442,12 @@ async fn run_daemon(
                         match GeoIpDb::open(&dl_mmdb_path) {
                             Ok(db) => {
                                 let mut st = dl_state.write().await;
-                                st.rule_engine.set_geoip_db(Arc::new(db));
+                                let new_engine =
+                                    RuleEngine::new(&st.config.rules, Some(Arc::new(db)));
+                                st.rule_engine = Arc::new(new_engine);
+                                tracing::info!(
+                                    "GeoIP database hot-swapped, GEOIP rules now active"
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!(err = %e, "downloaded mmdb but failed to load");
@@ -484,12 +494,29 @@ async fn run_daemon(
     });
 
     let proxy_state = Arc::clone(&state);
+    let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             match proxy_listener.accept().await {
                 Ok((stream, addr)) => {
+                    // Admission control: cap concurrent connections. If exhausted,
+                    // drop the new connection with a log line — a bursty/abusive
+                    // client cannot blow fd/memory budget.
+                    let permit = match connection_limit.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            tracing::warn!(
+                                peer = %addr,
+                                limit = MAX_CONCURRENT_CONNECTIONS,
+                                "connection limit reached, dropping incoming connection"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     let s = Arc::clone(&proxy_state);
                     tokio::spawn(async move {
+                        let _permit = permit; // released on task exit
                         if let Err(e) = handle_connection(stream, addr, s).await {
                             tracing::debug!(error = %e, peer = %addr, "connection handler error");
                         }
@@ -583,7 +610,36 @@ async fn handle_connection(
     };
     let (resolved_ip, process_name) = tokio::join!(dns_fut, process_fut);
 
-    // --- Phase 1: Route resolution (under read lock) ---
+    // --- Phase 1a: Rule matching (lock-free) ---
+    // Clone the Arc<RuleEngine> and mode under a brief read lock, then evaluate
+    // outside the lock. Rule evaluation is a linear scan that can be O(N) for
+    // large rule sets; holding the state lock during that would serialize
+    // concurrent connections and block writers (config reload) needlessly.
+    let (rule_engine, mode) = {
+        let st = state.read().await;
+        (Arc::clone(&st.rule_engine), st.config.mode)
+    };
+
+    let match_input = MatchInput {
+        host: if parsed_ip.is_some() {
+            None
+        } else {
+            Some(&target_host)
+        },
+        ip: resolved_ip,
+        process_name: process_name.as_deref(),
+    };
+
+    let (rule_target, matched_rule) = match mode {
+        Mode::Direct => (None, None),
+        Mode::Global => (None, None), // resolved below from proxy_groups
+        Mode::Rule => match rule_engine.evaluate_verbose(&match_input) {
+            Some((t, d)) => (Some(t.to_string()), Some(d)),
+            None => (None, None),
+        },
+    };
+
+    // --- Phase 1b: Selection-chain and candidate-list resolution (under read lock) ---
     let group_name: Option<String>;
     let proxy_name: String;
     let candidates: Vec<(String, Proxy)>;
@@ -591,24 +647,30 @@ async fn handle_connection(
     {
         let st = state.read().await;
 
-        let match_input = MatchInput {
-            host: if parsed_ip.is_some() {
-                None
-            } else {
-                Some(&target_host)
+        let (grp, resolved): (Option<String>, String) = match mode {
+            Mode::Direct => (None, "DIRECT".to_string()),
+            Mode::Global => match st.config.proxy_groups.first() {
+                Some(g) => {
+                    let (gg, p) = st.resolve_selection_chain(&g.name);
+                    (gg.map(|s| s.to_string()), p.to_string())
+                }
+                None => (None, "DIRECT".to_string()),
             },
-            ip: resolved_ip,
-            process_name: process_name.as_deref(),
+            Mode::Rule => match rule_target.as_deref() {
+                Some(target) => {
+                    let (gg, p) = st.resolve_selection_chain(target);
+                    (gg.map(|s| s.to_string()), p.to_string())
+                }
+                None => (None, "DIRECT".to_string()),
+            },
         };
-
-        let (grp, resolved, matched_rule) = st.resolve_routing_with_group(&match_input);
-        group_name = grp.map(|s| s.to_string());
-        proxy_name = resolved.to_string();
+        group_name = grp;
+        proxy_name = resolved;
 
         tracing::info!(
             target = %target_host,
             port = target_port,
-            mode = ?st.config.mode,
+            mode = ?mode,
             rule = ?matched_rule,
             proxy = %proxy_name,
             group = ?group_name,
@@ -618,21 +680,17 @@ async fn handle_connection(
         // Build candidate list for failover
         candidates = if let Some(ref gn) = group_name {
             st.build_candidate_list(gn, &st.cooldown)
+        } else if proxy_name != "DIRECT" && proxy_name != "REJECT" {
+            st.proxies
+                .get(&proxy_name)
+                .map(|p| vec![(proxy_name.clone(), p.clone())])
+                .unwrap_or_default()
         } else {
-            // No group — single proxy or DIRECT/REJECT
-            if proxy_name != "DIRECT" && proxy_name != "REJECT" {
-                st.proxies
-                    .get(&proxy_name)
-                    .map(|p| vec![(proxy_name.clone(), p.clone())])
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
+            Vec::new()
         };
 
         cooldown = Arc::clone(&st.cooldown);
     }
-    // State read lock is dropped here, before any async connect/relay calls.
 
     // --- Phase 2: Connect with retry/failover ---
     match proxy_name.as_str() {

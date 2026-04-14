@@ -31,7 +31,7 @@ pub struct Config {
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     #[default]
