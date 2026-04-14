@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -21,18 +21,44 @@ static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
 static REBUILD_NOTIFY: once_cell::sync::Lazy<Notify> = once_cell::sync::Lazy::new(Notify::new);
 static REBUILDING: Mutex<bool> = Mutex::new(false);
 
+/// Set of process names that PROCESS-NAME rules care about.
+/// When set, the scanner only walks sockets of matching processes —
+/// a massive speedup when only a handful of apps are referenced.
+static TARGETS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Record the set of process names referenced by PROCESS-NAME rules.
+/// The scanner uses this to skip all non-matching processes' socket lists.
+/// Called once at RuleEngine construction.
+pub fn set_process_name_targets<I, S>(names: I)
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let set: HashSet<String> = names.into_iter().map(Into::into).collect();
+    if let Ok(mut guard) = TARGETS.lock() {
+        *guard = if set.is_empty() { None } else { Some(set) };
+    }
+    // Invalidate any existing snapshot — scan criteria changed.
+    if let Ok(mut guard) = SNAPSHOT.lock() {
+        *guard = None;
+    }
+}
+
+fn targets_snapshot() -> Option<HashSet<String>> {
+    TARGETS.lock().ok().and_then(|g| g.clone())
+}
+
 /// Look up the process name that owns the TCP connection from `source_addr`.
 ///
-/// Uses a 2-second port→process table snapshot. Cache hits are O(1) sync
-/// HashMap lookups. Cache misses trigger a full system scan which is offloaded
-/// to a blocking thread so the async runtime is not stalled. Concurrent
-/// misses coalesce — only one scan runs at a time.
+/// Uses a 2-second port→process table snapshot restricted to processes whose
+/// names appear in any PROCESS-NAME rule. Cache hits are O(1) sync HashMap
+/// lookups. Cache misses trigger a scan offloaded to a blocking thread.
+/// Concurrent misses coalesce — only one scan runs at a time.
 pub async fn lookup_process_name(source_addr: SocketAddr) -> Option<String> {
     if let Some(hit) = fast_path_lookup(&source_addr) {
         return hit;
     }
 
-    // Coalesce concurrent rebuilds: only one task scans, others wait.
     let should_rebuild = {
         let mut flag = REBUILDING.lock().ok()?;
         if *flag {
@@ -71,13 +97,13 @@ fn fast_path_lookup(source_addr: &SocketAddr) -> Option<Option<String>> {
 
 fn build_snapshot() -> Snapshot {
     Snapshot {
-        port_to_name: scan_all_tcp_sockets(),
+        port_to_name: scan_tcp_sockets(targets_snapshot().as_ref()),
         expires: Instant::now() + SNAPSHOT_TTL,
     }
 }
 
 #[cfg(target_os = "macos")]
-fn scan_all_tcp_sockets() -> HashMap<u16, String> {
+fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
     use libproc::bsd_info::BSDInfo;
     use libproc::file_info::{pidfdinfo, ListFDs, ProcFDType};
     use libproc::net_info::{SocketFDInfo, SocketInfoKind};
@@ -92,6 +118,20 @@ fn scan_all_tcp_sockets() -> HashMap<u16, String> {
 
     for pid in pids {
         let pid = pid as i32;
+
+        // Filter by process name BEFORE walking file descriptors — this is
+        // the aggressive optimization: if the user only has rules for 4 apps,
+        // we skip every other process' fd scan entirely.
+        let proc_name = match name(pid) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if let Some(targets) = targets {
+            if !targets.contains(&proc_name) {
+                continue;
+            }
+        }
+
         let info: BSDInfo = match pidinfo(pid, 0) {
             Ok(i) => i,
             Err(_) => continue,
@@ -100,8 +140,6 @@ fn scan_all_tcp_sockets() -> HashMap<u16, String> {
             Ok(f) => f,
             Err(_) => continue,
         };
-
-        let mut proc_name: Option<String> = None;
 
         for fd in fds {
             if !matches!(ProcFDType::from(fd.proc_fdtype), ProcFDType::Socket) {
@@ -122,13 +160,7 @@ fn scan_all_tcp_sockets() -> HashMap<u16, String> {
             if port == 0 {
                 continue;
             }
-
-            if proc_name.is_none() {
-                proc_name = name(pid).ok();
-            }
-            if let Some(ref n) = proc_name {
-                map.entry(port).or_insert_with(|| n.clone());
-            }
+            map.entry(port).or_insert_with(|| proc_name.clone());
         }
     }
 
@@ -136,10 +168,9 @@ fn scan_all_tcp_sockets() -> HashMap<u16, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn scan_all_tcp_sockets() -> HashMap<u16, String> {
+fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
     let mut map: HashMap<u16, String> = HashMap::new();
 
-    // Parse both /proc/net/tcp and /proc/net/tcp6 to build inode → port map
     let mut inode_to_port: HashMap<String, u16> = HashMap::new();
     for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let content = match std::fs::read_to_string(file) {
@@ -156,7 +187,6 @@ fn scan_all_tcp_sockets() -> HashMap<u16, String> {
             if inode == "0" {
                 continue;
             }
-            // local = "HEXADDR:HEXPORT"
             let port_hex = match local.rsplit_once(':') {
                 Some((_, p)) => p,
                 None => continue,
@@ -171,7 +201,6 @@ fn scan_all_tcp_sockets() -> HashMap<u16, String> {
         return map;
     }
 
-    // Scan /proc/*/fd/ to match inodes to PIDs
     let proc_dir = match std::fs::read_dir("/proc") {
         Ok(d) => d,
         Err(_) => return map,
@@ -183,34 +212,51 @@ fn scan_all_tcp_sockets() -> HashMap<u16, String> {
             Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
             _ => continue,
         };
-        let fd_dir = format!("/proc/{pid_str}/fd");
-        let fds = match std::fs::read_dir(&fd_dir) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let mut proc_name: Option<String> = None;
-        for fd_entry in fds.flatten() {
-            let link = match std::fs::read_link(fd_entry.path()) {
-                Ok(l) => l,
+
+        // Filter by process name BEFORE walking fds (the expensive step).
+        if targets.is_some() {
+            let comm_path = format!("/proc/{pid_str}/comm");
+            let proc_name = match std::fs::read_to_string(&comm_path) {
+                Ok(s) => s.trim().to_string(),
                 Err(_) => continue,
             };
-            let link_str = link.to_string_lossy();
-            let inode = match link_str
-                .strip_prefix("socket:[")
-                .and_then(|s| s.strip_suffix(']'))
-            {
-                Some(i) => i,
-                None => continue,
-            };
-            if let Some(&port) = inode_to_port.get(inode) {
-                if proc_name.is_none() {
-                    let comm_path = format!("/proc/{pid_str}/comm");
-                    proc_name = std::fs::read_to_string(comm_path)
-                        .ok()
-                        .map(|s| s.trim().to_string());
+            if let Some(targets) = targets {
+                if !targets.contains(&proc_name) {
+                    continue;
                 }
-                if let Some(ref n) = proc_name {
-                    map.entry(port).or_insert_with(|| n.clone());
+            }
+            scan_linux_proc_fds(pid_str, &inode_to_port, &proc_name, &mut map);
+        } else {
+            // Slow path: no targets filter, read name only after match.
+            let fd_dir = format!("/proc/{pid_str}/fd");
+            let fds = match std::fs::read_dir(&fd_dir) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let mut proc_name: Option<String> = None;
+            for fd_entry in fds.flatten() {
+                let link = match std::fs::read_link(fd_entry.path()) {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let link_str = link.to_string_lossy();
+                let inode = match link_str
+                    .strip_prefix("socket:[")
+                    .and_then(|s| s.strip_suffix(']'))
+                {
+                    Some(i) => i,
+                    None => continue,
+                };
+                if let Some(&port) = inode_to_port.get(inode) {
+                    if proc_name.is_none() {
+                        let comm_path = format!("/proc/{pid_str}/comm");
+                        proc_name = std::fs::read_to_string(comm_path)
+                            .ok()
+                            .map(|s| s.trim().to_string());
+                    }
+                    if let Some(ref n) = proc_name {
+                        map.entry(port).or_insert_with(|| n.clone());
+                    }
                 }
             }
         }
@@ -219,8 +265,39 @@ fn scan_all_tcp_sockets() -> HashMap<u16, String> {
     map
 }
 
+#[cfg(target_os = "linux")]
+fn scan_linux_proc_fds(
+    pid_str: &str,
+    inode_to_port: &HashMap<String, u16>,
+    proc_name: &str,
+    map: &mut HashMap<u16, String>,
+) {
+    let fd_dir = format!("/proc/{pid_str}/fd");
+    let fds = match std::fs::read_dir(&fd_dir) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    for fd_entry in fds.flatten() {
+        let link = match std::fs::read_link(fd_entry.path()) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let link_str = link.to_string_lossy();
+        let inode = match link_str
+            .strip_prefix("socket:[")
+            .and_then(|s| s.strip_suffix(']'))
+        {
+            Some(i) => i,
+            None => continue,
+        };
+        if let Some(&port) = inode_to_port.get(inode) {
+            map.entry(port).or_insert_with(|| proc_name.to_string());
+        }
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn scan_all_tcp_sockets() -> HashMap<u16, String> {
+fn scan_tcp_sockets(_targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
     HashMap::new()
 }
 
@@ -236,6 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_lookup_uses_cached_snapshot() {
+        set_process_name_targets::<_, &str>([]);
         let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
         let start = Instant::now();
         let _ = lookup_process_name(addr).await;
@@ -248,6 +326,25 @@ mod tests {
         assert!(
             second_call < first_call / 10 || second_call < Duration::from_micros(500),
             "cached lookup ({second_call:?}) should be much faster than first call ({first_call:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_scan_is_fast() {
+        // When we only care about a tiny set of process names, the scan should
+        // be dramatically faster than the unfiltered scan.
+        set_process_name_targets(["nonexistent_process_xyz"]);
+        let addr: SocketAddr = "127.0.0.1:44444".parse().unwrap();
+
+        let start = Instant::now();
+        let _ = lookup_process_name(addr).await;
+        let elapsed = start.elapsed();
+
+        // With only one nonexistent target, scan should finish very fast
+        // (no fd walks at all on macOS, single comm read per pid on Linux).
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "targeted scan took too long: {elapsed:?}"
         );
     }
 }

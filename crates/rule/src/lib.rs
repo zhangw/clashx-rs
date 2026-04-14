@@ -47,6 +47,19 @@ impl RuleEngine {
             .iter()
             .any(|r| matches!(r, RuleEntry::GeoIp { .. } | RuleEntry::IpCidr { .. }));
 
+        // Register the set of process names referenced by PROCESS-NAME rules so
+        // the system-wide scanner can skip all non-matching processes. With only
+        // a handful of target apps, this turns an O(all procs × all fds) scan
+        // into O(target procs × their fds).
+        let process_targets: Vec<&str> = rules
+            .iter()
+            .filter_map(|r| match r {
+                RuleEntry::ProcessName { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        process::set_process_name_targets(process_targets);
+
         Self {
             rules,
             geoip_db,
