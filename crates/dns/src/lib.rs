@@ -242,13 +242,10 @@ pub async fn resolve_with_nameservers(
                         "DNS for {host} failed recently; suppressed for ~{NEGATIVE_TTL:?}"
                     )
                 }
-                None => {
-                    // The leader finished but its entry was already evicted
-                    // — rare edge case, fall through and resolve ourselves.
-                    // Re-recurse; a new singleflight claim will succeed or
-                    // we'll wait on a fresh leader.
-                    Box::pin(resolve_with_nameservers(host, nameservers, cache)).await
-                }
+                // Unreachable in practice: the leader just inserted an entry
+                // with a future expiry, and eviction sorts by expiry ascending
+                // (bottom 25%) — the fresh entry survives.
+                None => anyhow::bail!("DNS singleflight leader for {host} left no cache entry"),
             };
         }
     }

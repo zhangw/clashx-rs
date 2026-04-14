@@ -94,13 +94,10 @@ impl RuleEngine {
     /// the caller can do DNS resolution and resume. Skips IP work entirely
     /// when an earlier domain rule matches.
     pub fn evaluate_until_ip_needed<'a>(&'a self, input: &MatchInput<'_>) -> EvalStep<'a> {
-        let host_lower_owned = input
-            .host
-            .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
-            .map(|h| h.to_ascii_lowercase());
-        let host_lower = host_lower_owned.as_deref().or(input.host);
+        let host_lower = self.host_lower(input);
+        let host_lower = host_lower.as_deref().or(input.host);
         for (idx, rule) in self.rules.iter().enumerate() {
-            if rule_needs_ip(rule) && input.ip.is_none() {
+            if self.rule_needs_ip(rule) && input.ip.is_none() {
                 return EvalStep::NeedsIp { resume_from: idx };
             }
             if matches_rule(rule, input, host_lower, self.geoip_db.as_deref()) {
@@ -117,25 +114,39 @@ impl RuleEngine {
         input: &MatchInput<'_>,
         start: usize,
     ) -> Option<&'a RuleEntry> {
-        let host_lower_owned = input
-            .host
-            .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
-            .map(|h| h.to_ascii_lowercase());
-        let host_lower = host_lower_owned.as_deref().or(input.host);
+        let host_lower = self.host_lower(input);
+        let host_lower = host_lower.as_deref().or(input.host);
         self.rules[start..]
             .iter()
             .find(|rule| matches_rule(rule, input, host_lower, self.geoip_db.as_deref()))
     }
 
     fn find_match<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a RuleEntry> {
-        let host_lower_owned = input
-            .host
-            .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
-            .map(|h| h.to_ascii_lowercase());
-        let host_lower = host_lower_owned.as_deref().or(input.host);
+        let host_lower = self.host_lower(input);
+        let host_lower = host_lower.as_deref().or(input.host);
         self.rules
             .iter()
             .find(|rule| matches_rule(rule, input, host_lower, self.geoip_db.as_deref()))
+    }
+
+    /// Lowercase the host only if it contains uppercase ASCII; otherwise
+    /// the caller reuses the borrowed original.
+    fn host_lower(&self, input: &MatchInput<'_>) -> Option<String> {
+        input
+            .host
+            .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
+            .map(|h| h.to_ascii_lowercase())
+    }
+
+    /// A rule requires a resolved IP to ever match. GEOIP only counts when
+    /// an mmdb is loaded — otherwise the rule would return false regardless
+    /// of whether an IP is present.
+    fn rule_needs_ip(&self, rule: &RuleEntry) -> bool {
+        match rule {
+            RuleEntry::IpCidr { .. } => true,
+            RuleEntry::GeoIp { .. } => self.geoip_db.is_some(),
+            _ => false,
+        }
     }
 }
 
@@ -148,10 +159,6 @@ pub enum EvalStep<'a> {
     NeedsIp { resume_from: usize },
     /// Walked all rules without matching.
     NoMatch,
-}
-
-fn rule_needs_ip(rule: &RuleEntry) -> bool {
-    matches!(rule, RuleEntry::IpCidr { .. } | RuleEntry::GeoIp { .. })
 }
 
 fn matches_rule(

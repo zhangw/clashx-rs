@@ -573,17 +573,15 @@ async fn handle_connection(
         )
     };
 
-    // Process lookup runs concurrently with the first rule-eval pass —
-    // independent work.
-    let process_fut = async {
-        if need_process {
-            lookup_process_name(source_addr).await
-        } else {
-            None
-        }
+    // Process lookup must complete before rule eval because PROCESS-NAME
+    // rules can short-circuit both later domain and IP rules. libproc lookup
+    // is <1ms on a cache hit (the common case), so this is not a hot-path
+    // concern.
+    let process_name = if need_process {
+        lookup_process_name(source_addr).await
+    } else {
+        None
     };
-
-    let process_name = process_fut.await;
 
     let host_field: Option<&str> = if parsed_ip.is_some() {
         None
