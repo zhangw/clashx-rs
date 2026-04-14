@@ -41,8 +41,9 @@ impl DnsCache {
     }
 
     async fn get(&self, host: &str) -> Option<IpAddr> {
+        let key = host.to_ascii_lowercase();
         let entries = self.entries.read().await;
-        let entry = entries.get(host)?;
+        let entry = entries.get(&key)?;
         if Instant::now() < entry.expires {
             Some(entry.ip)
         } else {
@@ -51,6 +52,7 @@ impl DnsCache {
     }
 
     async fn put(&self, host: &str, ip: IpAddr, ttl_secs: u32) {
+        let key = host.to_ascii_lowercase();
         let ttl = ttl_secs.max(MIN_TTL_SECS);
         let mut entries = self.entries.write().await;
 
@@ -69,7 +71,7 @@ impl DnsCache {
         }
 
         entries.insert(
-            host.to_string(),
+            key,
             CacheEntry {
                 ip,
                 expires: Instant::now() + std::time::Duration::from_secs(ttl as u64),

@@ -537,40 +537,33 @@ async fn handle_connection(
     // DNS pre-resolve: if target is a domain and config has IP-based rules (GEOIP/IP-CIDR),
     // resolve to IP so those rules can match. Uses config nameservers directly (bypasses
     // system proxy) to get accurate IPs for GEOIP matching.
-    let (needs_resolve, nameservers, dns_cache) = if parsed_ip.is_none() {
+    let resolved_ip = if let Some(ip) = parsed_ip {
+        Some(ip)
+    } else {
         let st = state.read().await;
-        (
-            st.rule_engine.needs_resolved_ip(),
-            Arc::clone(&st.nameservers),
-            Arc::clone(&st.dns_cache),
-        )
-    } else {
-        (
-            false,
-            Arc::from([]),
-            Arc::new(clashx_rs_dns::DnsCache::new()),
-        )
-    };
-    let resolved_ip = if parsed_ip.is_some() {
-        parsed_ip
-    } else if needs_resolve {
-        match clashx_rs_dns::resolve_with_nameservers(&target_host, &nameservers, &dns_cache).await
-        {
-            Ok(ip) => {
-                tracing::debug!(host = %target_host, resolved = %ip, "DNS pre-resolved");
-                Some(ip)
+        if st.rule_engine.needs_resolved_ip() {
+            let nameservers = Arc::clone(&st.nameservers);
+            let dns_cache = Arc::clone(&st.dns_cache);
+            drop(st); // release read lock before async DNS query
+            match clashx_rs_dns::resolve_with_nameservers(&target_host, &nameservers, &dns_cache)
+                .await
+            {
+                Ok(ip) => {
+                    tracing::debug!(host = %target_host, resolved = %ip, "DNS pre-resolved");
+                    Some(ip)
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        host = %target_host,
+                        err = %e,
+                        "DNS pre-resolve failed, IP-based rules will skip"
+                    );
+                    None
+                }
             }
-            Err(e) => {
-                tracing::debug!(
-                    host = %target_host,
-                    err = %e,
-                    "DNS pre-resolve failed, IP-based rules will skip"
-                );
-                None
-            }
+        } else {
+            None
         }
-    } else {
-        None
     };
 
     // --- Phase 1: Route resolution (under read lock) ---
