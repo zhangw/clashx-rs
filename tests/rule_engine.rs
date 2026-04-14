@@ -67,6 +67,7 @@ fn input_host(host: &str) -> MatchInput<'_> {
         host: Some(host),
         ip: host.parse().ok(),
         process_name: None,
+        ..Default::default()
     }
 }
 
@@ -75,6 +76,7 @@ fn input_ip(ip: &str) -> MatchInput<'_> {
         host: None,
         ip: Some(ip.parse::<IpAddr>().unwrap()),
         process_name: None,
+        ..Default::default()
     }
 }
 
@@ -83,6 +85,7 @@ fn input_process(name: &str) -> MatchInput<'_> {
         host: None,
         ip: None,
         process_name: Some(name),
+        ..Default::default()
     }
 }
 
@@ -458,6 +461,7 @@ fn empty_input_falls_to_catch_all() {
         host: None,
         ip: None,
         process_name: None,
+        ..Default::default()
     };
     assert_eq!(e.evaluate(&input), Some("🐟 漏网之鱼"));
 }
@@ -502,6 +506,7 @@ fn host_with_resolved_ip_matches_domain_rule_first() {
         host: Some("google.com"),
         ip: Some("142.250.80.46".parse().unwrap()),
         process_name: None,
+        ..Default::default()
     };
     assert_eq!(e.evaluate(&input), Some("@singapo"));
 }
@@ -514,6 +519,7 @@ fn ip_string_as_host_matches_cidr() {
         host: Some("172.16.5.3"),
         ip: Some("172.16.5.3".parse().unwrap()),
         process_name: None,
+        ..Default::default()
     };
     assert_eq!(e.evaluate(&input), Some("@acmecorp-corpnet"));
 }

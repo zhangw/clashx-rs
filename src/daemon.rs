@@ -28,6 +28,7 @@ fn match_input_from_host(host: &str) -> MatchInput<'_> {
         host: if ip.is_some() { None } else { Some(host) },
         ip,
         process_name: None,
+        ..Default::default()
     }
 }
 
@@ -583,9 +584,11 @@ async fn handle_connection(
         use clashx_rs_rule::EvalStep;
         let mut owned_process: Option<String> = None;
         let mut ip = parsed_ip;
+        // A literal-IP target counts as already-attempted-and-satisfied, so
+        // IP/GEOIP rules evaluate against it without triggering a DNS fetch.
+        let mut ip_attempted = parsed_ip.is_some();
+        let mut process_attempted = false;
 
-        // Lazy-eval loop. We rebuild MatchInput each iteration so the borrow
-        // of owned_process stays scoped to the current evaluate_from call.
         let mut start = 0usize;
         let mut target_str: Option<String> = None;
         let mut desc: Option<String> = None;
@@ -594,6 +597,8 @@ async fn handle_connection(
                 host: host_field,
                 ip,
                 process_name: owned_process.as_deref(),
+                ip_attempted,
+                process_attempted,
             };
             match rule_engine.evaluate_from(&input, start) {
                 EvalStep::Matched(rule) => {
@@ -628,9 +633,11 @@ async fn handle_connection(
                                 None
                             }
                         };
+                        ip_attempted = true;
                     }
                     if need_process {
                         owned_process = rule_engine.process_lookup().lookup(source_addr).await;
+                        process_attempted = true;
                     }
                     start = resume_from;
                 }
@@ -1220,6 +1227,7 @@ mod tests {
             host: Some("test.example.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         let (group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(group, Some("🚀 节点选择"));
@@ -1239,6 +1247,7 @@ mod tests {
             host: Some("anything.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         let (group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(group, None);
@@ -1334,6 +1343,7 @@ mod tests {
             host: Some("bun.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         let (group, proxy, _rule) = state.resolve_routing_with_group(&input);
 
@@ -1358,6 +1368,7 @@ mod tests {
             host: Some("bun.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         let (group, _proxy, _rule) = state.resolve_routing_with_group(&input);
         let tracker = CooldownTracker::new();
@@ -1397,6 +1408,7 @@ mod tests {
             host: Some("example.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         let (_group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(proxy, "DIRECT");
