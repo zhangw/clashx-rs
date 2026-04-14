@@ -74,6 +74,19 @@ impl RuleEntry {
         }
     }
 
+    /// Short description of the rule for logging (e.g., "GEOIP,CN", "DOMAIN-SUFFIX,google.com").
+    pub fn description(&self) -> String {
+        match self {
+            RuleEntry::Domain { domain, .. } => format!("DOMAIN,{domain}"),
+            RuleEntry::DomainSuffix { suffix, .. } => format!("DOMAIN-SUFFIX,{suffix}"),
+            RuleEntry::DomainKeyword { keyword, .. } => format!("DOMAIN-KEYWORD,{keyword}"),
+            RuleEntry::IpCidr { ip, prefix_len, .. } => format!("IP-CIDR,{ip}/{prefix_len}"),
+            RuleEntry::ProcessName { name, .. } => format!("PROCESS-NAME,{name}"),
+            RuleEntry::GeoIp { country, .. } => format!("GEOIP,{country}"),
+            RuleEntry::Match { .. } => "MATCH".to_string(),
+        }
+    }
+
     pub fn target(&self) -> &str {
         match self {
             RuleEntry::Domain { target, .. }

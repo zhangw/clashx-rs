@@ -214,21 +214,26 @@ impl DaemonState {
         }
     }
 
-    /// Resolve routing for a given input. Returns (group_name, proxy_name).
-    /// group_name is Some if the route went through a proxy group, None otherwise.
+    /// Resolve routing for a given input. Returns (group_name, proxy_name, matched_rule).
     fn resolve_routing_with_group<'a>(
         &'a self,
         input: &MatchInput<'_>,
-    ) -> (Option<&'a str>, &'a str) {
+    ) -> (Option<&'a str>, &'a str, Option<String>) {
         match self.config.mode {
-            Mode::Direct => (None, "DIRECT"),
+            Mode::Direct => (None, "DIRECT", None),
             Mode::Global => match self.config.proxy_groups.first() {
-                Some(g) => self.resolve_selection_chain(&g.name),
-                None => (None, "DIRECT"),
+                Some(g) => {
+                    let (grp, proxy) = self.resolve_selection_chain(&g.name);
+                    (grp, proxy, None)
+                }
+                None => (None, "DIRECT", None),
             },
-            Mode::Rule => match self.rule_engine.evaluate(input) {
-                Some(target) => self.resolve_selection_chain(target),
-                None => (None, "DIRECT"),
+            Mode::Rule => match self.rule_engine.evaluate_verbose(input) {
+                Some((target, rule_desc)) => {
+                    let (grp, proxy) = self.resolve_selection_chain(target);
+                    (grp, proxy, Some(rule_desc))
+                }
+                None => (None, "DIRECT", None),
             },
         }
     }
@@ -590,7 +595,7 @@ async fn handle_connection(
             process_name: process_name.as_deref(),
         };
 
-        let (grp, resolved) = st.resolve_routing_with_group(&match_input);
+        let (grp, resolved, matched_rule) = st.resolve_routing_with_group(&match_input);
         group_name = grp.map(|s| s.to_string());
         proxy_name = resolved.to_string();
 
@@ -598,6 +603,7 @@ async fn handle_connection(
             target = %target_host,
             port = target_port,
             mode = ?st.config.mode,
+            rule = ?matched_rule,
             proxy = %proxy_name,
             group = ?group_name,
             "routing connection"
@@ -953,10 +959,11 @@ async fn dispatch_control(
         ControlRequest::Test { domain } => {
             let st = state.read().await;
             let input = match_input_from_host(&domain);
-            let (group, resolved_name) = st.resolve_routing_with_group(&input);
+            let (group, resolved_name, matched_rule) = st.resolve_routing_with_group(&input);
             ControlResponse::success(json!({
                 "domain": domain,
                 "mode": format!("{:?}", st.config.mode),
+                "matched_rule": matched_rule,
                 "resolved_proxy": resolved_name,
                 "group": group,
             }))
@@ -1149,7 +1156,7 @@ mod tests {
             ip: None,
             process_name: None,
         };
-        let (group, proxy) = state.resolve_routing_with_group(&input);
+        let (group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(group, Some("🚀 节点选择"));
         assert_eq!(proxy, "🇭🇰 香港 01"); // first proxy = default selection
     }
@@ -1168,7 +1175,7 @@ mod tests {
             ip: None,
             process_name: None,
         };
-        let (group, proxy) = state.resolve_routing_with_group(&input);
+        let (group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(group, None);
         assert_eq!(proxy, "DIRECT");
     }
@@ -1263,7 +1270,7 @@ mod tests {
             ip: None,
             process_name: None,
         };
-        let (group, proxy) = state.resolve_routing_with_group(&input);
+        let (group, proxy, _rule) = state.resolve_routing_with_group(&input);
 
         // The innermost group is returned so failover tries siblings of the
         // selected leaf, not members of the outer fallback group.
@@ -1287,7 +1294,7 @@ mod tests {
             ip: None,
             process_name: None,
         };
-        let (group, _proxy) = state.resolve_routing_with_group(&input);
+        let (group, _proxy, _rule) = state.resolve_routing_with_group(&input);
         let tracker = CooldownTracker::new();
         let candidates = state.build_candidate_list(group.unwrap(), &tracker);
 
@@ -1326,7 +1333,7 @@ mod tests {
             ip: None,
             process_name: None,
         };
-        let (_group, proxy) = state.resolve_routing_with_group(&input);
+        let (_group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(proxy, "DIRECT");
     }
 }
