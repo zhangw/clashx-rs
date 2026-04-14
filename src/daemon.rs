@@ -643,7 +643,7 @@ async fn handle_connection(
         }
         "DIRECT" => {
             let outbound = connect_with_retry("DIRECT", &target_host, || {
-                outbound::direct::connect(&target)
+                outbound::direct::connect(&target, resolved_ip)
             })
             .await?;
             relay_streams(inbound_stream, outbound, initial_data).await?;
