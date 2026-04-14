@@ -159,7 +159,16 @@ fn main() -> Result<()> {
             bypass,
         } => {
             let config_path = expand_tilde(&config);
-            let cfg = clashx_rs_config::load_config(&config_path).ok();
+            let cfg = match clashx_rs_config::load_config(&config_path) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to load config {}: {e}, using defaults",
+                        config_path.display()
+                    );
+                    None
+                }
+            };
             let port = cfg
                 .as_ref()
                 .and_then(|c| c.mixed_port)

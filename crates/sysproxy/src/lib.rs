@@ -23,7 +23,9 @@ impl SysProxy {
         return macos::enable(self.port, bypass);
         #[cfg(target_os = "linux")]
         {
-            let _ = bypass;
+            if !bypass.is_empty() {
+                tracing::warn!("proxy bypass list is not yet supported on Linux");
+            }
             return linux::enable(self.port);
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
