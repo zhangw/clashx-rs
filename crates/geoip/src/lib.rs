@@ -19,12 +19,9 @@ impl GeoIpDb {
 
     /// Look up the ISO 3166-1 alpha-2 country code for an IP address.
     /// Returns None if the IP is not found in the database (e.g., private ranges).
-    pub fn lookup_country(&self, ip: IpAddr) -> Option<String> {
+    pub fn lookup_country(&self, ip: IpAddr) -> Option<&str> {
         let result: maxminddb::geoip2::Country = self.reader.lookup(ip).ok()?;
-        result
-            .country
-            .and_then(|c| c.iso_code)
-            .map(|s| s.to_uppercase())
+        result.country.and_then(|c| c.iso_code)
     }
 }
 
@@ -61,7 +58,7 @@ mod tests {
         let db = GeoIpDb::open(&test_fixture_path()).unwrap();
         // 2.125.160.216 is mapped to GB in MaxMind test data
         let ip: IpAddr = "2.125.160.216".parse().unwrap();
-        assert_eq!(db.lookup_country(ip).as_deref(), Some("GB"));
+        assert_eq!(db.lookup_country(ip), Some("GB"));
     }
 
     #[test]
@@ -69,7 +66,7 @@ mod tests {
         let db = GeoIpDb::open(&test_fixture_path()).unwrap();
         // 89.160.20.112 is mapped to SE in MaxMind test data
         let ip: IpAddr = "89.160.20.112".parse().unwrap();
-        assert_eq!(db.lookup_country(ip).as_deref(), Some("SE"));
+        assert_eq!(db.lookup_country(ip), Some("SE"));
     }
 
     #[test]
@@ -84,7 +81,7 @@ mod tests {
         let db = GeoIpDb::open(&test_fixture_path()).unwrap();
         // 2001:218:: is mapped to JP in MaxMind test data
         let ip: IpAddr = "2001:218::1".parse().unwrap();
-        assert_eq!(db.lookup_country(ip).as_deref(), Some("JP"));
+        assert_eq!(db.lookup_country(ip), Some("JP"));
     }
 
     #[test]

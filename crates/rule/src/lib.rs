@@ -15,6 +15,7 @@ pub struct MatchInput<'a> {
 pub struct RuleEngine {
     rules: Vec<RuleEntry>,
     geoip_db: Option<Arc<GeoIpDb>>,
+    has_ip_rules: bool,
 }
 
 impl RuleEngine {
@@ -42,13 +43,32 @@ impl RuleEngine {
             );
         }
 
-        Self { rules, geoip_db }
+        let has_ip_rules = rules
+            .iter()
+            .any(|r| matches!(r, RuleEntry::GeoIp { .. } | RuleEntry::IpCidr { .. }));
+
+        Self {
+            rules,
+            geoip_db,
+            has_ip_rules,
+        }
     }
 
     /// Hot-swap the GeoIP database (called after background download completes).
     pub fn set_geoip_db(&mut self, db: Arc<GeoIpDb>) {
         self.geoip_db = Some(db);
+        self.has_ip_rules = true;
         tracing::info!("GeoIP database hot-swapped, GEOIP rules now active");
+    }
+
+    /// Whether the config has any GEOIP or IP-CIDR rules that need a resolved IP.
+    pub fn needs_resolved_ip(&self) -> bool {
+        self.has_ip_rules
+    }
+
+    /// Whether a GeoIP database is currently loaded.
+    pub fn has_geoip_db(&self) -> bool {
+        self.geoip_db.is_some()
     }
 
     pub fn evaluate<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a str> {
@@ -99,7 +119,7 @@ fn matches_rule(
             let Some(db) = geoip_db else { return false };
             let Some(ip) = input.ip else { return false };
             db.lookup_country(ip)
-                .map(|c| c == *country)
+                .map(|c| c.eq_ignore_ascii_case(country))
                 .unwrap_or(false)
         }
         RuleEntry::Match { .. } => true,

@@ -337,11 +337,11 @@ async fn run_daemon(
         "127.0.0.1".to_string()
     };
 
-    let geoip_loaded = mmdb_path.exists();
     let mut daemon_state =
         DaemonState::from_config(config, config_path.to_path_buf(), mmdb_path.clone());
     daemon_state.parse_and_apply_overrides(selections)?;
     daemon_state.validate();
+    let geoip_loaded = daemon_state.rule_engine.has_geoip_db();
     let state = Arc::new(RwLock::new(daemon_state));
 
     let rt_dir = paths::runtime_dir();
@@ -512,10 +512,12 @@ async fn handle_connection(
 
     let parsed_ip: Option<std::net::IpAddr> = target_host.parse().ok();
 
-    // DNS pre-resolve: if target is a domain, resolve to IP so GEOIP/IP-CIDR rules can match.
+    // DNS pre-resolve: if target is a domain and config has IP-based rules (GEOIP/IP-CIDR),
+    // resolve to IP so those rules can match. Skip the resolve entirely when no such rules exist.
+    let needs_resolve = parsed_ip.is_none() && state.read().await.rule_engine.needs_resolved_ip();
     let resolved_ip = if parsed_ip.is_some() {
         parsed_ip
-    } else {
+    } else if needs_resolve {
         match clashx_rs_dns::resolve(&target_host).await {
             Ok(ip) => Some(ip),
             Err(e) => {
@@ -527,6 +529,8 @@ async fn handle_connection(
                 None
             }
         }
+    } else {
+        None
     };
 
     // --- Phase 1: Route resolution (under read lock) ---

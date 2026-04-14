@@ -23,7 +23,6 @@ pub enum RuleEntry {
         name: String,
         target: String,
     },
-    /// Stub: parsed but never matches. Real implementation deferred until DNS rewrite + maxminddb.
     GeoIp {
         country: String,
         target: String,
