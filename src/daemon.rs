@@ -40,14 +40,14 @@ struct DaemonState {
     startup_overrides: Vec<(String, String)>,
     cooldown: Arc<crate::retry::CooldownTracker>,
     mmdb_path: PathBuf,
-    nameservers: Vec<IpAddr>,
+    nameservers: Arc<[IpAddr]>,
 }
 
 impl DaemonState {
     fn from_config(config: Config, config_path: PathBuf, mmdb_path: PathBuf) -> Self {
         // Extract plain IP nameservers from dns config for direct DNS queries.
         // Skip DoH/DoT URLs — only use plain IPs (e.g., 223.5.5.5, 119.29.29.29).
-        let nameservers: Vec<IpAddr> = config
+        let nameservers: Arc<[IpAddr]> = config
             .dns
             .as_ref()
             .map(|d| {
@@ -55,9 +55,10 @@ impl DaemonState {
                     .iter()
                     .chain(d.default_nameserver.iter())
                     .filter_map(|s| s.parse::<IpAddr>().ok())
-                    .collect()
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into();
         if !nameservers.is_empty() {
             tracing::info!(?nameservers, "using config nameservers for DNS pre-resolve");
         }
@@ -536,9 +537,12 @@ async fn handle_connection(
     // system proxy) to get accurate IPs for GEOIP matching.
     let (needs_resolve, nameservers) = if parsed_ip.is_none() {
         let st = state.read().await;
-        (st.rule_engine.needs_resolved_ip(), st.nameservers.clone())
+        (
+            st.rule_engine.needs_resolved_ip(),
+            Arc::clone(&st.nameservers),
+        )
     } else {
-        (false, Vec::new())
+        (false, Arc::from([]))
     };
     let resolved_ip = if parsed_ip.is_some() {
         parsed_ip
