@@ -6,6 +6,20 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
+/// How long a port → process snapshot is trusted before a rebuild is triggered.
+///
+/// This is a deliberate stale-tolerance window: within the TTL, "port not in
+/// snapshot" is treated as a definitive miss (no rebuild). Consequences:
+///
+/// - Connections from a target process that starts within 2s of the snapshot
+///   can be routed WITHOUT matching their PROCESS-NAME rule, until the next
+///   rebuild brings their port into the snapshot.
+/// - Ports that have been reused by a different process can match the OLD
+///   process's PROCESS-NAME rule for up to 2s.
+///
+/// This is the tradeoff chosen to keep per-connection cost at essentially zero
+/// in the common case. PROCESS-NAME rules are best-effort — for hard routing
+/// requirements, prefer DOMAIN-based, IP-CIDR, or GEOIP rules.
 const SNAPSHOT_TTL: Duration = Duration::from_secs(2);
 
 struct Snapshot {

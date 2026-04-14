@@ -76,9 +76,18 @@ The following findings from the original evaluation have been resolved:
 **Fix (`crates/rule/src/process.rs`):**
 - Replaced `lsof` subprocess with native `libproc` API — no fork/exec.
 - Added 2-second port → process table snapshot cache. First connection in a burst triggers one full-system scan; subsequent connections hit the O(1) cache.
+- Scanner filters by process name BEFORE walking file descriptors, using the
+  set of names referenced by PROCESS-NAME rules. A scan touches only the
+  target processes' fd lists instead of all system processes.
 - Concurrent misses coalesce via a `REBUILDING` flag + `tokio::sync::Notify`, so a burst of parallel connections triggers exactly one rescan.
 - Snapshot rebuild is offloaded to `spawn_blocking` so the async runtime is not stalled.
 - Process lookup moved outside the `DaemonState` read lock so concurrent connections don't serialize behind it.
+
+**Known tradeoff:** PROCESS-NAME matching is best-effort. Within the 2s TTL
+window, a new connection from a target process can be missed until the next
+rebuild (briefly routed as if no PROCESS-NAME rule matched), and a port reused
+by a different process can match the old process's rule. For hard routing
+requirements, prefer DOMAIN-based, IP-CIDR, or GEOIP rules.
 
 ### No DNS subsystem (originally #3)
 
