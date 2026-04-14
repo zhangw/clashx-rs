@@ -69,9 +69,12 @@ enum Command {
     Sysproxy {
         #[command(subcommand)]
         action: SysproxyAction,
-        /// Config file to read skip-proxy bypass rules from
+        /// Config file to read mixed-port from
         #[arg(short, long, default_value = "~/.config/clashx-rs/config.yaml")]
         config: String,
+        /// Subnets/domains to bypass the proxy (default: private ranges + localhost)
+        #[arg(long = "bypass")]
+        bypass: Vec<String>,
     },
     /// Download the GeoIP mmdb database
     MmdbDownload {
@@ -150,27 +153,35 @@ fn main() -> Result<()> {
 
         Command::Test { domain } => client::send_command(ControlRequest::Test { domain })?,
 
-        Command::Sysproxy { action, config } => {
+        Command::Sysproxy {
+            action,
+            config,
+            bypass,
+        } => {
             let config_path = expand_tilde(&config);
             let cfg = clashx_rs_config::load_config(&config_path).ok();
             let port = cfg
                 .as_ref()
                 .and_then(|c| c.mixed_port)
                 .unwrap_or(paths::DEFAULT_MIXED_PORT);
-            let bypass = cfg
-                .as_ref()
-                .map(|c| c.skip_proxy.clone())
-                .unwrap_or_default();
+            // Priority: CLI --bypass > config skip-proxy > built-in defaults
+            let bypass_rules = if !bypass.is_empty() {
+                bypass
+            } else {
+                cfg.as_ref()
+                    .map(|c| c.skip_proxy.clone())
+                    .unwrap_or_default()
+            };
             let sp = SysProxy::new(port);
             match action {
                 SysproxyAction::On => {
-                    sp.enable_with_bypass(&bypass)?;
-                    if bypass.is_empty() {
+                    sp.enable_with_bypass(&bypass_rules)?;
+                    if bypass_rules.is_empty() {
                         println!("system proxy enabled on port {port} (default bypass rules)");
                     } else {
                         println!(
                             "system proxy enabled on port {port} (bypass: {})",
-                            bypass.join(", ")
+                            bypass_rules.join(", ")
                         );
                     }
                 }
