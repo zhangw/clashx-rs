@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,14 +7,15 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clashx_rs_config::load_config;
 use clashx_rs_config::types::{Config, Mode, Proxy};
+use clashx_rs_geoip::GeoIpDb;
 use clashx_rs_proxy::inbound::{self, InboundResult};
 use clashx_rs_proxy::outbound::{self, OutboundStream};
 use clashx_rs_proxy::relay::relay;
-use clashx_rs_rule::{process::lookup_process_name, MatchInput, RuleEngine};
+use clashx_rs_rule::{MatchInput, RuleEngine};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::control::{ControlRequest, ControlResponse};
 use crate::paths::{self, DEFAULT_MIXED_PORT};
@@ -27,22 +29,71 @@ fn match_input_from_host(host: &str) -> MatchInput<'_> {
         host: if ip.is_some() { None } else { Some(host) },
         ip,
         process_name: None,
+        ..Default::default()
+    }
+}
+
+/// Max concurrent connections before admission control starts rejecting.
+/// For a desktop local proxy this is far above normal browser workloads
+/// (hundreds of parallel fetches). Abusive/buggy clients are bounded here.
+const MAX_CONCURRENT_CONNECTIONS: usize = 2048;
+
+struct MatchedRuleDebug<'a>(Option<&'a clashx_rs_config::rule::RuleEntry>);
+
+impl fmt::Debug for MatchedRuleDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(rule) => write!(f, "Some(\"{}\")", rule.display()),
+            None => f.write_str("None"),
+        }
     }
 }
 
 struct DaemonState {
     config: Config,
     config_path: PathBuf,
-    rule_engine: RuleEngine,
+    rule_engine: Arc<RuleEngine>,
     proxies: HashMap<String, Proxy>,
     selections: HashMap<String, String>,
     startup_overrides: Vec<(String, String)>,
     cooldown: Arc<crate::retry::CooldownTracker>,
+    mmdb_path: PathBuf,
+    nameservers: Arc<[IpAddr]>,
+    dns_cache: Arc<clashx_rs_dns::DnsCache>,
 }
 
 impl DaemonState {
-    fn from_config(config: Config, config_path: PathBuf) -> Self {
-        let rule_engine = RuleEngine::new(&config.rules);
+    fn from_config(config: Config, config_path: PathBuf, mmdb_path: PathBuf) -> Self {
+        // Extract plain IP nameservers from dns config for direct DNS queries.
+        // Skip DoH/DoT URLs — only use plain IPs (e.g., 223.5.5.5, 119.29.29.29).
+        let nameservers: Arc<[IpAddr]> = config
+            .dns
+            .as_ref()
+            .map(|d| {
+                d.nameserver
+                    .iter()
+                    .chain(d.default_nameserver.iter())
+                    .filter_map(|s| s.parse::<IpAddr>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+            .into();
+        if !nameservers.is_empty() {
+            tracing::info!(?nameservers, "using config nameservers for DNS pre-resolve");
+        }
+
+        let geoip_db = match GeoIpDb::open(&mmdb_path) {
+            Ok(db) => {
+                tracing::info!(path = %mmdb_path.display(), "GeoIP database loaded");
+                Some(Arc::new(db))
+            }
+            Err(e) => {
+                tracing::warn!(path = %mmdb_path.display(), err = %e, "failed to load GeoIP database");
+                None
+            }
+        };
+
+        let rule_engine = Arc::new(RuleEngine::new(&config.rules, geoip_db));
 
         let mut proxies = HashMap::new();
         for p in &config.proxies {
@@ -66,6 +117,9 @@ impl DaemonState {
             selections,
             startup_overrides: Vec::new(),
             cooldown: Arc::new(crate::retry::CooldownTracker::new()),
+            mmdb_path,
+            nameservers,
+            dns_cache: Arc::new(clashx_rs_dns::DnsCache::new()),
         }
     }
 
@@ -178,31 +232,28 @@ impl DaemonState {
         }
     }
 
-    /// Resolve routing for a given input. Returns (group_name, proxy_name).
-    /// group_name is Some if the route went through a proxy group, None otherwise.
+    /// Resolve routing for a given input. Returns (group_name, proxy_name, matched_rule).
     fn resolve_routing_with_group<'a>(
         &'a self,
         input: &MatchInput<'_>,
-    ) -> (Option<&'a str>, &'a str) {
+    ) -> (Option<&'a str>, &'a str, Option<String>) {
         match self.config.mode {
-            Mode::Direct => (None, "DIRECT"),
+            Mode::Direct => (None, "DIRECT", None),
             Mode::Global => match self.config.proxy_groups.first() {
-                Some(g) => self.resolve_selection_chain(&g.name),
-                None => (None, "DIRECT"),
+                Some(g) => {
+                    let (grp, proxy) = self.resolve_selection_chain(&g.name);
+                    (grp, proxy, None)
+                }
+                None => (None, "DIRECT", None),
             },
-            Mode::Rule => match self.rule_engine.evaluate(input) {
-                Some(target) => self.resolve_selection_chain(target),
-                None => (None, "DIRECT"),
+            Mode::Rule => match self.rule_engine.evaluate_verbose(input) {
+                Some((target, rule_desc)) => {
+                    let (grp, proxy) = self.resolve_selection_chain(target);
+                    (grp, proxy, Some(rule_desc))
+                }
+                None => (None, "DIRECT", None),
             },
         }
-    }
-
-    /// True if the config contains any PROCESS-NAME rules.
-    fn has_process_rules(&self) -> bool {
-        self.config
-            .rules
-            .iter()
-            .any(|r| r.starts_with("PROCESS-NAME,"))
     }
 
     /// Build a list of (proxy_name, Proxy) candidates for retry/failover.
@@ -264,14 +315,29 @@ impl DaemonState {
     }
 }
 
-pub fn start_foreground(config_path: &Path, selections: &[String]) -> Result<()> {
+pub fn start_foreground(
+    config_path: &Path,
+    selections: &[String],
+    mmdb_path: PathBuf,
+    mmdb_auto_download: bool,
+) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run_daemon(config_path, selections))
+    rt.block_on(run_daemon(
+        config_path,
+        selections,
+        mmdb_path,
+        mmdb_auto_download,
+    ))
 }
 
-pub fn start_background(_config_path: &Path, _selections: &[String]) -> Result<()> {
+pub fn start_background(
+    _config_path: &Path,
+    _selections: &[String],
+    _mmdb_path: PathBuf,
+    _mmdb_auto_download: bool,
+) -> Result<()> {
     println!("background daemon mode is not yet implemented");
     Ok(())
 }
@@ -280,7 +346,12 @@ pub fn start_background(_config_path: &Path, _selections: &[String]) -> Result<(
 // Core daemon loop
 // ---------------------------------------------------------------------------
 
-async fn run_daemon(config_path: &Path, selections: &[String]) -> Result<()> {
+async fn run_daemon(
+    config_path: &Path,
+    selections: &[String],
+    mmdb_path: PathBuf,
+    mmdb_auto_download: bool,
+) -> Result<()> {
     let config = load_config(config_path)?;
     let port = config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT);
     let allow_lan = config.allow_lan.unwrap_or(false);
@@ -303,9 +374,11 @@ async fn run_daemon(config_path: &Path, selections: &[String]) -> Result<()> {
         "127.0.0.1".to_string()
     };
 
-    let mut daemon_state = DaemonState::from_config(config, config_path.to_path_buf());
+    let mut daemon_state =
+        DaemonState::from_config(config, config_path.to_path_buf(), mmdb_path.clone());
     daemon_state.parse_and_apply_overrides(selections)?;
     daemon_state.validate();
+    let geoip_loaded = daemon_state.rule_engine.has_geoip_db();
     let state = Arc::new(RwLock::new(daemon_state));
 
     let rt_dir = paths::runtime_dir();
@@ -320,7 +393,7 @@ async fn run_daemon(config_path: &Path, selections: &[String]) -> Result<()> {
             .with_context(|| format!("failed to chmod runtime dir: {}", rt_dir.display()))?;
     }
 
-    let sock = paths::socket_path();
+    let sock = paths::socket_path(port);
     let _ = std::fs::remove_file(&sock);
     let control_listener = UnixListener::bind(&sock)
         .with_context(|| format!("failed to bind control socket: {}", sock.display()))?;
@@ -333,7 +406,7 @@ async fn run_daemon(config_path: &Path, selections: &[String]) -> Result<()> {
     }
     tracing::info!(path = %sock.display(), "control socket bound");
 
-    let pid_file = paths::pid_path();
+    let pid_file = paths::pid_path(port);
     std::fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write PID file: {}", pid_file.display()))?;
 
@@ -344,6 +417,67 @@ async fn run_daemon(config_path: &Path, selections: &[String]) -> Result<()> {
 
     println!("clashx-rs started on {bind_addr}:{port}");
     println!("press Ctrl-C to stop");
+
+    // Auto-download mmdb in background if requested and not already loaded.
+    if mmdb_auto_download && !geoip_loaded {
+        let dl_state = Arc::clone(&state);
+        let dl_mmdb_path = mmdb_path;
+        let dl_port = port;
+        tokio::spawn(async move {
+            // Wait for proxy to fully start before downloading through it.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            let proxy_url = format!("socks5://127.0.0.1:{dl_port}");
+            let backoff = [10u64, 30, 90];
+
+            for (attempt, delay) in backoff.iter().enumerate() {
+                tracing::info!(
+                    attempt = attempt + 1,
+                    max = backoff.len(),
+                    "auto-downloading mmdb"
+                );
+                match clashx_rs_geoip::download::download_mmdb(
+                    None,
+                    Some(&proxy_url),
+                    &dl_mmdb_path,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        match GeoIpDb::open(&dl_mmdb_path) {
+                            Ok(db) => {
+                                let mut st = dl_state.write().await;
+                                let new_engine =
+                                    RuleEngine::new(&st.config.rules, Some(Arc::new(db)));
+                                st.rule_engine = Arc::new(new_engine);
+                                tracing::info!(
+                                    "GeoIP database hot-swapped, GEOIP rules now active"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(err = %e, "downloaded mmdb but failed to load");
+                            }
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            err = %e,
+                            retry_in_secs = delay,
+                            "mmdb download failed"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                    }
+                }
+            }
+
+            tracing::warn!(
+                "failed to auto-download mmdb after {} attempts, GEOIP rules remain inactive",
+                backoff.len()
+            );
+        });
+    }
 
     let ctrl_state = Arc::clone(&state);
     tokio::spawn(async move {
@@ -365,12 +499,29 @@ async fn run_daemon(config_path: &Path, selections: &[String]) -> Result<()> {
     });
 
     let proxy_state = Arc::clone(&state);
+    let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             match proxy_listener.accept().await {
                 Ok((stream, addr)) => {
+                    // Admission control: cap concurrent connections. If exhausted,
+                    // drop the new connection with a log line — a bursty/abusive
+                    // client cannot blow fd/memory budget.
+                    let permit = match connection_limit.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            tracing::warn!(
+                                peer = %addr,
+                                limit = MAX_CONCURRENT_CONNECTIONS,
+                                "connection limit reached, dropping incoming connection"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     let s = Arc::clone(&proxy_state);
                     tokio::spawn(async move {
+                        let _permit = permit; // released on task exit
                         if let Err(e) = handle_connection(stream, addr, s).await {
                             tracing::debug!(error = %e, peer = %addr, "connection handler error");
                         }
@@ -418,9 +569,96 @@ async fn handle_connection(
     let target_host = target.host_string();
     let target_port = target.port();
 
-    let ip: Option<std::net::IpAddr> = target_host.parse().ok();
+    let parsed_ip: Option<std::net::IpAddr> = target_host.parse().ok();
 
-    // --- Phase 1: Route resolution (under read lock) ---
+    let (nameservers, dns_cache, rule_engine, mode) = {
+        let st = state.read().await;
+        (
+            Arc::clone(&st.nameservers),
+            Arc::clone(&st.dns_cache),
+            Arc::clone(&st.rule_engine),
+            st.config.mode,
+        )
+    };
+
+    let host_field: Option<&str> = if parsed_ip.is_some() {
+        None
+    } else {
+        Some(&target_host)
+    };
+
+    let (matched_rule, resolved_ip, _process_name): (
+        Option<&clashx_rs_config::rule::RuleEntry>,
+        Option<IpAddr>,
+        Option<String>,
+    ) = if mode == Mode::Rule {
+        use clashx_rs_rule::EvalStep;
+        let mut owned_process: Option<String> = None;
+        let mut ip = parsed_ip;
+        // A literal-IP target counts as already-attempted-and-satisfied, so
+        // IP/GEOIP rules evaluate against it without triggering a DNS fetch.
+        let mut ip_attempted = parsed_ip.is_some();
+        let mut process_attempted = false;
+
+        let mut start = 0usize;
+        let mut matched_rule = None;
+        loop {
+            let input = MatchInput {
+                host: host_field,
+                ip,
+                process_name: owned_process.as_deref(),
+                ip_attempted,
+                process_attempted,
+            };
+            match rule_engine.evaluate_from(&input, start) {
+                EvalStep::Matched(rule) => {
+                    matched_rule = Some(rule);
+                    break;
+                }
+                EvalStep::NoMatch => break,
+                EvalStep::NeedsData {
+                    resume_from,
+                    need_ip,
+                    need_process,
+                } => {
+                    if need_ip {
+                        ip = match clashx_rs_dns::resolve_with_nameservers(
+                            &target_host,
+                            &nameservers,
+                            &dns_cache,
+                        )
+                        .await
+                        {
+                            Ok(r) => {
+                                tracing::debug!(host = %target_host, resolved = %r, "DNS pre-resolved");
+                                Some(r)
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    host = %target_host,
+                                    err = %e,
+                                    "DNS pre-resolve failed, IP-based rules will skip"
+                                );
+                                None
+                            }
+                        };
+                        ip_attempted = true;
+                    }
+                    if need_process {
+                        owned_process = rule_engine.process_lookup().lookup(source_addr).await;
+                        process_attempted = true;
+                    }
+                    start = resume_from;
+                }
+            }
+        }
+
+        (matched_rule, ip, owned_process)
+    } else {
+        (None, parsed_ip, None)
+    };
+
+    // Selection-chain + candidate-list resolution (brief read lock — O(1) lookups).
     let group_name: Option<String>;
     let proxy_name: String;
     let candidates: Vec<(String, Proxy)>;
@@ -428,30 +666,26 @@ async fn handle_connection(
     {
         let st = state.read().await;
 
-        let process_name = if st.config.mode == Mode::Rule && st.has_process_rules() {
-            lookup_process_name(&source_addr)
-        } else {
-            None
+        let chain_start: Option<&str> = match mode {
+            Mode::Direct => None,
+            Mode::Global => st.config.proxy_groups.first().map(|g| g.name.as_str()),
+            Mode::Rule => matched_rule.map(|r| r.target()),
         };
-
-        let match_input = MatchInput {
-            host: if ip.is_some() {
-                None
-            } else {
-                Some(&target_host)
-            },
-            ip,
-            process_name: process_name.as_deref(),
+        let (grp, resolved): (Option<String>, String) = match chain_start {
+            Some(target) => {
+                let (gg, p) = st.resolve_selection_chain(target);
+                (gg.map(|s| s.to_string()), p.to_string())
+            }
+            None => (None, "DIRECT".to_string()),
         };
-
-        let (grp, resolved) = st.resolve_routing_with_group(&match_input);
-        group_name = grp.map(|s| s.to_string());
-        proxy_name = resolved.to_string();
+        group_name = grp;
+        proxy_name = resolved;
 
         tracing::info!(
             target = %target_host,
             port = target_port,
-            mode = ?st.config.mode,
+            mode = ?mode,
+            rule = ?MatchedRuleDebug(matched_rule),
             proxy = %proxy_name,
             group = ?group_name,
             "routing connection"
@@ -460,21 +694,17 @@ async fn handle_connection(
         // Build candidate list for failover
         candidates = if let Some(ref gn) = group_name {
             st.build_candidate_list(gn, &st.cooldown)
+        } else if proxy_name != "DIRECT" && proxy_name != "REJECT" {
+            st.proxies
+                .get(&proxy_name)
+                .map(|p| vec![(proxy_name.clone(), p.clone())])
+                .unwrap_or_default()
         } else {
-            // No group — single proxy or DIRECT/REJECT
-            if proxy_name != "DIRECT" && proxy_name != "REJECT" {
-                st.proxies
-                    .get(&proxy_name)
-                    .map(|p| vec![(proxy_name.clone(), p.clone())])
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
+            Vec::new()
         };
 
         cooldown = Arc::clone(&st.cooldown);
     }
-    // State read lock is dropped here, before any async connect/relay calls.
 
     // --- Phase 2: Connect with retry/failover ---
     match proxy_name.as_str() {
@@ -485,7 +715,7 @@ async fn handle_connection(
         }
         "DIRECT" => {
             let outbound = connect_with_retry("DIRECT", &target_host, || {
-                outbound::direct::connect(&target)
+                outbound::direct::connect(&target, resolved_ip)
             })
             .await?;
             relay_streams(inbound_stream, outbound, initial_data).await?;
@@ -733,8 +963,8 @@ async fn dispatch_control(
                 if let Err(e) = sysproxy.disable() {
                     tracing::warn!("failed to disable system proxy on stop: {e}");
                 }
-                let _ = std::fs::remove_file(paths::socket_path());
-                let _ = std::fs::remove_file(paths::pid_path());
+                let _ = std::fs::remove_file(paths::socket_path(port));
+                let _ = std::fs::remove_file(paths::pid_path(port));
                 tracing::info!("cleanup complete");
                 std::process::exit(0);
             });
@@ -744,11 +974,12 @@ async fn dispatch_control(
         ControlRequest::Reload => {
             let mut st = state.write().await;
             let path = st.config_path.clone();
+            let mmdb_path = st.mmdb_path.clone();
             let overrides = std::mem::take(&mut st.startup_overrides);
             let cooldown = Arc::clone(&st.cooldown);
             match load_config(&path) {
                 Ok(new_config) => {
-                    let mut new_state = DaemonState::from_config(new_config, path);
+                    let mut new_state = DaemonState::from_config(new_config, path, mmdb_path);
                     if let Err(e) = new_state.reapply_overrides(overrides) {
                         return ControlResponse::error(format!(
                             "reload succeeded but --select overrides failed: {e}"
@@ -806,10 +1037,11 @@ async fn dispatch_control(
         ControlRequest::Test { domain } => {
             let st = state.read().await;
             let input = match_input_from_host(&domain);
-            let (group, resolved_name) = st.resolve_routing_with_group(&input);
+            let (group, resolved_name, matched_rule) = st.resolve_routing_with_group(&input);
             ControlResponse::success(json!({
                 "domain": domain,
                 "mode": format!("{:?}", st.config.mode),
+                "matched_rule": matched_rule,
                 "resolved_proxy": resolved_name,
                 "group": group,
             }))
@@ -880,7 +1112,11 @@ mod tests {
 
     #[test]
     fn default_selection_is_first_proxy() {
-        let state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         assert_eq!(
             state.selections.get("🚀 节点选择").map(|s| s.as_str()),
             Some("🇭🇰 香港 01")
@@ -893,7 +1129,11 @@ mod tests {
 
     #[test]
     fn override_valid_selection() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let overrides = vec!["🚀 节点选择=🇸🇬 新加坡 01".to_string()];
         state.parse_and_apply_overrides(&overrides).unwrap();
         assert_eq!(
@@ -909,7 +1149,11 @@ mod tests {
 
     #[test]
     fn override_multiple_groups() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let overrides = vec![
             "🚀 节点选择=🇸🇬 新加坡 02".to_string(),
             "@hk=🇭🇰 香港 02".to_string(),
@@ -927,7 +1171,11 @@ mod tests {
 
     #[test]
     fn override_unknown_group_errors() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let overrides = vec!["nonexistent=🇸🇬 新加坡 01".to_string()];
         let err = state.parse_and_apply_overrides(&overrides).unwrap_err();
         assert!(err.to_string().contains("group not found"));
@@ -936,7 +1184,11 @@ mod tests {
 
     #[test]
     fn override_unknown_proxy_errors() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let overrides = vec!["🚀 节点选择=🇺🇲 美国 01".to_string()];
         let err = state.parse_and_apply_overrides(&overrides).unwrap_err();
         assert!(err.to_string().contains("proxy"));
@@ -945,7 +1197,11 @@ mod tests {
 
     #[test]
     fn override_missing_separator_errors() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let overrides = vec!["no-separator-here".to_string()];
         let err = state.parse_and_apply_overrides(&overrides).unwrap_err();
         assert!(err.to_string().contains("invalid --select format"));
@@ -953,7 +1209,11 @@ mod tests {
 
     #[test]
     fn override_empty_list_is_noop() {
-        let mut state = DaemonState::from_config(test_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let original = state.selections.clone();
         state.parse_and_apply_overrides(&[]).unwrap();
         assert_eq!(state.selections, original);
@@ -964,13 +1224,18 @@ mod tests {
         let mut config = test_config();
         config.rules = vec!["DOMAIN-SUFFIX,example.com,🚀 节点选择".to_string()];
         config.mode = Mode::Rule;
-        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let input = MatchInput {
             host: Some("test.example.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
-        let (group, proxy) = state.resolve_routing_with_group(&input);
+        let (group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(group, Some("🚀 节点选择"));
         assert_eq!(proxy, "🇭🇰 香港 01"); // first proxy = default selection
     }
@@ -979,13 +1244,18 @@ mod tests {
     fn resolve_with_group_returns_none_for_direct() {
         let mut config = test_config();
         config.mode = Mode::Direct;
-        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let input = MatchInput {
             host: Some("anything.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
-        let (group, proxy) = state.resolve_routing_with_group(&input);
+        let (group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(group, None);
         assert_eq!(proxy, "DIRECT");
     }
@@ -993,7 +1263,11 @@ mod tests {
     #[test]
     fn build_candidates_selected_first_then_rest() {
         let config = test_config();
-        let mut state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         state
             .selections
             .insert("🚀 节点选择".to_string(), "🇸🇬 新加坡 01".to_string());
@@ -1007,7 +1281,11 @@ mod tests {
     #[test]
     fn build_candidates_filters_cooled_down() {
         let config = test_config();
-        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let tracker = CooldownTracker::new();
         for _ in 0..crate::retry::COOLDOWN_FAILURE_THRESHOLD {
             tracker.record_failure("🇭🇰 香港 01");
@@ -1023,7 +1301,11 @@ mod tests {
     fn build_candidates_all_cooled_down_tries_anyway() {
         let mut config = test_config();
         config.proxy_groups.retain(|g| g.name == "@hk");
-        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         let tracker = CooldownTracker::new();
         for _ in 0..crate::retry::COOLDOWN_FAILURE_THRESHOLD {
             tracker.record_failure("🇭🇰 香港 01");
@@ -1052,8 +1334,11 @@ mod tests {
 
     #[test]
     fn nested_group_resolves_to_inner_leaf() {
-        let mut state =
-            DaemonState::from_config(nested_group_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            nested_group_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         // Pin the inner selection so the expectation doesn't depend on the
         // default "first proxy" rule.
         state
@@ -1064,8 +1349,9 @@ mod tests {
             host: Some("bun.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
-        let (group, proxy) = state.resolve_routing_with_group(&input);
+        let (group, proxy, _rule) = state.resolve_routing_with_group(&input);
 
         // The innermost group is returned so failover tries siblings of the
         // selected leaf, not members of the outer fallback group.
@@ -1075,8 +1361,11 @@ mod tests {
 
     #[test]
     fn nested_group_candidate_list_is_non_empty() {
-        let mut state =
-            DaemonState::from_config(nested_group_config(), PathBuf::from("/tmp/test.yaml"));
+        let mut state = DaemonState::from_config(
+            nested_group_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
         state
             .parse_and_apply_overrides(&["🚀 节点选择=🇸🇬 新加坡 01".to_string()])
             .unwrap();
@@ -1085,8 +1374,9 @@ mod tests {
             host: Some("bun.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
-        let (group, _proxy) = state.resolve_routing_with_group(&input);
+        let (group, _proxy, _rule) = state.resolve_routing_with_group(&input);
         let tracker = CooldownTracker::new();
         let candidates = state.build_candidate_list(group.unwrap(), &tracker);
 
@@ -1114,14 +1404,19 @@ mod tests {
         ];
         config.mode = Mode::Rule;
         config.rules = vec!["MATCH,A".to_string()];
-        let state = DaemonState::from_config(config, PathBuf::from("/tmp/test.yaml"));
+        let state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
 
         let input = MatchInput {
             host: Some("example.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
-        let (_group, proxy) = state.resolve_routing_with_group(&input);
+        let (_group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(proxy, "DIRECT");
     }
 }

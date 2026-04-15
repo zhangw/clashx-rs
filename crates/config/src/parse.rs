@@ -5,6 +5,23 @@ use anyhow::{Context, Result};
 use crate::types::Config;
 
 pub fn load_config(path: &Path) -> Result<Config> {
+    // Warn if config file is world/group-readable. It typically contains
+    // proxy passwords, so recommend 0600 or 0400.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{mode:o}"),
+                    "config file has group/other read permissions — it may contain proxy passwords; chmod 600 recommended"
+                );
+            }
+        }
+    }
+
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
     let config: Config = serde_yaml::from_str(&content)

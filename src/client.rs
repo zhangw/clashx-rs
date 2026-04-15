@@ -5,8 +5,8 @@ use anyhow::Result;
 
 use crate::control::{ControlRequest, ControlResponse};
 
-pub fn send_command(request: ControlRequest) -> Result<()> {
-    let path = crate::paths::socket_path();
+pub fn send_command(request: ControlRequest, port: u16) -> Result<()> {
+    let path = crate::paths::socket_path(port);
     let mut stream = UnixStream::connect(&path).map_err(|e| {
         anyhow::anyhow!(
             "failed to connect to daemon socket at {}: {}",

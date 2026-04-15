@@ -7,10 +7,14 @@ pub fn runtime_dir() -> PathBuf {
     home.join(".config/clashx-rs")
 }
 
-pub fn socket_path() -> PathBuf {
-    runtime_dir().join("clashx-rs.sock")
+pub fn socket_path(port: u16) -> PathBuf {
+    runtime_dir().join(format!("clashx-rs-{port}.sock"))
 }
 
-pub fn pid_path() -> PathBuf {
-    runtime_dir().join("clashx-rs.pid")
+pub fn pid_path(port: u16) -> PathBuf {
+    runtime_dir().join(format!("clashx-rs-{port}.pid"))
+}
+
+pub fn default_mmdb_path() -> PathBuf {
+    runtime_dir().join("Country.mmdb")
 }

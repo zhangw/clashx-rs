@@ -32,10 +32,26 @@ fn get_active_services() -> Result<Vec<String>> {
     Ok(services)
 }
 
-pub fn enable(port: u16) -> Result<()> {
+/// Default bypass entries applied when no explicit bypass list is provided.
+const DEFAULT_BYPASS: &[&str] = &[
+    "192.168.0.0/16",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "127.0.0.1",
+    "localhost",
+    "*.local",
+];
+
+pub fn enable(port: u16, bypass: &[String]) -> Result<()> {
     let services = get_active_services()?;
     let host = "127.0.0.1";
     let port_str = port.to_string();
+
+    let bypass_list: Vec<&str> = if bypass.is_empty() {
+        DEFAULT_BYPASS.to_vec()
+    } else {
+        bypass.iter().map(|s| s.as_str()).collect()
+    };
 
     for service in &services {
         run_networksetup(&["-setwebproxy", service, host, &port_str])
@@ -46,6 +62,12 @@ pub fn enable(port: u16) -> Result<()> {
 
         run_networksetup(&["-setsocksfirewallproxy", service, host, &port_str])
             .with_context(|| format!("failed to set SOCKS proxy for {service}"))?;
+
+        // Set proxy bypass domains/subnets
+        let mut args = vec!["-setproxybypassdomains", service];
+        args.extend(&bypass_list);
+        run_networksetup(&args)
+            .with_context(|| format!("failed to set proxy bypass for {service}"))?;
     }
 
     Ok(())

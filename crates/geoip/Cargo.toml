@@ -1,0 +1,11 @@
+[package]
+name = "clashx-rs-geoip"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maxminddb.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

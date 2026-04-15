@@ -70,6 +70,10 @@ impl ServerCertVerifier for NoCertVerifier {
 
 fn build_tls_config(skip_cert_verify: bool) -> ClientConfig {
     if skip_cert_verify {
+        tracing::warn!(
+            "Trojan: certificate verification is disabled (skip-cert-verify=true) — \
+             connections are vulnerable to MITM; only use with trusted networks"
+        );
         ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
@@ -108,7 +112,7 @@ fn get_connector(skip_cert_verify: bool) -> &'static TlsConnector {
 // Trojan header builder
 // ---------------------------------------------------------------------------
 
-fn build_trojan_header(password: &str, target: &TargetAddr) -> Vec<u8> {
+fn build_trojan_header(password: &str, target: &TargetAddr) -> Result<Vec<u8>> {
     let mut header = Vec::with_capacity(128);
 
     // SHA-224 of password, hex-encoded (56 ASCII bytes)
@@ -126,8 +130,14 @@ fn build_trojan_header(password: &str, target: &TargetAddr) -> Vec<u8> {
     // ATYP + address + port
     match target {
         TargetAddr::Domain(domain, port) => {
-            header.push(ATYP_DOMAIN);
             let domain_bytes = domain.as_bytes();
+            if domain_bytes.len() > 255 {
+                anyhow::bail!(
+                    "Trojan domain address exceeds 255 bytes: {} bytes",
+                    domain_bytes.len()
+                );
+            }
+            header.push(ATYP_DOMAIN);
             header.push(domain_bytes.len() as u8);
             header.extend_from_slice(domain_bytes);
             header.extend_from_slice(&port.to_be_bytes());
@@ -147,7 +157,7 @@ fn build_trojan_header(password: &str, target: &TargetAddr) -> Vec<u8> {
     // Trailing CRLF
     header.extend_from_slice(CRLF);
 
-    header
+    Ok(header)
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +193,7 @@ pub async fn connect(
     .context("Trojan connect/TLS handshake timed out")??;
 
     // 3. Send Trojan header
-    let header = build_trojan_header(password, target);
+    let header = build_trojan_header(password, target)?;
     tls_stream.write_all(&header).await?;
 
     Ok(OutboundStream::Tls(Box::new(tls_stream)))
@@ -212,7 +222,7 @@ mod tests {
     fn trojan_header_domain() {
         let password = "test-password";
         let target = TargetAddr::Domain("example.com".to_string(), 443);
-        let header = build_trojan_header(password, &target);
+        let header = build_trojan_header(password, &target).unwrap();
 
         let hash_hex = expected_hash_hex(password);
 
@@ -239,7 +249,7 @@ mod tests {
     fn trojan_header_ipv4() {
         let password = "test-password";
         let target = TargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80);
-        let header = build_trojan_header(password, &target);
+        let header = build_trojan_header(password, &target).unwrap();
 
         // After hash (56) + CRLF (2) + CMD (1) = byte index 59
         assert_eq!(header[59], ATYP_IPV4);

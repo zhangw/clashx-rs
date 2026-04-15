@@ -1,21 +1,37 @@
 pub mod process;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use clashx_rs_config::rule::RuleEntry;
+use clashx_rs_geoip::GeoIpDb;
 
+use crate::process::ProcessLookup;
+
+#[derive(Default)]
 pub struct MatchInput<'a> {
     pub host: Option<&'a str>,
     pub ip: Option<IpAddr>,
     pub process_name: Option<&'a str>,
+    /// DNS resolution was already attempted. If true and `ip` is None, the
+    /// resolve failed — IP/GEOIP rules should be treated as non-matching and
+    /// the evaluator must advance past them instead of re-requesting the IP.
+    pub ip_attempted: bool,
+    /// Process-name lookup was already attempted. Same semantics as
+    /// `ip_attempted` for PROCESS-NAME rules.
+    pub process_attempted: bool,
 }
 
 pub struct RuleEngine {
     rules: Vec<RuleEntry>,
+    geoip_db: Option<Arc<GeoIpDb>>,
+    has_ip_rules: bool,
+    has_process_rules: bool,
+    process_lookup: Arc<ProcessLookup>,
 }
 
 impl RuleEngine {
-    pub fn new(raw_rules: &[String]) -> Self {
+    pub fn new(raw_rules: &[String], geoip_db: Option<Arc<GeoIpDb>>) -> Self {
         let rules: Vec<RuleEntry> = raw_rules
             .iter()
             .filter_map(|s| match RuleEntry::parse(s) {
@@ -32,26 +48,161 @@ impl RuleEngine {
             .iter()
             .filter(|r| matches!(r, RuleEntry::GeoIp { .. }))
             .count();
-        if geoip_count > 0 {
+        if geoip_count > 0 && geoip_db.is_none() {
             tracing::warn!(
                 count = geoip_count,
-                "GEOIP rules parsed but not yet functional (stub), will not match any traffic"
+                "GEOIP rules present but no mmdb loaded — rules will not match"
             );
         }
 
-        Self { rules }
+        // Only count GEOIP rules as "needs IP" when we actually have an mmdb
+        // to evaluate them against — otherwise the rule can never match and
+        // we'd pay for DNS pre-resolve for nothing. IP-CIDR rules always count.
+        let has_ip_rules = rules.iter().any(|r| match r {
+            RuleEntry::IpCidr { .. } => true,
+            RuleEntry::GeoIp { .. } => geoip_db.is_some(),
+            _ => false,
+        });
+
+        let process_lookup = Arc::new(ProcessLookup::new());
+        let process_targets: Vec<&str> = rules
+            .iter()
+            .filter_map(|r| match r {
+                RuleEntry::ProcessName { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let has_process_rules = !process_targets.is_empty();
+        process_lookup.set_targets(process_targets);
+
+        Self {
+            rules,
+            geoip_db,
+            has_ip_rules,
+            has_process_rules,
+            process_lookup,
+        }
+    }
+
+    /// Handle to the per-engine process-name lookup cache. Daemon uses this
+    /// to resolve process names lazily during rule evaluation.
+    pub fn process_lookup(&self) -> &Arc<ProcessLookup> {
+        &self.process_lookup
+    }
+
+    /// Whether the config has any GEOIP or IP-CIDR rules that need a resolved IP.
+    pub fn needs_resolved_ip(&self) -> bool {
+        self.has_ip_rules
+    }
+
+    /// Whether a GeoIP database is currently loaded.
+    pub fn has_geoip_db(&self) -> bool {
+        self.geoip_db.is_some()
     }
 
     pub fn evaluate<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a str> {
-        let host_lower = input.host.map(|h| h.to_lowercase());
+        self.find_match(input).map(|r| r.target())
+    }
+
+    /// Evaluate rules top-to-bottom, returning the target and matched rule description.
+    pub fn evaluate_verbose<'a>(&'a self, input: &MatchInput<'_>) -> Option<(&'a str, String)> {
+        self.find_match(input)
+            .map(|r| (r.target(), r.description()))
+    }
+
+    /// Lazy evaluation. Walk rules from `start`; when a rule needs data
+    /// `input` doesn't carry yet (resolved IP, or process name), pause and
+    /// return `NeedsData { resume_from, need_ip, need_process }`. Caller
+    /// populates the requested field(s) and re-invokes with the new input
+    /// and the returned `resume_from` index.
+    ///
+    /// Rules that cheaply match on existing input (host / already-known IP /
+    /// already-known process) still run and can short-circuit.
+    pub fn evaluate_from<'a>(&'a self, input: &MatchInput<'_>, start: usize) -> EvalStep<'a> {
+        let host_lower = self.host_lower(input);
+        let host_lower = host_lower.as_deref().or(input.host);
+
+        // Engine-wide pre-checks fold away per-rule work when the config
+        // has no rules of a given kind (the common case: no PROCESS-NAME).
+        let may_need_ip = self.has_ip_rules && input.ip.is_none();
+        let may_need_process = self.has_process_rules && input.process_name.is_none();
+        let geoip_loaded = self.geoip_db.is_some();
+
+        for (offset, rule) in self.rules[start..].iter().enumerate() {
+            let idx = start + offset;
+            let rule_wants_ip = may_need_ip
+                && match rule {
+                    RuleEntry::IpCidr { .. } => true,
+                    RuleEntry::GeoIp { .. } => geoip_loaded,
+                    _ => false,
+                };
+            let rule_wants_process =
+                may_need_process && matches!(rule, RuleEntry::ProcessName { .. });
+
+            // Already-attempted-but-unsatisfied: the rule can never match.
+            // Skip instead of re-requesting (the bug fix: not skipping here
+            // was the infinite-loop source on DNS failure / missing process).
+            if (rule_wants_ip && input.ip_attempted)
+                || (rule_wants_process && input.process_attempted)
+            {
+                continue;
+            }
+
+            let need_ip = rule_wants_ip && !input.ip_attempted;
+            let need_process = rule_wants_process && !input.process_attempted;
+            if need_ip || need_process {
+                return EvalStep::NeedsData {
+                    resume_from: idx,
+                    need_ip,
+                    need_process,
+                };
+            }
+            if matches_rule(rule, input, host_lower, self.geoip_db.as_deref()) {
+                return EvalStep::Matched(rule);
+            }
+        }
+        EvalStep::NoMatch
+    }
+
+    fn find_match<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a RuleEntry> {
+        let host_lower = self.host_lower(input);
+        let host_lower = host_lower.as_deref().or(input.host);
         self.rules
             .iter()
-            .find(|rule| matches_rule(rule, input, host_lower.as_deref()))
-            .map(|rule| rule.target())
+            .find(|rule| matches_rule(rule, input, host_lower, self.geoip_db.as_deref()))
+    }
+
+    /// Lowercase the host only if it contains uppercase ASCII; otherwise
+    /// the caller reuses the borrowed original.
+    fn host_lower(&self, input: &MatchInput<'_>) -> Option<String> {
+        input
+            .host
+            .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
+            .map(|h| h.to_ascii_lowercase())
     }
 }
 
-fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>, host_lower: Option<&str>) -> bool {
+/// Outcome of the first evaluation pass.
+pub enum EvalStep<'a> {
+    /// A rule matched — no further lookups needed.
+    Matched(&'a RuleEntry),
+    /// Reached a rule whose required input is not yet available. The caller
+    /// should populate the requested fields and call `resume_from`.
+    NeedsData {
+        resume_from: usize,
+        need_ip: bool,
+        need_process: bool,
+    },
+    /// Walked all rules without matching.
+    NoMatch,
+}
+
+fn matches_rule(
+    rule: &RuleEntry,
+    input: &MatchInput<'_>,
+    host_lower: Option<&str>,
+    geoip_db: Option<&GeoIpDb>,
+) -> bool {
     match rule {
         RuleEntry::Domain { domain, .. } => host_lower.is_some_and(|h| h == domain.as_str()),
         RuleEntry::DomainSuffix { suffix, .. } => host_lower.is_some_and(|h| {
@@ -81,8 +232,13 @@ fn matches_rule(rule: &RuleEntry, input: &MatchInput<'_>, host_lower: Option<&st
                 false
             }
         }
-        // Stub: parsed but never matches until maxminddb + DNS rewrite land
-        RuleEntry::GeoIp { .. } => false,
+        RuleEntry::GeoIp { country, .. } => {
+            let Some(db) = geoip_db else { return false };
+            let Some(ip) = input.ip else { return false };
+            db.lookup_country(ip)
+                .map(|c| c.eq_ignore_ascii_case(country))
+                .unwrap_or(false)
+        }
         RuleEntry::Match { .. } => true,
     }
 }
@@ -125,7 +281,18 @@ mod tests {
 
     fn make_engine(rules: &[&str]) -> RuleEngine {
         let raw: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
-        RuleEngine::new(&raw)
+        RuleEngine::new(&raw, None)
+    }
+
+    fn make_engine_with_geoip(rules: &[&str], db: Arc<GeoIpDb>) -> RuleEngine {
+        let raw: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
+        RuleEngine::new(&raw, Some(db))
+    }
+
+    fn test_geoip_db() -> Arc<GeoIpDb> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../geoip/tests/fixtures/GeoIP2-Country-Test.mmdb");
+        Arc::new(GeoIpDb::open(&path).unwrap())
     }
 
     #[test]
@@ -135,6 +302,7 @@ mod tests {
             host: Some("google.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
@@ -146,6 +314,7 @@ mod tests {
             host: Some("www.google.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
@@ -157,6 +326,7 @@ mod tests {
             host: Some("oogle.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), None);
     }
@@ -168,6 +338,7 @@ mod tests {
             host: Some("WWW.GOOGLE.COM"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
@@ -179,6 +350,7 @@ mod tests {
             host: None,
             ip: Some("192.168.1.100".parse().unwrap()),
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
@@ -190,6 +362,7 @@ mod tests {
             host: None,
             ip: Some("10.0.0.1".parse().unwrap()),
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), None);
     }
@@ -201,6 +374,7 @@ mod tests {
             host: None,
             ip: None,
             process_name: Some("curl"),
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
@@ -212,6 +386,7 @@ mod tests {
             host: None,
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
@@ -223,6 +398,7 @@ mod tests {
             host: Some("google.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
@@ -234,6 +410,7 @@ mod tests {
             host: Some("google.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), None);
     }
@@ -245,6 +422,7 @@ mod tests {
             host: Some("mtalk.google.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
@@ -256,6 +434,7 @@ mod tests {
             host: Some("www.google.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), None);
     }
@@ -267,6 +446,7 @@ mod tests {
             host: Some("MTALK.GOOGLE.COM"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
@@ -278,6 +458,7 @@ mod tests {
             host: Some("www.youtube.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
@@ -289,6 +470,7 @@ mod tests {
             host: Some("www.google.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), None);
     }
@@ -300,6 +482,7 @@ mod tests {
             host: Some("WWW.YOUTUBE.COM"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
@@ -311,6 +494,7 @@ mod tests {
             host: Some("cdn.alicdn.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
@@ -322,6 +506,7 @@ mod tests {
             host: None,
             ip: Some("fd00::1".parse().unwrap()),
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
@@ -333,6 +518,7 @@ mod tests {
             host: None,
             ip: Some("2001:db8::1".parse().unwrap()),
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), None);
     }
@@ -344,6 +530,7 @@ mod tests {
             host: None,
             ip: Some("::1".parse().unwrap()),
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
@@ -359,18 +546,117 @@ mod tests {
             host: Some("google.com"),
             ip: None,
             process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
     }
 
     #[test]
-    fn geoip_stub_never_matches() {
-        let engine = make_engine(&["GEOIP,CN,DIRECT", "MATCH,Proxy"]);
+    fn geoip_no_match_when_db_absent() {
+        let engine = make_engine(&["GEOIP,GB,DIRECT", "MATCH,Proxy"]);
         let input = MatchInput {
-            host: Some("baidu.com"),
-            ip: Some("114.114.114.114".parse().unwrap()),
+            host: None,
+            ip: Some("2.125.160.216".parse().unwrap()),
             process_name: None,
+            ..Default::default()
+        };
+        // Without a db, GEOIP rules always return false → falls through to MATCH
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn geoip_matches_when_db_present() {
+        let db = test_geoip_db();
+        let engine = make_engine_with_geoip(&["GEOIP,GB,DIRECT", "MATCH,Proxy"], db);
+        let input = MatchInput {
+            host: None,
+            // 2.125.160.216 → GB in MaxMind test data
+            ip: Some("2.125.160.216".parse().unwrap()),
+            process_name: None,
+            ..Default::default()
+        };
+        assert_eq!(engine.evaluate(&input), Some("DIRECT"));
+    }
+
+    #[test]
+    fn geoip_no_match_wrong_country() {
+        let db = test_geoip_db();
+        let engine = make_engine_with_geoip(&["GEOIP,CN,DIRECT", "MATCH,Proxy"], db);
+        let input = MatchInput {
+            host: None,
+            // 2.125.160.216 → GB, not CN
+            ip: Some("2.125.160.216".parse().unwrap()),
+            process_name: None,
+            ..Default::default()
         };
         assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn geoip_no_match_when_ip_none() {
+        let db = test_geoip_db();
+        let engine = make_engine_with_geoip(&["GEOIP,GB,DIRECT", "MATCH,Proxy"], db);
+        let input = MatchInput {
+            host: Some("example.com"),
+            ip: None,
+            process_name: None,
+            ..Default::default()
+        };
+        // ip is None → GEOIP can't match → falls through to MATCH
+        assert_eq!(engine.evaluate(&input), Some("Proxy"));
+    }
+
+    #[test]
+    fn geoip_rule_ordering() {
+        let db = test_geoip_db();
+        let engine = make_engine_with_geoip(
+            &[
+                "DOMAIN-SUFFIX,example.com,Proxy",
+                "GEOIP,GB,DIRECT",
+                "MATCH,Fallback",
+            ],
+            db,
+        );
+
+        // Domain rule matches first
+        let input1 = MatchInput {
+            host: Some("example.com"),
+            ip: Some("2.125.160.216".parse().unwrap()),
+            process_name: None,
+            ..Default::default()
+        };
+        assert_eq!(engine.evaluate(&input1), Some("Proxy"));
+
+        // GEOIP matches for non-domain-matched traffic
+        let input2 = MatchInput {
+            host: Some("other.co.uk"),
+            ip: Some("2.125.160.216".parse().unwrap()),
+            process_name: None,
+            ..Default::default()
+        };
+        assert_eq!(engine.evaluate(&input2), Some("DIRECT"));
+
+        // Falls through to MATCH for non-GB IP
+        let input3 = MatchInput {
+            host: Some("other.se"),
+            ip: Some("192.168.1.1".parse().unwrap()),
+            process_name: None,
+            ..Default::default()
+        };
+        assert_eq!(engine.evaluate(&input3), Some("Fallback"));
+    }
+
+    #[test]
+    fn geoip_ipv6_match() {
+        let db = test_geoip_db();
+        let engine = make_engine_with_geoip(&["GEOIP,JP,DIRECT", "MATCH,Proxy"], db);
+        let input = MatchInput {
+            host: None,
+            // 2001:218::1 → JP in MaxMind test data
+            ip: Some("2001:218::1".parse().unwrap()),
+            process_name: None,
+            ..Default::default()
+        };
+        assert_eq!(engine.evaluate(&input), Some("DIRECT"));
     }
 }

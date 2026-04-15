@@ -15,12 +15,22 @@ impl SysProxy {
     }
 
     pub fn enable(&self) -> Result<()> {
+        self.enable_with_bypass(&[])
+    }
+
+    pub fn enable_with_bypass(&self, bypass: &[String]) -> Result<()> {
         #[cfg(target_os = "macos")]
-        return macos::enable(self.port);
+        return macos::enable(self.port, bypass);
         #[cfg(target_os = "linux")]
-        return linux::enable(self.port);
+        {
+            if !bypass.is_empty() {
+                tracing::warn!("proxy bypass list is not yet supported on Linux");
+            }
+            linux::enable(self.port)
+        }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
+            let _ = bypass;
             tracing::warn!("system proxy not supported on this platform");
             Ok(())
         }

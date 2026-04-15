@@ -5,5 +5,11 @@ edition.workspace = true
 
 [dependencies]
 clashx-rs-config = { path = "../config" }
+clashx-rs-geoip = { path = "../geoip" }
+tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+once_cell = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14"

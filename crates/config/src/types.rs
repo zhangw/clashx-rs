@@ -25,11 +25,13 @@ pub struct Config {
     pub proxy_groups: Vec<ProxyGroup>,
     #[serde(default)]
     pub rules: Vec<String>,
+    #[serde(default)]
+    pub skip_proxy: Vec<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     #[default]
