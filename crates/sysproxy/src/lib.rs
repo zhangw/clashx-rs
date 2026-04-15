@@ -26,7 +26,7 @@ impl SysProxy {
             if !bypass.is_empty() {
                 tracing::warn!("proxy bypass list is not yet supported on Linux");
             }
-            return linux::enable(self.port);
+            linux::enable(self.port)
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
