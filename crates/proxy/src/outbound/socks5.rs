@@ -24,7 +24,8 @@ const REP_SUCCESS: u8 = 0x00;
 ///
 /// If no credentials are provided, only NO_AUTH is offered (original behaviour).
 ///
-/// The initial TCP connect must complete within [`CONNECT_TIMEOUT`].
+/// The full SOCKS5 setup (TCP connect, method negotiation, optional auth, and
+/// CONNECT reply) must complete within [`CONNECT_TIMEOUT`].
 pub async fn connect(
     server: &str,
     port: u16,
@@ -32,119 +33,134 @@ pub async fn connect(
     username: Option<&str>,
     password: Option<&str>,
 ) -> Result<OutboundStream> {
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((server, port)))
-        .await
-        .context("SOCKS5 connect timed out")??;
+    connect_with_timeout(server, port, target, username, password, CONNECT_TIMEOUT).await
+}
 
-    // --- Method negotiation ---
-    let have_creds = username.is_some() && password.is_some();
-    if have_creds {
-        // Offer NO_AUTH and USERNAME/PASSWORD
-        stream
-            .write_all(&[SOCKS5_VERSION, 0x02, NO_AUTH, USERNAME_PASSWORD_AUTH])
-            .await?;
-    } else {
-        // Offer only NO_AUTH
-        stream.write_all(&[SOCKS5_VERSION, 0x01, NO_AUTH]).await?;
-    }
+async fn connect_with_timeout(
+    server: &str,
+    port: u16,
+    target: &TargetAddr,
+    username: Option<&str>,
+    password: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<OutboundStream> {
+    let stream = tokio::time::timeout(timeout, async {
+        let mut stream = TcpStream::connect((server, port)).await?;
 
-    let mut method_resp = [0u8; 2];
-    stream.read_exact(&mut method_resp).await?;
-    if method_resp[0] != SOCKS5_VERSION {
-        bail!(
-            "SOCKS5 server returned unexpected version: {}",
-            method_resp[0]
-        );
-    }
-
-    match method_resp[1] {
-        NO_AUTH => {
-            // No authentication required — proceed to CONNECT request.
+        // --- Method negotiation ---
+        let have_creds = username.is_some() && password.is_some();
+        if have_creds {
+            // Offer NO_AUTH and USERNAME/PASSWORD
+            stream
+                .write_all(&[SOCKS5_VERSION, 0x02, NO_AUTH, USERNAME_PASSWORD_AUTH])
+                .await?;
+        } else {
+            // Offer only NO_AUTH
+            stream.write_all(&[SOCKS5_VERSION, 0x01, NO_AUTH]).await?;
         }
-        USERNAME_PASSWORD_AUTH => {
-            // RFC 1929 sub-negotiation
-            let user = username.unwrap(); // safe: have_creds guarantees Some
-            let pass = password.unwrap();
 
-            if user.len() > 255 {
-                bail!("SOCKS5 username exceeds 255 bytes");
+        let mut method_resp = [0u8; 2];
+        stream.read_exact(&mut method_resp).await?;
+        if method_resp[0] != SOCKS5_VERSION {
+            bail!(
+                "SOCKS5 server returned unexpected version: {}",
+                method_resp[0]
+            );
+        }
+
+        match method_resp[1] {
+            NO_AUTH => {
+                // No authentication required — proceed to CONNECT request.
             }
-            if pass.len() > 255 {
-                bail!("SOCKS5 password exceeds 255 bytes");
+            USERNAME_PASSWORD_AUTH => {
+                // RFC 1929 sub-negotiation
+                let user = username.unwrap(); // safe: have_creds guarantees Some
+                let pass = password.unwrap();
+
+                if user.len() > 255 {
+                    bail!("SOCKS5 username exceeds 255 bytes");
+                }
+                if pass.len() > 255 {
+                    bail!("SOCKS5 password exceeds 255 bytes");
+                }
+
+                let mut auth_msg: Vec<u8> = Vec::with_capacity(3 + user.len() + pass.len());
+                auth_msg.push(USERNAME_PASSWORD_VERSION);
+                auth_msg.push(user.len() as u8);
+                auth_msg.extend_from_slice(user.as_bytes());
+                auth_msg.push(pass.len() as u8);
+                auth_msg.extend_from_slice(pass.as_bytes());
+                stream.write_all(&auth_msg).await?;
+
+                let mut auth_resp = [0u8; 2];
+                stream.read_exact(&mut auth_resp).await?;
+                if auth_resp[0] != USERNAME_PASSWORD_VERSION {
+                    bail!(
+                        "SOCKS5 auth response has unexpected version: {}",
+                        auth_resp[0]
+                    );
+                }
+                if auth_resp[1] != 0x00 {
+                    bail!("SOCKS5 authentication failed, status={}", auth_resp[1]);
+                }
             }
+            other => bail!("SOCKS5 server chose unsupported auth method: {other}"),
+        }
 
-            let mut auth_msg: Vec<u8> = Vec::with_capacity(3 + user.len() + pass.len());
-            auth_msg.push(USERNAME_PASSWORD_VERSION);
-            auth_msg.push(user.len() as u8);
-            auth_msg.extend_from_slice(user.as_bytes());
-            auth_msg.push(pass.len() as u8);
-            auth_msg.extend_from_slice(pass.as_bytes());
-            stream.write_all(&auth_msg).await?;
-
-            let mut auth_resp = [0u8; 2];
-            stream.read_exact(&mut auth_resp).await?;
-            if auth_resp[0] != USERNAME_PASSWORD_VERSION {
-                bail!(
-                    "SOCKS5 auth response has unexpected version: {}",
-                    auth_resp[0]
-                );
+        // --- Build CONNECT request ---
+        let mut req: Vec<u8> = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00];
+        match target {
+            TargetAddr::Domain(domain, tport) => {
+                let domain_bytes = domain.as_bytes();
+                req.push(ATYP_DOMAIN);
+                req.push(domain_bytes.len() as u8);
+                req.extend_from_slice(domain_bytes);
+                req.extend_from_slice(&tport.to_be_bytes());
             }
-            if auth_resp[1] != 0x00 {
-                bail!("SOCKS5 authentication failed, status={}", auth_resp[1]);
+            TargetAddr::Ip(std::net::IpAddr::V4(ip), tport) => {
+                req.push(ATYP_IPV4);
+                req.extend_from_slice(&ip.octets());
+                req.extend_from_slice(&tport.to_be_bytes());
+            }
+            TargetAddr::Ip(std::net::IpAddr::V6(ip), tport) => {
+                req.push(ATYP_IPV6);
+                req.extend_from_slice(&ip.octets());
+                req.extend_from_slice(&tport.to_be_bytes());
             }
         }
-        other => bail!("SOCKS5 server chose unsupported auth method: {other}"),
-    }
+        stream.write_all(&req).await?;
 
-    // --- Build CONNECT request ---
-    let mut req: Vec<u8> = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00];
-    match target {
-        TargetAddr::Domain(domain, tport) => {
-            let domain_bytes = domain.as_bytes();
-            req.push(ATYP_DOMAIN);
-            req.push(domain_bytes.len() as u8);
-            req.extend_from_slice(domain_bytes);
-            req.extend_from_slice(&tport.to_be_bytes());
-        }
-        TargetAddr::Ip(std::net::IpAddr::V4(ip), tport) => {
-            req.push(ATYP_IPV4);
-            req.extend_from_slice(&ip.octets());
-            req.extend_from_slice(&tport.to_be_bytes());
-        }
-        TargetAddr::Ip(std::net::IpAddr::V6(ip), tport) => {
-            req.push(ATYP_IPV6);
-            req.extend_from_slice(&ip.octets());
-            req.extend_from_slice(&tport.to_be_bytes());
-        }
-    }
-    stream.write_all(&req).await?;
+        // --- Read 4-byte response header: VER REP RSV ATYP ---
+        let mut resp_header = [0u8; 4];
+        stream.read_exact(&mut resp_header).await?;
 
-    // --- Read 4-byte response header: VER REP RSV ATYP ---
-    let mut resp_header = [0u8; 4];
-    stream.read_exact(&mut resp_header).await?;
+        if resp_header[1] != REP_SUCCESS {
+            bail!("SOCKS5 CONNECT failed, REP={}", resp_header[1]);
+        }
 
-    if resp_header[1] != REP_SUCCESS {
-        bail!("SOCKS5 CONNECT failed, REP={}", resp_header[1]);
-    }
+        // --- Skip bound address ---
+        let atyp = resp_header[3];
+        match atyp {
+            ATYP_IPV4 => {
+                let mut buf = [0u8; 4 + 2];
+                stream.read_exact(&mut buf).await?;
+            }
+            ATYP_DOMAIN => {
+                let len = stream.read_u8().await? as usize;
+                let mut buf = vec![0u8; len + 2];
+                stream.read_exact(&mut buf).await?;
+            }
+            ATYP_IPV6 => {
+                let mut buf = [0u8; 16 + 2];
+                stream.read_exact(&mut buf).await?;
+            }
+            other => bail!("unexpected ATYP in SOCKS5 reply: {other}"),
+        }
 
-    // --- Skip bound address ---
-    let atyp = resp_header[3];
-    match atyp {
-        ATYP_IPV4 => {
-            let mut buf = [0u8; 4 + 2];
-            stream.read_exact(&mut buf).await?;
-        }
-        ATYP_DOMAIN => {
-            let len = stream.read_u8().await? as usize;
-            let mut buf = vec![0u8; len + 2];
-            stream.read_exact(&mut buf).await?;
-        }
-        ATYP_IPV6 => {
-            let mut buf = [0u8; 16 + 2];
-            stream.read_exact(&mut buf).await?;
-        }
-        other => bail!("unexpected ATYP in SOCKS5 reply: {other}"),
-    }
+        Ok::<TcpStream, anyhow::Error>(stream)
+    })
+    .await
+    .context("SOCKS5 connect/setup timed out")??;
 
     Ok(OutboundStream::Tcp(stream))
 }
@@ -153,6 +169,7 @@ pub async fn connect(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -369,5 +386,33 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(result, OutboundStream::Tcp(_)));
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_times_out_during_setup() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (_conn, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let target = TargetAddr::Domain("example.com".to_string(), 80);
+        let err = connect_with_timeout(
+            "127.0.0.1",
+            server_addr.port(),
+            &target,
+            None,
+            None,
+            Duration::from_millis(50),
+        )
+        .await
+        .err()
+        .expect("expected stalled SOCKS5 setup to time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
     }
 }
