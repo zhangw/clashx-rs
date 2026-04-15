@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,15 +77,7 @@ impl RuleEntry {
 
     /// Short description of the rule for logging (e.g., "GEOIP,CN", "DOMAIN-SUFFIX,google.com").
     pub fn description(&self) -> String {
-        match self {
-            RuleEntry::Domain { domain, .. } => format!("DOMAIN,{domain}"),
-            RuleEntry::DomainSuffix { suffix, .. } => format!("DOMAIN-SUFFIX,{suffix}"),
-            RuleEntry::DomainKeyword { keyword, .. } => format!("DOMAIN-KEYWORD,{keyword}"),
-            RuleEntry::IpCidr { ip, prefix_len, .. } => format!("IP-CIDR,{ip}/{prefix_len}"),
-            RuleEntry::ProcessName { name, .. } => format!("PROCESS-NAME,{name}"),
-            RuleEntry::GeoIp { country, .. } => format!("GEOIP,{country}"),
-            RuleEntry::Match { .. } => "MATCH".to_string(),
-        }
+        self.display().to_string()
     }
 
     pub fn target(&self) -> &str {
@@ -97,6 +90,30 @@ impl RuleEntry {
             | RuleEntry::GeoIp { target, .. }
             | RuleEntry::Match { target } => target,
         }
+    }
+
+    pub fn display(&self) -> RuleDisplay<'_> {
+        RuleDisplay(self)
+    }
+
+    fn write_description(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        match self {
+            RuleEntry::Domain { domain, .. } => write!(f, "DOMAIN,{domain}"),
+            RuleEntry::DomainSuffix { suffix, .. } => write!(f, "DOMAIN-SUFFIX,{suffix}"),
+            RuleEntry::DomainKeyword { keyword, .. } => write!(f, "DOMAIN-KEYWORD,{keyword}"),
+            RuleEntry::IpCidr { ip, prefix_len, .. } => write!(f, "IP-CIDR,{ip}/{prefix_len}"),
+            RuleEntry::ProcessName { name, .. } => write!(f, "PROCESS-NAME,{name}"),
+            RuleEntry::GeoIp { country, .. } => write!(f, "GEOIP,{country}"),
+            RuleEntry::Match { .. } => f.write_str("MATCH"),
+        }
+    }
+}
+
+pub struct RuleDisplay<'a>(&'a RuleEntry);
+
+impl fmt::Display for RuleDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.write_description(f)
     }
 }
 

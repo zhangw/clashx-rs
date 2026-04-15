@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,6 +37,17 @@ fn match_input_from_host(host: &str) -> MatchInput<'_> {
 /// For a desktop local proxy this is far above normal browser workloads
 /// (hundreds of parallel fetches). Abusive/buggy clients are bounded here.
 const MAX_CONCURRENT_CONNECTIONS: usize = 2048;
+
+struct MatchedRuleDebug<'a>(Option<&'a clashx_rs_config::rule::RuleEntry>);
+
+impl fmt::Debug for MatchedRuleDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(rule) => write!(f, "Some(\"{}\")", rule.display()),
+            None => f.write_str("None"),
+        }
+    }
+}
 
 struct DaemonState {
     config: Config,
@@ -575,9 +587,8 @@ async fn handle_connection(
         Some(&target_host)
     };
 
-    let (rule_target, matched_rule, resolved_ip, _process_name): (
-        Option<String>,
-        Option<String>,
+    let (matched_rule, resolved_ip, _process_name): (
+        Option<&clashx_rs_config::rule::RuleEntry>,
         Option<IpAddr>,
         Option<String>,
     ) = if mode == Mode::Rule {
@@ -590,8 +601,7 @@ async fn handle_connection(
         let mut process_attempted = false;
 
         let mut start = 0usize;
-        let mut target_str: Option<String> = None;
-        let mut desc: Option<String> = None;
+        let mut matched_rule = None;
         loop {
             let input = MatchInput {
                 host: host_field,
@@ -602,8 +612,7 @@ async fn handle_connection(
             };
             match rule_engine.evaluate_from(&input, start) {
                 EvalStep::Matched(rule) => {
-                    target_str = Some(rule.target().to_string());
-                    desc = Some(rule.description());
+                    matched_rule = Some(rule);
                     break;
                 }
                 EvalStep::NoMatch => break,
@@ -644,12 +653,9 @@ async fn handle_connection(
             }
         }
 
-        match target_str {
-            Some(t) => (Some(t), desc, ip, owned_process),
-            None => (None, None, ip, owned_process),
-        }
+        (matched_rule, ip, owned_process)
     } else {
-        (None, None, parsed_ip, None)
+        (None, parsed_ip, None)
     };
 
     // Selection-chain + candidate-list resolution (brief read lock — O(1) lookups).
@@ -663,7 +669,7 @@ async fn handle_connection(
         let chain_start: Option<&str> = match mode {
             Mode::Direct => None,
             Mode::Global => st.config.proxy_groups.first().map(|g| g.name.as_str()),
-            Mode::Rule => rule_target.as_deref(),
+            Mode::Rule => matched_rule.map(|r| r.target()),
         };
         let (grp, resolved): (Option<String>, String) = match chain_start {
             Some(target) => {
@@ -679,7 +685,7 @@ async fn handle_connection(
             target = %target_host,
             port = target_port,
             mode = ?mode,
-            rule = ?matched_rule,
+            rule = ?MatchedRuleDebug(matched_rule),
             proxy = %proxy_name,
             group = ?group_name,
             "routing connection"

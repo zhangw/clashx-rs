@@ -115,13 +115,12 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<(TargetAddr, Option<Vec
     }
 
     let mut parts = trimmed.splitn(3, ' ');
-    let method = parts.next().unwrap_or("").to_uppercase();
-    let uri = parts.next().unwrap_or("").to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+    let method = parts.next().unwrap_or("");
+    let uri = parts.next().unwrap_or("");
 
-    if method == "CONNECT" {
+    if method.eq_ignore_ascii_case("CONNECT") {
         // CONNECT host:port HTTP/1.x
-        let target = parse_host_port(&uri)?;
+        let target = parse_host_port(uri)?;
 
         // Read and discard headers until we see an empty line.
         let mut line = String::new();
@@ -153,34 +152,36 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<(TargetAddr, Option<Vec
         Ok((target, initial_data))
     } else {
         // Plain HTTP request.
-        // Collect all headers.
-        let mut headers: Vec<String> = Vec::new();
+        // Preserve the original bytes we parsed so plain HTTP can be relayed
+        // without rebuilding the request line + headers into new Strings.
+        let mut raw = Vec::with_capacity(request_line.len() + reader.buffer().len());
+        raw.extend_from_slice(request_line.as_bytes());
         let mut host_header: Option<String> = None;
         let mut line = String::new();
+        let mut header_count = 0usize;
         loop {
-            if headers.len() >= MAX_HEADERS {
+            if header_count >= MAX_HEADERS {
                 bail!("HTTP headers exceeded {MAX_HEADERS}");
             }
             read_bounded_line(&mut reader, &mut line).await?;
-            let trimmed_line = line.trim_end_matches(['\r', '\n']).to_string();
+            let trimmed_line = line.trim_end_matches(['\r', '\n']);
+            raw.extend_from_slice(line.as_bytes());
             if trimmed_line.is_empty() {
                 break;
             }
             if host_header.is_none() {
-                let lower = trimmed_line.to_lowercase();
-                if let Some(rest) = lower.strip_prefix("host:") {
-                    host_header = Some(rest.trim().to_string());
+                if let Some((name, rest)) = trimmed_line.split_once(':') {
+                    if name.eq_ignore_ascii_case("host") {
+                        host_header = Some(rest.trim().to_string());
+                    }
                 }
             }
-            headers.push(trimmed_line);
+            header_count += 1;
         }
 
         // Preserve any body bytes the BufReader read ahead of the header boundary.
-        let body_prefix = if reader.buffer().is_empty() {
-            Vec::new()
-        } else {
-            reader.buffer().to_vec()
-        };
+        let body_prefix = reader.buffer();
+        raw.extend_from_slice(body_prefix);
         drop(reader);
 
         // Determine the target.
@@ -189,7 +190,7 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<(TargetAddr, Option<Vec
             let without_scheme = if let Some(s) = uri.strip_prefix("http://") {
                 s
             } else {
-                uri.strip_prefix("https://").unwrap_or(&uri)
+                uri.strip_prefix("https://").unwrap_or(uri)
             };
             // The authority is everything up to the first '/'.
             let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
@@ -199,17 +200,6 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<(TargetAddr, Option<Vec
         } else {
             bail!("could not determine target host from HTTP request");
         };
-
-        // Reconstruct the raw request bytes to forward upstream.
-        // Use the original request line verbatim, then append any buffered body bytes.
-        let mut raw: Vec<u8> = Vec::new();
-        raw.extend_from_slice(format!("{method} {uri} {version}\r\n").as_bytes());
-        for h in &headers {
-            raw.extend_from_slice(h.as_bytes());
-            raw.extend_from_slice(b"\r\n");
-        }
-        raw.extend_from_slice(b"\r\n");
-        raw.extend_from_slice(&body_prefix);
 
         Ok((target, Some(raw)))
     }
