@@ -6,6 +6,7 @@ members = [
     "crates/proxy",
     "crates/sysproxy",
     "crates/geoip",
+    "crates/subscribe",
 ]
 resolver = "2"
 
@@ -23,7 +24,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 sha2 = "0.10"
-maxminddb = "0.24"
+maxminddb = "0.27"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
@@ -44,6 +45,7 @@ clashx-rs-dns = { path = "crates/dns" }
 clashx-rs-geoip = { path = "crates/geoip" }
 clashx-rs-proxy = { path = "crates/proxy" }
 clashx-rs-sysproxy = { path = "crates/sysproxy" }
+clashx-rs-subscribe = { path = "crates/subscribe" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -18,20 +18,30 @@ A pure Rust, headless Clash-compatible proxy CLI for macOS and Linux.
   - DIRECT
   - REJECT
 - Rule-based routing:
+  - `DOMAIN`
   - `DOMAIN-SUFFIX`
+  - `DOMAIN-KEYWORD`
   - `IP-CIDR`
   - `PROCESS-NAME`
+  - `GEOIP` (MaxMind mmdb)
   - `MATCH`
 - Config modes:
   - `rule`
   - `global`
   - `direct`
 - Proxy-group selection with live switching
+- DNS pre-resolve with positive/negative caching and singleflight
+- Lazy two-phase rule evaluation — DNS/process lookups only run when a rule needs them
+- Per-proxy cooldown + failover across candidate proxies
+- Parallel-instance support — socket/pid files are keyed by mixed-port
+- Config subscriptions — download Clash YAML from URLs and auto-refresh
+- GeoIP mmdb download (optionally through the running proxy)
 - Local control socket and CLI commands for status, reload, rules, groups, and switching
 - System proxy helpers:
-  - macOS: `networksetup`
+  - macOS: `networksetup` with configurable bypass rules
   - Linux: shell export/unset snippets
 - Timeout protection for inbound handshakes and outbound setup
+- Admission control — caps in-flight connections to bound worst-case memory
 
 ## Non-goals
 
@@ -49,9 +59,10 @@ This project is usable as a local CLI proxy, but it is still early-stage softwar
 
 Known caveats:
 
-- `clashx-rs run -d` is not implemented yet
-- DNS config fields are parsed, but DNS policy is not yet a first-class runtime subsystem
+- `clashx-rs run -d` (background daemon mode) is not implemented yet
+- DNS resolution uses the system resolver with a TTL-based cache; fake-ip mode is deferred
 - `PROCESS-NAME` lookup is best-effort and platform-dependent
+- `GEOIP` requires a MaxMind Country mmdb at `~/.config/clashx-rs/Country.mmdb` (or provide `--mmdb <path>`)
 - `allow-lan` can expose an unauthenticated proxy listener on the configured address; use carefully
 - Trojan `skip-cert-verify` weakens upstream TLS security and should be avoided unless you understand the tradeoff
 
@@ -88,11 +99,15 @@ Workspace crates:
 - `crates/rule`
   rule parsing, evaluation, and process lookup helpers
 - `crates/dns`
-  system resolver helper
+  system resolver with TTL-based positive/negative cache and singleflight
 - `crates/proxy`
   inbound protocol handling, outbound connectors, relay, and timeouts
 - `crates/sysproxy`
   macOS/Linux system proxy helpers
+- `crates/geoip`
+  MaxMind mmdb loader and downloader for `GEOIP` rules
+- `crates/subscribe`
+  subscription downloader for Clash-compatible YAML feeds
 
 ## Build
 
@@ -173,8 +188,25 @@ Manage system proxy:
 
 ```bash
 cargo run -- sysproxy on
+cargo run -- sysproxy on --bypass 10.0.0.0/8 --bypass *.corp.example
 cargo run -- sysproxy status
 cargo run -- sysproxy off
+```
+
+Download the GeoIP database (optionally through the running proxy):
+
+```bash
+cargo run -- mmdb-download
+cargo run -- mmdb-download --proxy socks5://127.0.0.1:7890
+```
+
+Manage config subscriptions:
+
+```bash
+cargo run -- subscribe add --name wgetcloud --url https://example.com/sub --output ~/.config/clashx-rs/config.yaml
+cargo run -- subscribe list
+cargo run -- subscribe update
+cargo run -- subscribe remove wgetcloud
 ```
 
 ## CLI Commands
@@ -182,17 +214,28 @@ cargo run -- sysproxy off
 The current command surface:
 
 ```text
-clashx-rs run [--config <path>]
-clashx-rs stop
-clashx-rs reload
-clashx-rs status
-clashx-rs proxies
-clashx-rs groups
-clashx-rs rules
-clashx-rs switch <group> <proxy>
-clashx-rs test <domain>
-clashx-rs sysproxy on|off|status
+clashx-rs [--config <path>] [--port <port>] <command>
+
+Commands:
+  run [-d] [--select GROUP=PROXY] [--mmdb <path>] [--mmdb-auto-download]
+  stop
+  reload
+  status
+  proxies
+  groups
+  rules
+  switch <group> <proxy>
+  test <domain>
+  sysproxy on [--bypass <pattern>]... | off | status
+  mmdb-download [--proxy <url>] [--url <url>] [--output <path>]
+  subscribe add --name <n> --url <u> --output <path> [--interval <secs>]
+  subscribe list
+  subscribe update [--name <n>]
+  subscribe remove <name>
 ```
+
+`--port` overrides the mixed-port so multiple daemons can run in parallel —
+socket and pid files are keyed by port.
 
 ## Configuration
 
@@ -234,10 +277,16 @@ proxy-groups:
       - local-socks5
       - DIRECT
 
+skip-proxy:
+  - 10.0.0.0/8
+  - *.corp.example
+
 rules:
   - DOMAIN-SUFFIX,google.com,Proxy
+  - DOMAIN-KEYWORD,github,Proxy
   - PROCESS-NAME,curl,DIRECT
-  - MATCH,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,Proxy
 ```
 
 Currently supported proxy types:
@@ -259,12 +308,16 @@ Unknown fields are ignored so existing Clash configs are easier to reuse.
 ~/.config/clashx-rs/
 ```
 
-Important paths:
+Important paths (port defaults to 7890; change via `--port` or `mixed-port`):
 
 - control socket:
-  `~/.config/clashx-rs/clashx-rs.sock`
+  `~/.config/clashx-rs/clashx-rs-<port>.sock`
 - PID file:
-  `~/.config/clashx-rs/clashx-rs.pid`
+  `~/.config/clashx-rs/clashx-rs-<port>.pid`
+- GeoIP database:
+  `~/.config/clashx-rs/Country.mmdb`
+- subscriptions:
+  `~/.config/clashx-rs/subscriptions.yaml`
 
 ## System Proxy Behavior
 
@@ -284,6 +337,7 @@ Linux:
 - Prefer loopback-only operation for workstation use.
 - Avoid Trojan `skip-cert-verify` unless you explicitly accept the MITM risk.
 - Control is local through a Unix socket under the runtime directory; keep the runtime directory private to your user account.
+- `subscriptions.yaml` may contain provider tokens; the file is written with `0600` and a warning is logged if permissions widen.
 
 ## Development Notes
 
@@ -304,11 +358,11 @@ cargo deny check
 
 ## Roadmap Ideas
 
-- background daemon mode
+- background daemon mode (`run -d`)
 - richer integration tests
-- stronger DNS integration and caching
-- more Clash-compatible routing features
-- more outbound protocols
+- fake-ip DNS mode
+- more Clash-compatible routing features (rule providers, URL-test groups)
+- more outbound protocols (VMess, VLESS, Hysteria)
 - optional REST API
 
 ## License
