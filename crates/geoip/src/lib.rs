@@ -20,14 +20,15 @@ impl GeoIpDb {
     /// Look up the ISO 3166-1 alpha-2 country code for an IP address.
     /// Returns None if the IP is not found in the database (e.g., private ranges).
     pub fn lookup_country(&self, ip: IpAddr) -> Option<&str> {
-        let result: maxminddb::geoip2::Country = self.reader.lookup(ip).ok()?;
-        result.country.and_then(|c| c.iso_code)
+        let result = self.reader.lookup(ip).ok()?;
+        let result: maxminddb::geoip2::Country = result.decode().ok()??;
+        result.country.iso_code
     }
 }
 
 #[derive(Debug)]
 pub enum GeoIpError {
-    Open(PathBuf, maxminddb::MaxMindDBError),
+    Open(PathBuf, maxminddb::MaxMindDbError),
     Download(String),
 }
 

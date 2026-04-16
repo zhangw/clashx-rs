@@ -534,6 +534,11 @@ async fn run_daemon(
         }
     });
 
+    let sub_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        subscription_auto_update(sub_state).await;
+    });
+
     tokio::signal::ctrl_c()
         .await
         .expect("failed to listen for ctrl-c");
@@ -971,27 +976,10 @@ async fn dispatch_control(
             resp
         }
 
-        ControlRequest::Reload => {
-            let mut st = state.write().await;
-            let path = st.config_path.clone();
-            let mmdb_path = st.mmdb_path.clone();
-            let overrides = std::mem::take(&mut st.startup_overrides);
-            let cooldown = Arc::clone(&st.cooldown);
-            match load_config(&path) {
-                Ok(new_config) => {
-                    let mut new_state = DaemonState::from_config(new_config, path, mmdb_path);
-                    if let Err(e) = new_state.reapply_overrides(overrides) {
-                        return ControlResponse::error(format!(
-                            "reload succeeded but --select overrides failed: {e}"
-                        ));
-                    }
-                    new_state.cooldown = cooldown;
-                    *st = new_state;
-                    ControlResponse::ok()
-                }
-                Err(e) => ControlResponse::error(format!("reload failed: {e}")),
-            }
-        }
+        ControlRequest::Reload => match reload_state(state).await {
+            Ok(()) => ControlResponse::ok(),
+            Err(e) => ControlResponse::error(format!("reload failed: {e}")),
+        },
 
         ControlRequest::Switch { group, proxy } => {
             let mut st = state.write().await;
@@ -1047,6 +1035,148 @@ async fn dispatch_control(
             }))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subscription auto-update
+// ---------------------------------------------------------------------------
+
+/// Minimum sleep between periodic checks (clamps against absurdly small intervals).
+const MIN_CHECK_SECS: u64 = 60;
+/// Default sleep when no subscriptions are configured.
+const IDLE_CHECK_SECS: u64 = 3600;
+/// Upper bound on per-tick sleep so newly added subscriptions get picked up within an hour.
+const MAX_CHECK_SECS: u64 = 3600;
+
+async fn subscription_auto_update(state: Arc<RwLock<DaemonState>>) {
+    loop {
+        let config = run_subscription_cycle(&state).await;
+        let sleep_secs = compute_sleep_secs(config.as_ref());
+        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+    }
+}
+
+/// Load config, build new DaemonState, reapply overrides — all outside any
+/// lock. Swap under a brief write lock so in-flight connections aren't blocked
+/// by disk I/O or YAML parsing. On failure, live state is untouched.
+async fn reload_state(state: &Arc<RwLock<DaemonState>>) -> anyhow::Result<()> {
+    let (path, mmdb_path, cooldown, overrides) = {
+        let st = state.read().await;
+        (
+            st.config_path.clone(),
+            st.mmdb_path.clone(),
+            Arc::clone(&st.cooldown),
+            st.startup_overrides.clone(),
+        )
+    };
+
+    let path_for_state = path.clone();
+    let new_config = tokio::task::spawn_blocking(move || load_config(&path))
+        .await
+        .map_err(|e| anyhow::anyhow!("config load task panicked: {e}"))??;
+
+    let mut new_state = DaemonState::from_config(new_config, path_for_state, mmdb_path);
+    new_state
+        .reapply_overrides(overrides)
+        .map_err(|e| anyhow::anyhow!("--select overrides failed: {e}"))?;
+    new_state.cooldown = cooldown;
+
+    let mut st = state.write().await;
+    *st = new_state;
+    Ok(())
+}
+
+/// Run one download-and-reload pass. Returns the post-cycle config (reused by
+/// `compute_sleep_secs`) or None if the subscriptions file couldn't be loaded.
+async fn run_subscription_cycle(
+    state: &Arc<RwLock<DaemonState>>,
+) -> Option<clashx_rs_subscribe::SubscriptionConfig> {
+    let mut config =
+        match tokio::task::spawn_blocking(clashx_rs_subscribe::load_subscriptions).await {
+            Ok(Ok(cfg)) => cfg,
+            Ok(Err(e)) => {
+                tracing::debug!(err = %e, "skipping subscription cycle: failed to load");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "subscription load task panicked");
+                return None;
+            }
+        };
+
+    if config.subscriptions.is_empty() {
+        return Some(config);
+    }
+
+    let results = clashx_rs_subscribe::update_due_subscriptions(&mut config).await;
+    if results.is_empty() {
+        return Some(config);
+    }
+
+    let mut any_success = false;
+    for (name, result) in &results {
+        match result {
+            Ok(()) => {
+                tracing::info!(name = %name, "subscription updated");
+                any_success = true;
+            }
+            Err(e) => {
+                tracing::warn!(name = %name, err = %e, "subscription update failed");
+            }
+        }
+    }
+
+    if !any_success {
+        return Some(config);
+    }
+
+    let save_config = config.clone();
+    let save_result =
+        tokio::task::spawn_blocking(move || clashx_rs_subscribe::save_subscriptions(&save_config))
+            .await;
+    match save_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(err = %e, "failed to save subscription state"),
+        Err(e) => tracing::warn!(err = %e, "subscription save task panicked"),
+    }
+
+    match reload_state(state).await {
+        Ok(()) => tracing::info!("daemon reloaded after subscription update"),
+        Err(e) => tracing::warn!(err = %e, "reload after subscription update failed"),
+    }
+    Some(config)
+}
+
+/// Sleep duration for the next subscription check: min remaining time across
+/// subscriptions, clamped to [MIN_CHECK_SECS, MAX_CHECK_SECS].
+fn compute_sleep_secs(config: Option<&clashx_rs_subscribe::SubscriptionConfig>) -> u64 {
+    let Some(config) = config else {
+        return IDLE_CHECK_SECS;
+    };
+
+    if config.subscriptions.is_empty() {
+        return IDLE_CHECK_SECS;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let min_remaining = config
+        .subscriptions
+        .iter()
+        .map(|s| {
+            if s.last_updated == 0 {
+                0
+            } else {
+                (s.last_updated.saturating_add(s.interval)).saturating_sub(now)
+            }
+        })
+        .min()
+        .unwrap_or(IDLE_CHECK_SECS);
+
+    min_remaining.clamp(MIN_CHECK_SECS, MAX_CHECK_SECS)
 }
 
 #[cfg(test)]

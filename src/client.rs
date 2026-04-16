@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use crate::control::{ControlRequest, ControlResponse};
 
-pub fn send_command(request: ControlRequest, port: u16) -> Result<()> {
+fn send_raw(request: ControlRequest, port: u16) -> Result<ControlResponse> {
     let path = crate::paths::socket_path(port);
     let mut stream = UnixStream::connect(&path).map_err(|e| {
         anyhow::anyhow!(
@@ -23,18 +23,34 @@ pub fn send_command(request: ControlRequest, port: u16) -> Result<()> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
 
-    let resp: ControlResponse = serde_json::from_str(line.trim())?;
+    Ok(serde_json::from_str(line.trim())?)
+}
+
+pub fn send_command(request: ControlRequest, port: u16) -> Result<()> {
+    let resp = send_raw(request, port)?;
     if resp.ok {
         if let Some(data) = resp.data {
             println!("{}", serde_json::to_string_pretty(&data)?);
         } else {
             println!("ok");
         }
+        Ok(())
     } else {
         let err = resp.error.unwrap_or_else(|| "unknown error".to_string());
         eprintln!("error: {err}");
         std::process::exit(1);
     }
+}
 
-    Ok(())
+/// Best-effort send — returns Err when the daemon is not running or rejects the
+/// request. Intended for callers that want to decide how to report failures.
+pub fn send_command_quiet(request: ControlRequest, port: u16) -> Result<()> {
+    let resp = send_raw(request, port)?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(resp
+            .error
+            .unwrap_or_else(|| "unknown error".to_string())))
+    }
 }
