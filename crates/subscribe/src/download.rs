@@ -53,11 +53,13 @@ pub async fn download_to(client: &Client, url: &str, output_path: &Path) -> Resu
     }
 
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.context("failed to read response body")? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read response body")?
+    {
         if bytes.len().saturating_add(chunk.len()) > MAX_SUBSCRIPTION_BYTES {
-            bail!(
-                "subscription response exceeded limit of {MAX_SUBSCRIPTION_BYTES} bytes"
-            );
+            bail!("subscription response exceeded limit of {MAX_SUBSCRIPTION_BYTES} bytes");
         }
         bytes.extend_from_slice(&chunk);
     }
