@@ -779,7 +779,7 @@ async fn handle_connection(
 }
 
 /// Attempt a single outbound connection to the given proxy.
-async fn connect_outbound(
+pub(crate) async fn connect_outbound(
     proxy: &Proxy,
     target: &clashx_rs_proxy::inbound::TargetAddr,
 ) -> Result<OutboundStream> {
@@ -1033,6 +1033,16 @@ async fn dispatch_control(
                 "resolved_proxy": resolved_name,
                 "group": group,
             }))
+        }
+
+        ControlRequest::Latency { full } => {
+            let proxies: Vec<Proxy> = state.read().await.proxies.values().cloned().collect();
+            let results = if full {
+                crate::latency::measure_full(proxies).await
+            } else {
+                crate::latency::measure_tcp(&proxies).await
+            };
+            ControlResponse::success(serde_json::to_value(&results).unwrap_or_default())
         }
     }
 }
@@ -1548,5 +1558,42 @@ mod tests {
         };
         let (_group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(proxy, "DIRECT");
+    }
+
+    #[tokio::test]
+    async fn latency_handler_returns_empty_array_with_no_proxies() {
+        let config = Config::default();
+        let state = Arc::new(RwLock::new(DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        )));
+        let resp = dispatch_control(ControlRequest::Latency { full: false }, &state).await;
+        assert!(resp.ok);
+        let data = resp.data.unwrap();
+        let arr = data.as_array().unwrap();
+        assert!(arr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn latency_handler_returns_results_with_proxies() {
+        let state = Arc::new(RwLock::new(DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        )));
+        let resp = dispatch_control(ControlRequest::Latency { full: false }, &state).await;
+        assert!(resp.ok);
+        let data = resp.data.unwrap();
+        let arr = data.as_array().unwrap();
+        // test_config has 4 proxies, all targeting 127.0.0.1 (should succeed fast)
+        assert!(!arr.is_empty());
+        for entry in arr {
+            // All local connections should have a latency or an error
+            let obj = entry.as_object().unwrap();
+            assert!(obj.contains_key("name"));
+            assert!(obj.contains_key("proxy_type"));
+            assert!(obj.contains_key("tcp_ms") || obj.contains_key("error"));
+        }
     }
 }

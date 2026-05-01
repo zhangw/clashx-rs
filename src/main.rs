@@ -1,6 +1,7 @@
 mod client;
 mod control;
 mod daemon;
+mod latency;
 mod paths;
 mod retry;
 
@@ -109,6 +110,15 @@ enum Command {
         #[arg(long)]
         output: Option<String>,
     },
+    /// Measure proxy latency (TCP handshake by default, --full for protocol setup)
+    Latency {
+        /// Measure full protocol setup latency (TLS + Trojan header / SOCKS5 handshake)
+        #[arg(long)]
+        full: bool,
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage config subscriptions
     Subscribe {
         #[command(subcommand)]
@@ -211,6 +221,23 @@ fn main() -> Result<()> {
 
         Command::Test { domain } => {
             client::send_command(ControlRequest::Test { domain }, ctrl_port)?
+        }
+
+        Command::Latency {
+            full,
+            json: as_json,
+        } => {
+            let data = client::send_command_with_data(ControlRequest::Latency { full }, ctrl_port)?;
+            let results: Vec<latency::ProxyLatencyResult> =
+                serde_json::from_value(data).unwrap_or_default();
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&results).unwrap_or_default()
+                );
+            } else {
+                latency::print_table(&results, full);
+            }
         }
 
         Command::Sysproxy { action } => match action {

@@ -54,3 +54,16 @@ pub fn send_command_quiet(request: ControlRequest, port: u16) -> Result<()> {
             .unwrap_or_else(|| "unknown error".to_string())))
     }
 }
+
+/// Send a command and return the response data on success, or an error.
+pub fn send_command_with_data(request: ControlRequest, port: u16) -> Result<serde_json::Value> {
+    let resp = send_raw(request, port)?;
+    if resp.ok {
+        resp.data
+            .ok_or_else(|| anyhow::anyhow!("daemon returned success with no data"))
+    } else {
+        Err(anyhow::anyhow!(resp
+            .error
+            .unwrap_or_else(|| "unknown error".to_string())))
+    }
+}

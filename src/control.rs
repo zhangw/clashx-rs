@@ -11,6 +11,7 @@ pub enum ControlRequest {
     Groups,
     Rules,
     Test { domain: String },
+    Latency { full: bool },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,5 +80,20 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""ok":false"#));
         assert!(json.contains("something went wrong"));
+    }
+
+    #[test]
+    fn serialize_latency_request() {
+        let req = ControlRequest::Latency { full: true };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""command":"latency""#));
+        assert!(json.contains(r#""full":true"#));
+    }
+
+    #[test]
+    fn deserialize_latency_request() {
+        let json = r#"{"command":"latency","full":false}"#;
+        let req: ControlRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(req, ControlRequest::Latency { full: false }));
     }
 }
