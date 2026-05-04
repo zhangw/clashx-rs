@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,13 @@ const MAX_CONCURRENT: usize = 10;
 const TCP_DEADLINE: Duration = Duration::from_secs(30);
 const FULL_DEADLINE: Duration = Duration::from_secs(60);
 
-const PROBE_HTTP_REQUEST: &[u8] = b"HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n";
+const PROBE_HOST_IP: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+const PROBE_PORT: u16 = 80;
+
+fn probe_http_request() -> &'static [u8] {
+    static REQ: OnceLock<Vec<u8>> = OnceLock::new();
+    REQ.get_or_init(|| format!("HEAD / HTTP/1.0\r\nHost: {PROBE_HOST_IP}\r\n\r\n").into_bytes())
+}
 
 /// Global lock — at most one latency measurement runs at a time across all CLI
 /// invocations, preventing probe storms from concurrent `clashx-rs latency` calls.
@@ -28,10 +34,7 @@ fn global_latency_lock() -> &'static Semaphore {
 }
 
 fn dummy_target() -> Arc<TargetAddr> {
-    Arc::new(TargetAddr::Ip(
-        std::net::IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-        80,
-    ))
+    Arc::new(TargetAddr::Ip(IpAddr::V4(PROBE_HOST_IP), PROBE_PORT))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,22 +138,13 @@ pub async fn measure_full(proxies: Vec<Proxy>) -> Vec<ProxyLatencyResult> {
             let _permit = sem.acquire().await;
 
             let start = Instant::now();
-            let connected = crate::daemon::connect_outbound(&proxy, &target).await;
+            let res: Result<()> = async {
+                let mut stream = crate::daemon::connect_outbound(&proxy, &target).await?;
+                probe_through_tunnel(&mut stream).await
+            }
+            .await;
 
-            let mut stream = match connected {
-                Ok(s) => s,
-                Err(e) => {
-                    return ProxyLatencyResult {
-                        name,
-                        proxy_type,
-                        tcp_ms: None,
-                        full_ms: None,
-                        error: Some(format!("{e:#}")),
-                    };
-                }
-            };
-
-            match probe_through_tunnel(&mut stream).await {
+            match res {
                 Ok(()) => ProxyLatencyResult {
                     name,
                     proxy_type,
@@ -197,7 +191,7 @@ async fn probe_through_tunnel(stream: &mut OutboundStream) -> Result<()> {
 }
 
 async fn probe_io<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S) -> Result<()> {
-    s.write_all(PROBE_HTTP_REQUEST)
+    s.write_all(probe_http_request())
         .await
         .context("write probe request")?;
     let mut buf = [0u8; 16];
@@ -502,12 +496,9 @@ mod tests {
         assert_eq!(pad(5, max_w), "     "); // 5 spaces to align with 10-wide name
     }
 
-    // ----- probe_through_tunnel ------------------------------------------------
-
     use tokio::net::TcpListener;
 
-    /// Test server that reads the probe request, optionally writes `reply`, then
-    /// shuts down the write half so the client sees EOF deterministically.
+    /// Shuts down the write half so the client sees EOF deterministically.
     async fn run_test_server(listener: TcpListener, reply: Option<&'static [u8]>) {
         let (mut conn, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 64];
