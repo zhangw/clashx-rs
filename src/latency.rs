@@ -2,9 +2,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use anyhow::{bail, Context, Result};
 use clashx_rs_config::types::Proxy;
 use clashx_rs_proxy::inbound::TargetAddr;
+use clashx_rs_proxy::outbound::OutboundStream;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -14,6 +17,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT: usize = 10;
 const TCP_DEADLINE: Duration = Duration::from_secs(30);
 const FULL_DEADLINE: Duration = Duration::from_secs(60);
+
+const PROBE_HTTP_REQUEST: &[u8] = b"HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n";
 
 /// Global lock — at most one latency measurement runs at a time across all CLI
 /// invocations, preventing probe storms from concurrent `clashx-rs latency` calls.
@@ -130,10 +135,23 @@ pub async fn measure_full(proxies: Vec<Proxy>) -> Vec<ProxyLatencyResult> {
             let _permit = sem.acquire().await;
 
             let start = Instant::now();
-            let result = crate::daemon::connect_outbound(&proxy, &target).await;
+            let connected = crate::daemon::connect_outbound(&proxy, &target).await;
 
-            match result {
-                Ok(_) => ProxyLatencyResult {
+            let mut stream = match connected {
+                Ok(s) => s,
+                Err(e) => {
+                    return ProxyLatencyResult {
+                        name,
+                        proxy_type,
+                        tcp_ms: None,
+                        full_ms: None,
+                        error: Some(format!("{e:#}")),
+                    };
+                }
+            };
+
+            match probe_through_tunnel(&mut stream).await {
+                Ok(()) => ProxyLatencyResult {
                     name,
                     proxy_type,
                     tcp_ms: None,
@@ -160,6 +178,34 @@ pub async fn measure_full(proxies: Vec<Proxy>) -> Vec<ProxyLatencyResult> {
     }
     results.sort_by_key(|r| r.full_ms.unwrap_or(u64::MAX));
     results
+}
+
+/// Send a small HTTP HEAD request through an established tunnel and require
+/// at least one response byte. Errors if the remote closes/RSTs without
+/// responding or the read deadline elapses — surfacing nodes whose handshake
+/// succeeds but whose actual relay is broken (e.g. Trojan auth-rejected).
+async fn probe_through_tunnel(stream: &mut OutboundStream) -> Result<()> {
+    tokio::time::timeout(PROBE_TIMEOUT, async {
+        match stream {
+            OutboundStream::Tcp(s) => probe_io(s).await,
+            OutboundStream::Tls(s) => probe_io(s.as_mut()).await,
+            OutboundStream::Rejected => bail!("rejected"),
+        }
+    })
+    .await
+    .context("probe response timed out")?
+}
+
+async fn probe_io<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S) -> Result<()> {
+    s.write_all(PROBE_HTTP_REQUEST)
+        .await
+        .context("write probe request")?;
+    let mut buf = [0u8; 16];
+    let n = s.read(&mut buf).await.context("read probe response")?;
+    if n == 0 {
+        bail!("server closed connection without response (likely auth-rejected)");
+    }
+    Ok(())
 }
 
 fn proxy_info(proxy: &Proxy) -> Option<(&str, &str, u16, &'static str)> {
@@ -454,5 +500,58 @@ mod tests {
         assert_eq!(max_w, 10); // emoji name is wider in display, not bytes
         assert_eq!(display_len("hk-01"), 5);
         assert_eq!(pad(5, max_w), "     "); // 5 spaces to align with 10-wide name
+    }
+
+    // ----- probe_through_tunnel ------------------------------------------------
+
+    use tokio::net::TcpListener;
+
+    /// Test server that reads the probe request, optionally writes `reply`, then
+    /// shuts down the write half so the client sees EOF deterministically.
+    async fn run_test_server(listener: TcpListener, reply: Option<&'static [u8]>) {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 64];
+        let _ = conn.read(&mut buf).await;
+        if let Some(bytes) = reply {
+            let _ = conn.write_all(bytes).await;
+        }
+        let _ = conn.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn probe_detects_silent_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(run_test_server(listener, None));
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut stream = OutboundStream::Tcp(tcp);
+        let err = probe_through_tunnel(&mut stream)
+            .await
+            .expect_err("expected probe to fail when server closes silently");
+        assert!(
+            format!("{err:#}").contains("server closed"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_succeeds_when_response_received() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(run_test_server(listener, Some(b"HTTP/1.0 200 OK\r\n\r\n")));
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut stream = OutboundStream::Tcp(tcp);
+        probe_through_tunnel(&mut stream)
+            .await
+            .expect("probe should succeed when bytes flow back");
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_rejected_stream() {
+        let mut stream = OutboundStream::Rejected;
+        let err = probe_through_tunnel(&mut stream).await.err().unwrap();
+        assert!(format!("{err:#}").contains("rejected"));
     }
 }
