@@ -13,8 +13,8 @@ pub mod manager;
 pub mod state;
 
 pub use manager::{
-    add_subscription, remove_subscription, update_all_subscriptions, update_due_subscriptions,
-    update_subscription_by_name,
+    add_subscription, remove_subscription, set_subscription_enabled, update_all_subscriptions,
+    update_due_subscriptions, update_subscription_by_name,
 };
 pub use state::{load_subscriptions, save_subscriptions};
 
@@ -33,10 +33,18 @@ pub struct Subscription {
     pub interval: u64,
     #[serde(default)]
     pub last_updated: u64,
+    /// Whether this subscription participates in automatic and bulk updates.
+    /// Missing in older config files means enabled, for backward compatibility.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
 
 fn default_interval() -> u64 {
     86400
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {

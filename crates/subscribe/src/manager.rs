@@ -57,19 +57,21 @@ where
     results
 }
 
-/// Download all subscriptions whose interval has elapsed. Updates `last_updated`
-/// timestamps in place on success. Returns per-subscription results.
+/// Download all enabled subscriptions whose interval has elapsed. Updates
+/// `last_updated` timestamps in place on success. Disabled subscriptions are
+/// skipped. Returns per-subscription results.
 pub async fn update_due_subscriptions(
     config: &mut SubscriptionConfig,
 ) -> Vec<(String, Result<()>)> {
-    update_filtered(config, needs_update).await
+    update_filtered(config, |s| s.enabled && needs_update(s)).await
 }
 
-/// Download all subscriptions regardless of interval.
+/// Download all enabled subscriptions regardless of interval. Disabled
+/// subscriptions are skipped — use `update_subscription_by_name` to force one.
 pub async fn update_all_subscriptions(
     config: &mut SubscriptionConfig,
 ) -> Vec<(String, Result<()>)> {
-    update_filtered(config, |_| true).await
+    update_filtered(config, |s| s.enabled).await
 }
 
 /// Download a specific subscription by name.
@@ -78,11 +80,7 @@ pub async fn update_subscription_by_name(
     name: &str,
 ) -> Result<()> {
     let client = build_client()?;
-    let sub = config
-        .subscriptions
-        .iter_mut()
-        .find(|s| s.name == name)
-        .ok_or_else(|| anyhow::anyhow!("subscription '{name}' not found"))?;
+    let sub = find_subscription_mut(config, name)?;
     let result = download_subscription(&client, sub).await;
     if result.is_ok() {
         sub.last_updated = now_unix();
@@ -109,6 +107,29 @@ pub fn remove_subscription(config: &mut SubscriptionConfig, name: &str) -> Resul
     Ok(())
 }
 
+/// Enable or disable a subscription by name. Disabled subscriptions are skipped
+/// by automatic and bulk updates. Fails if not found.
+pub fn set_subscription_enabled(
+    config: &mut SubscriptionConfig,
+    name: &str,
+    enabled: bool,
+) -> Result<()> {
+    find_subscription_mut(config, name)?.enabled = enabled;
+    Ok(())
+}
+
+/// Find a subscription by name, returning a mutable reference or a "not found" error.
+fn find_subscription_mut<'a>(
+    config: &'a mut SubscriptionConfig,
+    name: &str,
+) -> Result<&'a mut Subscription> {
+    config
+        .subscriptions
+        .iter_mut()
+        .find(|s| s.name == name)
+        .ok_or_else(|| anyhow::anyhow!("subscription '{name}' not found"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +141,7 @@ mod tests {
             output: "/tmp/t.yaml".into(),
             interval,
             last_updated,
+            enabled: true,
         }
     }
 
@@ -161,5 +183,24 @@ mod tests {
         add_subscription(&mut config, sample(0, 3600)).unwrap();
         remove_subscription(&mut config, "t").unwrap();
         assert!(config.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn set_enabled_toggles_flag() {
+        let mut config = SubscriptionConfig::default();
+        add_subscription(&mut config, sample(0, 3600)).unwrap();
+        assert!(config.subscriptions[0].enabled);
+
+        set_subscription_enabled(&mut config, "t", false).unwrap();
+        assert!(!config.subscriptions[0].enabled);
+
+        set_subscription_enabled(&mut config, "t", true).unwrap();
+        assert!(config.subscriptions[0].enabled);
+    }
+
+    #[test]
+    fn set_enabled_missing_fails() {
+        let mut config = SubscriptionConfig::default();
+        assert!(set_subscription_enabled(&mut config, "nope", false).is_err());
     }
 }
