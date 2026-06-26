@@ -144,6 +144,16 @@ enum SubscribeAction {
         /// Subscription name
         name: String,
     },
+    /// Enable a subscription (resumes automatic and bulk updates)
+    Enable {
+        /// Subscription name
+        name: String,
+    },
+    /// Disable a subscription (skipped by automatic and bulk updates)
+    Disable {
+        /// Subscription name
+        name: String,
+    },
     /// List all subscriptions
     List,
     /// Download subscription configs now
@@ -309,6 +319,21 @@ fn run_subscribe(action: SubscribeAction, ctrl_port: u16) -> Result<()> {
         update_all_subscriptions, update_subscription_by_name, Subscription, SubscriptionConfig,
     };
 
+    // Shared load-set-save-print for the `enable`/`disable` subcommands.
+    fn apply_enabled(name: &str, enabled: bool) -> Result<()> {
+        use clashx_rs_subscribe::{
+            load_subscriptions, save_subscriptions, set_subscription_enabled,
+        };
+        let mut config = load_subscriptions()?;
+        set_subscription_enabled(&mut config, name, enabled)?;
+        save_subscriptions(&config)?;
+        println!(
+            "{} subscription '{name}'",
+            if enabled { "enabled" } else { "disabled" }
+        );
+        Ok(())
+    }
+
     match action {
         SubscribeAction::Add {
             name,
@@ -325,6 +350,7 @@ fn run_subscribe(action: SubscribeAction, ctrl_port: u16) -> Result<()> {
                     output,
                     interval,
                     last_updated: 0,
+                    enabled: true,
                 },
             )?;
             save_subscriptions(&config)?;
@@ -337,6 +363,10 @@ fn run_subscribe(action: SubscribeAction, ctrl_port: u16) -> Result<()> {
             save_subscriptions(&config)?;
             println!("removed subscription '{name}'");
         }
+
+        SubscribeAction::Enable { name } => apply_enabled(&name, true)?,
+
+        SubscribeAction::Disable { name } => apply_enabled(&name, false)?,
 
         SubscribeAction::List => {
             let config: SubscriptionConfig = load_subscriptions()?;
@@ -353,6 +383,7 @@ fn run_subscribe(action: SubscribeAction, ctrl_port: u16) -> Result<()> {
                     println!("    url:          {}", redact_url_for_display(&sub.url));
                     println!("    output:       {}", sub.output);
                     println!("    interval:     {}s", sub.interval);
+                    println!("    enabled:      {}", sub.enabled);
                     println!("    last_updated: {last}");
                 }
             }
@@ -381,7 +412,11 @@ fn run_subscribe(action: SubscribeAction, ctrl_port: u16) -> Result<()> {
                 } else {
                     let results = update_all_subscriptions(&mut config).await;
                     if results.is_empty() {
-                        println!("no subscriptions configured");
+                        if config.subscriptions.is_empty() {
+                            println!("no subscriptions configured");
+                        } else {
+                            println!("no enabled subscriptions to update");
+                        }
                     }
                     for (sub_name, result) in results {
                         match result {

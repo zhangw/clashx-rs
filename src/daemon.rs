@@ -1173,9 +1173,11 @@ fn compute_sleep_secs(config: Option<&clashx_rs_subscribe::SubscriptionConfig>) 
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let min_remaining = config
+    // `None` => no enabled subscriptions to track; idle until one is added/re-enabled.
+    config
         .subscriptions
         .iter()
+        .filter(|s| s.enabled)
         .map(|s| {
             if s.last_updated == 0 {
                 0
@@ -1184,9 +1186,8 @@ fn compute_sleep_secs(config: Option<&clashx_rs_subscribe::SubscriptionConfig>) 
             }
         })
         .min()
-        .unwrap_or(IDLE_CHECK_SECS);
-
-    min_remaining.clamp(MIN_CHECK_SECS, MAX_CHECK_SECS)
+        .map(|remaining| remaining.clamp(MIN_CHECK_SECS, MAX_CHECK_SECS))
+        .unwrap_or(IDLE_CHECK_SECS)
 }
 
 #[cfg(test)]

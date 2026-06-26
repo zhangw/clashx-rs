@@ -128,6 +128,7 @@ mod tests {
             output: "~/.config/clash/wgetcloud.yaml".into(),
             interval: 864000,
             last_updated: 1_700_000_000,
+            enabled: false,
         });
         save_subscriptions_to(&path, &config).unwrap();
 
@@ -136,6 +137,7 @@ mod tests {
         assert_eq!(loaded.subscriptions[0].name, "wgetcloud");
         assert_eq!(loaded.subscriptions[0].interval, 864000);
         assert_eq!(loaded.subscriptions[0].last_updated, 1_700_000_000);
+        assert!(!loaded.subscriptions[0].enabled);
     }
 
     #[test]
@@ -155,5 +157,7 @@ subscriptions:
         let loaded = load_subscriptions_from(&path).unwrap();
         assert_eq!(loaded.subscriptions[0].interval, 86400);
         assert_eq!(loaded.subscriptions[0].last_updated, 0);
+        // Missing `enabled` defaults to true for backward compatibility.
+        assert!(loaded.subscriptions[0].enabled);
     }
 }

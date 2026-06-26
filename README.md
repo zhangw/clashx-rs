@@ -206,8 +206,14 @@ Manage config subscriptions:
 cargo run -- subscribe add --name wgetcloud --url https://example.com/sub --output ~/.config/clashx-rs/config.yaml
 cargo run -- subscribe list
 cargo run -- subscribe update
+cargo run -- subscribe disable wgetcloud   # stop automatic + bulk fetches; keeps the entry
+cargo run -- subscribe enable wgetcloud    # resume automatic updates
 cargo run -- subscribe remove wgetcloud
 ```
+
+Disabled subscriptions (`enabled: false` in `~/.config/clashx-rs/subscriptions.yaml`)
+are skipped by the daemon's automatic updates and by bulk `subscribe update`. You
+can still force a one-off download with `subscribe update --name <name>`.
 
 ## CLI Commands
 
@@ -231,6 +237,8 @@ Commands:
   subscribe add --name <n> --url <u> --output <path> [--interval <secs>]
   subscribe list
   subscribe update [--name <n>]
+  subscribe enable <name>
+  subscribe disable <name>
   subscribe remove <name>
 ```
 
