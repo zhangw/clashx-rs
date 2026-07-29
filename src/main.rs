@@ -3,6 +3,7 @@ mod control;
 mod daemon;
 mod latency;
 mod paths;
+mod probe;
 mod retry;
 
 use std::path::PathBuf;

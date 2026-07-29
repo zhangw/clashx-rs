@@ -12,7 +12,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::inbound::TargetAddr;
 use crate::outbound::OutboundStream;
-use crate::timeout::CONNECT_TIMEOUT;
+use crate::timeout::PROXY_CONNECT_TIMEOUT;
 
 const CMD_CONNECT: u8 = 0x01;
 const ATYP_IPV4: u8 = 0x01;
@@ -166,7 +166,7 @@ fn build_trojan_header(password: &str, target: &TargetAddr) -> Result<Vec<u8>> {
 
 /// Connect to a Trojan proxy server and return a ready-to-relay TLS stream.
 ///
-/// Both the TCP connect and the TLS handshake must complete within [`CONNECT_TIMEOUT`].
+/// Both the TCP connect and the TLS handshake must complete within [`PROXY_CONNECT_TIMEOUT`].
 pub async fn connect(
     server: &str,
     port: u16,
@@ -181,7 +181,7 @@ pub async fn connect(
     let server_name = ServerName::try_from(sni_host.to_string())?;
 
     // Wrap both TCP connect and TLS handshake under a single timeout budget.
-    let mut tls_stream = tokio::time::timeout(CONNECT_TIMEOUT, async {
+    let mut tls_stream = tokio::time::timeout(PROXY_CONNECT_TIMEOUT, async {
         // 1. TCP connect
         let tcp_stream = TcpStream::connect((server, port)).await?;
 

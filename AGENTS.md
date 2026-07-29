@@ -28,6 +28,19 @@ Current implemented shape:
   - `direct`
 - startup proxy-group selection overrides:
   - `clashx-rs run --select GROUP=PROXY`
+- active node-liveness probes:
+  - per-group `health-check` block (mihomo-compatible keys: `enable`, `url`, `interval`, `expected-status`)
+  - absent block = enabled with defaults (`http://www.gstatic.com/generate_204`, 300s, expect 204)
+  - probes dial the probe URL (plain `http://` only; `https://` URLs are skipped with a one-time warning) through each node itself
+  - servers with only non-public addresses (private/loopback/CGNAT/ULA, domains resolved once) are never probed — intranet relays stay untouched
+  - probe-sidelined nodes stay out of rotation until a probe passes (re-checked every 60s), unless every candidate is out of rotation (fallback keeps connectivity); a data-plane success also clears the sideline
+  - per-node interval honored (floor 30s) with stable per-node jitter; at most 10 concurrent probes per round; config reload forces an immediate full re-probe
+- failover/retry tuning:
+  - proxy-node connect timeout 5s (DIRECT stays 10s)
+  - timeout errors skip same-node retries and fail over immediately
+  - first-byte window: no deadline until client data is sent; afterwards the remote must answer within 8s (re-armed per chunk). On timeout, safely replayable bytes (TLS handshake / bodiless idempotent HTTP) fail over; non-replayable requests keep the connection and fall back to plain relay. If even the last candidate times out, the connection relays on instead of failing (all nodes answering alike implies a slow origin)
+  - first-byte failures never feed cooldown; they only degrade the node in candidate ordering for 120s (ordering-only, never excluded)
+  - passive cooldown: 2 consecutive connect/tunnel failures → 60s timed cooldown; reload resets the tracker
 
 ## Current Caveats
 
@@ -49,6 +62,10 @@ Current implemented shape:
   control request/response types
 - `src/paths.rs`
   runtime paths and default port
+- `src/probe.rs`
+  active node-liveness probes (per-node HTTP status check through the node itself)
+- `src/retry.rs`
+  retry/backoff/failover constants and the cooldown tracker
 
 - `crates/config`
   Clash YAML parsing and typed config

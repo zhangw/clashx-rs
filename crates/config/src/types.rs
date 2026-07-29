@@ -114,6 +114,56 @@ pub struct Socks5Proxy {
     pub password: Option<String>,
 }
 
+pub const DEFAULT_HEALTH_CHECK_URL: &str = "http://www.gstatic.com/generate_204";
+pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
+pub const DEFAULT_HEALTH_CHECK_EXPECTED_STATUS: u16 = 204;
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_health_check_url() -> String {
+    DEFAULT_HEALTH_CHECK_URL.to_string()
+}
+
+fn default_health_check_interval() -> u64 {
+    DEFAULT_HEALTH_CHECK_INTERVAL_SECS
+}
+
+fn default_health_check_expected_status() -> u16 {
+    DEFAULT_HEALTH_CHECK_EXPECTED_STATUS
+}
+
+/// Active liveness probe settings for a proxy group (mihomo-compatible keys).
+///
+/// Probing dials the probe URL through each member node itself and expects an
+/// exact HTTP status match; it detects "half-dead" nodes that accept local
+/// connections but cannot reach the outside.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HealthCheck {
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default = "default_health_check_url")]
+    pub url: String,
+    /// Probe interval in seconds.
+    #[serde(default = "default_health_check_interval")]
+    pub interval: u64,
+    #[serde(default = "default_health_check_expected_status")]
+    pub expected_status: u16,
+}
+
+impl Default for HealthCheck {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            url: default_health_check_url(),
+            interval: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
+            expected_status: DEFAULT_HEALTH_CHECK_EXPECTED_STATUS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ProxyGroup {
@@ -122,6 +172,16 @@ pub struct ProxyGroup {
     pub group_type: GroupType,
     #[serde(default)]
     pub proxies: Vec<String>,
+    #[serde(default)]
+    pub health_check: Option<HealthCheck>,
+}
+
+impl ProxyGroup {
+    /// Effective health-check settings: an absent `health-check` block means
+    /// probing is enabled with built-in defaults.
+    pub fn effective_health_check(&self) -> HealthCheck {
+        self.health_check.clone().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -212,6 +272,45 @@ proxy-groups:
         assert_eq!(group.name, "Proxy");
         assert_eq!(group.group_type, GroupType::Select);
         assert_eq!(group.proxies, vec!["my-trojan", "my-socks5", "DIRECT"]);
+    }
+
+    #[test]
+    fn proxy_group_without_health_check_uses_defaults() {
+        let yaml = r#"
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies:
+      - my-trojan
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let hc = config.proxy_groups[0].effective_health_check();
+        assert!(hc.enable);
+        assert_eq!(hc.url, DEFAULT_HEALTH_CHECK_URL);
+        assert_eq!(hc.interval, DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
+        assert_eq!(hc.expected_status, DEFAULT_HEALTH_CHECK_EXPECTED_STATUS);
+    }
+
+    #[test]
+    fn parse_proxy_group_health_check() {
+        let yaml = r#"
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies:
+      - my-trojan
+    health-check:
+      enable: false
+      url: http://cp.cloudflare.com/generate_204
+      interval: 60
+      expected-status: 204
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let hc = config.proxy_groups[0].effective_health_check();
+        assert!(!hc.enable);
+        assert_eq!(hc.url, "http://cp.cloudflare.com/generate_204");
+        assert_eq!(hc.interval, 60);
+        assert_eq!(hc.expected_status, 204);
     }
 
     #[test]

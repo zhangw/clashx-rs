@@ -4,7 +4,7 @@ use tokio::net::TcpStream;
 
 use crate::inbound::TargetAddr;
 use crate::outbound::OutboundStream;
-use crate::timeout::CONNECT_TIMEOUT;
+use crate::timeout::PROXY_CONNECT_TIMEOUT;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const NO_AUTH: u8 = 0x00;
@@ -25,7 +25,7 @@ const REP_SUCCESS: u8 = 0x00;
 /// If no credentials are provided, only NO_AUTH is offered (original behaviour).
 ///
 /// The full SOCKS5 setup (TCP connect, method negotiation, optional auth, and
-/// CONNECT reply) must complete within [`CONNECT_TIMEOUT`].
+/// CONNECT reply) must complete within [`PROXY_CONNECT_TIMEOUT`].
 pub async fn connect(
     server: &str,
     port: u16,
@@ -33,7 +33,15 @@ pub async fn connect(
     username: Option<&str>,
     password: Option<&str>,
 ) -> Result<OutboundStream> {
-    connect_with_timeout(server, port, target, username, password, CONNECT_TIMEOUT).await
+    connect_with_timeout(
+        server,
+        port,
+        target,
+        username,
+        password,
+        PROXY_CONNECT_TIMEOUT,
+    )
+    .await
 }
 
 async fn connect_with_timeout(

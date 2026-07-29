@@ -3,6 +3,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clashx_rs_config::load_config;
@@ -13,7 +14,7 @@ use clashx_rs_proxy::outbound::{self, OutboundStream};
 use clashx_rs_proxy::relay::relay;
 use clashx_rs_rule::{MatchInput, RuleEngine};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::sync::{RwLock, Semaphore};
 
@@ -49,7 +50,7 @@ impl fmt::Debug for MatchedRuleDebug<'_> {
     }
 }
 
-struct DaemonState {
+pub(crate) struct DaemonState {
     config: Config,
     config_path: PathBuf,
     rule_engine: Arc<RuleEngine>,
@@ -296,11 +297,17 @@ impl DaemonState {
             .collect();
 
         // If all filtered out, ignore cooldown
-        let final_list = if filtered.is_empty() {
-            &ordered
+        let mut final_list: Vec<&str> = if filtered.is_empty() {
+            ordered
         } else {
-            &filtered
+            filtered
         };
+
+        // Demote degraded nodes (weak first-byte signal) to the end,
+        // preserving relative order (stable sort). Ordering-only: degraded
+        // nodes are never excluded. Cached key: one lock acquisition per
+        // element instead of O(n log n).
+        final_list.sort_by_cached_key(|&name| cooldown.is_degraded(name));
 
         // Resolve to Proxy configs, truncate to MAX_FAILOVER_ATTEMPTS
         final_list
@@ -312,6 +319,56 @@ impl DaemonState {
             })
             .take(crate::retry::MAX_FAILOVER_ATTEMPTS)
             .collect()
+    }
+
+    /// Lightweight probe schedule: (node_name, health-check) pairs for every
+    /// health-check-enabled group member, *without* cloning Proxy configs.
+    /// The scheduler filters due nodes from this cheap snapshot and fetches
+    /// Proxy configs on demand via [`Self::proxy_named`], avoiding a full
+    /// node-table deep copy on every tick. `DIRECT`/`REJECT` pseudo-members
+    /// and nested group names are skipped.
+    pub(crate) fn probe_schedule(&self) -> Vec<(String, clashx_rs_config::types::HealthCheck)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for group in &self.config.proxy_groups {
+            let hc = group.effective_health_check();
+            if !hc.enable {
+                continue;
+            }
+            for member in &group.proxies {
+                if member == "DIRECT" || member == "REJECT" || !seen.insert(member.clone()) {
+                    continue;
+                }
+                if self.proxies.contains_key(member) {
+                    out.push((member.clone(), hc.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Fetch a node's Proxy config by name (on-demand clone for due probes).
+    pub(crate) fn proxy_named(&self, name: &str) -> Option<Proxy> {
+        self.proxies.get(name).cloned()
+    }
+
+    /// Shortest probe interval across enabled groups — used only as the
+    /// scheduler tick cadence; per-node probing cadence comes from each
+    /// node's own health-check interval.
+    pub(crate) fn probe_interval_secs(&self) -> u64 {
+        self.config
+            .proxy_groups
+            .iter()
+            .map(|g| g.effective_health_check())
+            .filter(|hc| hc.enable)
+            .map(|hc| hc.interval)
+            .min()
+            .unwrap_or(clashx_rs_config::types::DEFAULT_HEALTH_CHECK_INTERVAL_SECS)
+            .max(30)
+    }
+
+    pub(crate) fn cooldown_handle(&self) -> Arc<crate::retry::CooldownTracker> {
+        Arc::clone(&self.cooldown)
     }
 }
 
@@ -498,6 +555,13 @@ async fn run_daemon(
         }
     });
 
+    // Active node-liveness probes (see probe.rs). Feeds the shared cooldown
+    // tracker so the data plane sidesteps half-dead nodes.
+    let probe_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        crate::probe::run(probe_state).await;
+    });
+
     let proxy_state = Arc::clone(&state);
     let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     tokio::spawn(async move {
@@ -566,7 +630,7 @@ async fn handle_connection(
 ) -> Result<()> {
     let InboundResult {
         target,
-        stream: inbound_stream,
+        stream: mut inbound_stream,
         initial_data,
         source_addr: _,
     } = inbound::detect_and_handle(stream, source_addr).await?;
@@ -723,7 +787,7 @@ async fn handle_connection(
                 outbound::direct::connect(&target, resolved_ip)
             })
             .await?;
-            relay_streams(inbound_stream, outbound, initial_data).await?;
+            relay_streams(inbound_stream, outbound, initial_data, None).await?;
             Ok(())
         }
         _ => {
@@ -732,6 +796,11 @@ async fn handle_connection(
             }
 
             let mut last_err = None;
+            // Client bytes buffered during the first-byte window, replayed to
+            // the next candidate on failover. Starts as the HTTP plain-proxy
+            // initial data (if any); grows with the client's first chunk(s).
+            let mut replay: Vec<u8> = initial_data.unwrap_or_default();
+
             for (i, (cand_name, cand_proxy)) in candidates.iter().enumerate() {
                 if i > 0 {
                     tracing::info!(
@@ -742,23 +811,125 @@ async fn handle_connection(
                     );
                 }
 
-                match connect_with_retry(cand_name, &target_host, || {
+                let mut outbound = match connect_with_retry(cand_name, &target_host, || {
                     connect_outbound(cand_proxy, &target)
                 })
                 .await
                 {
-                    Ok(outbound) => {
-                        cooldown.record_success(cand_name);
-                        relay_streams(inbound_stream, outbound, initial_data).await?;
-                        return Ok(());
-                    }
+                    Ok(o) => o,
                     Err(e) => {
                         cooldown.record_failure(cand_name);
-                        if cooldown.is_cooled_down(cand_name) {
+                        if cooldown.is_cooled_down(cand_name) && !cooldown.is_sidelined(cand_name) {
                             tracing::warn!(
                                 proxy = %cand_name,
-                                "proxy entered cooldown for {}s ({} consecutive failures)",
-                                crate::retry::COOLDOWN_DURATION.as_secs(),
+                                "proxy entered timed cooldown ({} consecutive failures)",
+                                crate::retry::COOLDOWN_FAILURE_THRESHOLD
+                            );
+                        }
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
+
+                // Connect succeeded — but for Trojan that only proves the
+                // node itself is alive. Wait for the remote's first response
+                // bytes before committing (see first_byte_window).
+                match first_byte_window(
+                    &mut outbound,
+                    &mut inbound_stream,
+                    &mut replay,
+                    crate::retry::FIRST_BYTE_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(prefix) => {
+                        cooldown.record_success(cand_name);
+                        relay_streams(inbound_stream, outbound, None, Some(prefix)).await?;
+                        return Ok(());
+                    }
+                    Err(FirstByteError::ClientClosed) => {
+                        tracing::debug!(
+                            target = %target_host,
+                            "client closed during first-byte window"
+                        );
+                        return Ok(());
+                    }
+                    Err(FirstByteError::TimedOut) => {
+                        // Not node-attributable: the origin may simply be
+                        // slow. Never feed passive cooldown from here — the
+                        // health probe owns that.
+                        if replay_is_safe(&replay) {
+                            if i + 1 == candidates.len() {
+                                // Every candidate gave the same answer — far
+                                // more likely a slow origin than N nodes dead
+                                // in the same way. Preserve pre-window
+                                // behavior: keep relaying rather than fail a
+                                // connection that used to succeed eventually.
+                                tracing::debug!(
+                                    proxy = %cand_name,
+                                    target = %target_host,
+                                    "no response on last candidate; continuing relay"
+                                );
+                                relay_streams(inbound_stream, outbound, None, None).await?;
+                                return Ok(());
+                            }
+                            cooldown.degrade(cand_name);
+                            tracing::warn!(
+                                proxy = %cand_name,
+                                target = %target_host,
+                                "no response after sending data, failing over (replay is safe)"
+                            );
+                            last_err = Some(anyhow::anyhow!(
+                                "no response from remote via {cand_name} (first-byte timeout)"
+                            ));
+                        } else {
+                            // Replaying could duplicate a non-idempotent
+                            // request at the origin — the first node may well
+                            // have delivered it. Keep this connection: drop
+                            // the window and relay, preserving pre-window
+                            // behavior for slow origins and large uploads.
+                            tracing::debug!(
+                                proxy = %cand_name,
+                                target = %target_host,
+                                "no response after sending data; not replayable, continuing relay"
+                            );
+                            relay_streams(inbound_stream, outbound, None, None).await?;
+                            return Ok(());
+                        }
+                    }
+                    Err(FirstByteError::RemoteClosed) => {
+                        // The remote definitely hung up. Not node-attributable
+                        // either (the origin may RST this specific request),
+                        // but there is nothing to continue with here.
+                        if replay_is_safe(&replay) {
+                            cooldown.degrade(cand_name);
+                            tracing::warn!(
+                                proxy = %cand_name,
+                                target = %target_host,
+                                "remote closed before responding, failing over (replay is safe)"
+                            );
+                            last_err = Some(anyhow::anyhow!(
+                                "remote closed connection via {cand_name} before responding"
+                            ));
+                        } else {
+                            tracing::warn!(
+                                proxy = %cand_name,
+                                target = %target_host,
+                                "remote closed before responding; request not safely replayable"
+                            );
+                            return Err(anyhow::anyhow!(
+                                "remote closed connection via {cand_name}; request not replayable"
+                            ));
+                        }
+                    }
+                    Err(FirstByteError::Outbound(e)) => {
+                        // The tunnel to the node itself broke — this *is*
+                        // node-attributable.
+                        cooldown.record_failure(cand_name);
+                        if cooldown.is_cooled_down(cand_name) && !cooldown.is_sidelined(cand_name) {
+                            tracing::warn!(
+                                proxy = %cand_name,
+                                "proxy entered timed cooldown ({} consecutive failures)",
                                 crate::retry::COOLDOWN_FAILURE_THRESHOLD
                             );
                         }
@@ -812,6 +983,10 @@ pub(crate) async fn connect_outbound(
 }
 
 /// Retry an async connect function with backoff.
+///
+/// Timeout errors break the retry loop immediately: a node that just timed out
+/// will not recover within a 100-500ms backoff, so the caller should fail over
+/// to the next candidate instead of burning another full timeout budget here.
 async fn connect_with_retry<F, Fut>(
     label: &str,
     target_host: &str,
@@ -841,6 +1016,7 @@ where
         match connect_fn().await {
             Ok(stream) => return Ok(stream),
             Err(e) => {
+                let is_timeout = crate::retry::is_timeout_error(&e);
                 tracing::debug!(
                     proxy = %label,
                     target = %target_host,
@@ -849,6 +1025,14 @@ where
                     "connect attempt failed"
                 );
                 last_err = Some(e);
+                if is_timeout {
+                    tracing::debug!(
+                        proxy = %label,
+                        target = %target_host,
+                        "connect timed out, skipping same-node retries"
+                    );
+                    break;
+                }
             }
         }
     }
@@ -856,23 +1040,188 @@ where
     Err(last_err.unwrap())
 }
 
-/// Write any initial data from HTTP plain proxy, then relay between inbound and
-/// the appropriate outbound stream variant.
+/// Failure modes of the post-connect first-byte window.
+#[derive(Debug)]
+enum FirstByteError {
+    /// The remote sent nothing within the deadline *after client data was
+    /// forwarded*. Not node-attributable (the origin may simply be slow), so
+    /// callers must not feed this into passive cooldown.
+    TimedOut,
+    /// The remote closed the tunnel before sending any data. Same attribution
+    /// caveat as `TimedOut` (the origin may RST specific requests).
+    RemoteClosed,
+    /// The client went away before anything was exchanged; nothing to salvage.
+    ClientClosed,
+    /// The tunnel itself errored mid-write/mid-read — the connection *to the
+    /// node* broke, which is node-attributable and may feed passive cooldown.
+    Outbound(anyhow::Error),
+}
+
+/// Whether the buffered client bytes may be replayed to another candidate
+/// after a first-byte timeout. Replaying bytes that were already sent to one
+/// node duplicates them at the origin, so this is only allowed when the
+/// bytes cannot produce a duplicated side effect:
+///
+/// - TLS handshake (ClientHello, record type 0x16, version 0x03xx): replaying
+///   starts a fresh handshake on a new TCP connection; no application data is
+///   duplicated. This covers HTTPS over CONNECT/SOCKS5.
+/// - Plain HTTP via the HTTP-proxy path: an RFC 7231 idempotent method *and*
+///   nothing after the header terminator — anything following it could be a
+///   request body or a pipelined second request (e.g. a POST), which must
+///   never be duplicated. Phase 2 appends chunks as they arrive, so a
+///   `starts_with` check alone is not sufficient.
+fn replay_is_safe(replay: &[u8]) -> bool {
+    if replay.is_empty() {
+        return true;
+    }
+    if replay.len() >= 3 && replay[0] == 0x16 && replay[1] == 0x03 {
+        return true;
+    }
+    const IDEMPOTENT: [&[u8]; 5] = [b"GET ", b"HEAD ", b"OPTIONS ", b"PUT ", b"DELETE "];
+    if !IDEMPOTENT.iter().any(|m| replay.starts_with(m)) {
+        return false;
+    }
+    match replay.windows(4).position(|w| w == b"\r\n\r\n") {
+        // Headers not even complete yet — certainly nothing beyond them.
+        None => true,
+        // Safe only if the buffer ends exactly at the header terminator.
+        Some(end) => replay.len() == end + 4,
+    }
+}
+
+/// Post-connect "first byte" window. Two phases:
+///
+/// 1. Nothing forwarded yet — wait *without a deadline* for either the
+///    client to send data or the remote to speak first (SSH/SMTP banners).
+///    An idle pre-connected tunnel is indistinguishable from a half-dead
+///    node at this point, so we must not time out and misjudge the node.
+/// 2. Client data has been forwarded — a response is now expected. Wait up
+///    to `timeout` for the remote's first byte; the deadline re-arms on
+///    every forwarded chunk so a late client request still gets the full
+///    budget.
+///
+/// Returns the remote's first bytes, which the caller splices into the
+/// relay. Buffered client bytes stay in `replay` for the caller's failover
+/// decision (see [`replay_is_safe`]).
+async fn first_byte_window(
+    outbound: &mut OutboundStream,
+    inbound: &mut TcpStream,
+    replay: &mut Vec<u8>,
+    timeout: Duration,
+) -> Result<Vec<u8>, FirstByteError> {
+    match outbound {
+        OutboundStream::Tcp(s) => first_byte_window_io(s, inbound, replay, timeout).await,
+        OutboundStream::Tls(s) => first_byte_window_io(&mut **s, inbound, replay, timeout).await,
+        OutboundStream::Rejected => Err(FirstByteError::Outbound(anyhow::anyhow!(
+            "outbound rejected"
+        ))),
+    }
+}
+
+async fn first_byte_window_io<S>(
+    outbound: &mut S,
+    inbound: &mut TcpStream,
+    replay: &mut Vec<u8>,
+    timeout: Duration,
+) -> Result<Vec<u8>, FirstByteError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut out_buf = vec![0u8; 8192];
+    let mut in_buf = vec![0u8; 16384];
+    // Set once the client half-closes (FIN) after sending data: stop reading
+    // the client but keep waiting for the remote — the response may still be
+    // on its way and the client can still receive it.
+    let mut client_eof = false;
+
+    // Phase 1: nothing sent yet — wait indefinitely for someone to speak.
+    if replay.is_empty() {
+        tokio::select! {
+            res = outbound.read(&mut out_buf) => {
+                match res {
+                    Err(e) => return Err(FirstByteError::Outbound(e.into())),
+                    Ok(0) => return Err(FirstByteError::RemoteClosed),
+                    Ok(n) => return Ok(out_buf[..n].to_vec()),
+                }
+            }
+            res = inbound.read(&mut in_buf) => {
+                match res {
+                    Err(_) => return Err(FirstByteError::ClientClosed),
+                    Ok(0) => return Err(FirstByteError::ClientClosed),
+                    Ok(n) => {
+                        replay.extend_from_slice(&in_buf[..n]);
+                        outbound
+                            .write_all(&in_buf[..n])
+                            .await
+                            .map_err(|e| FirstByteError::Outbound(e.into()))?;
+                    }
+                }
+            }
+        }
+    } else {
+        outbound
+            .write_all(replay)
+            .await
+            .map_err(|e| FirstByteError::Outbound(e.into()))?;
+    }
+
+    // Phase 2: client data sent — expect a response within `timeout`,
+    // re-armed on every forwarded chunk.
+    loop {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let read_client = !client_eof && replay.len() < crate::retry::MAX_REPLAY_BUFFER;
+        tokio::select! {
+            res = tokio::time::timeout_at(deadline, outbound.read(&mut out_buf)) => {
+                match res {
+                    Err(_) => return Err(FirstByteError::TimedOut),
+                    Ok(Err(e)) => return Err(FirstByteError::Outbound(e.into())),
+                    Ok(Ok(0)) => return Err(FirstByteError::RemoteClosed),
+                    Ok(Ok(n)) => return Ok(out_buf[..n].to_vec()),
+                }
+            }
+            res = inbound.read(&mut in_buf), if read_client => {
+                match res {
+                    Err(_) => return Err(FirstByteError::ClientClosed),
+                    Ok(0) => client_eof = true,
+                    Ok(n) => {
+                        replay.extend_from_slice(&in_buf[..n]);
+                        outbound
+                            .write_all(&in_buf[..n])
+                            .await
+                            .map_err(|e| FirstByteError::Outbound(e.into()))?;
+                        // Keep waiting; the deadline re-arms next iteration.
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Write any initial data from HTTP plain proxy plus any already-consumed
+/// remote prefix bytes, then relay between inbound and the appropriate
+/// outbound stream variant.
 async fn relay_streams(
     mut inbound: TcpStream,
     outbound: OutboundStream,
     initial_data: Option<Vec<u8>>,
+    remote_prefix: Option<Vec<u8>>,
 ) -> Result<()> {
     match outbound {
         OutboundStream::Tcp(mut tcp) => {
             if let Some(data) = initial_data {
                 tcp.write_all(&data).await?;
             }
+            if let Some(prefix) = remote_prefix {
+                inbound.write_all(&prefix).await?;
+            }
             relay(inbound, tcp).await?;
         }
         OutboundStream::Tls(mut tls) => {
             if let Some(data) = initial_data {
                 tls.write_all(&data).await?;
+            }
+            if let Some(prefix) = remote_prefix {
+                inbound.write_all(&prefix).await?;
             }
             relay(&mut inbound, &mut *tls).await?;
         }
@@ -1069,13 +1418,18 @@ async fn subscription_auto_update(state: Arc<RwLock<DaemonState>>) {
 /// Load config, build new DaemonState, reapply overrides — all outside any
 /// lock. Swap under a brief write lock so in-flight connections aren't blocked
 /// by disk I/O or YAML parsing. On failure, live state is untouched.
+///
+/// The cooldown tracker is intentionally *not* carried over: the fresh state
+/// gets a fresh tracker, so nodes removed or renamed by a subscription update
+/// don't leave stale sideline/failure entries behind. Failure memory rebuilds
+/// within COOLDOWN_FAILURE_THRESHOLD connections, and the probe supervisor
+/// re-reads the new tracker on its next tick.
 async fn reload_state(state: &Arc<RwLock<DaemonState>>) -> anyhow::Result<()> {
-    let (path, mmdb_path, cooldown, overrides) = {
+    let (path, mmdb_path, overrides) = {
         let st = state.read().await;
         (
             st.config_path.clone(),
             st.mmdb_path.clone(),
-            Arc::clone(&st.cooldown),
             st.startup_overrides.clone(),
         )
     };
@@ -1089,7 +1443,6 @@ async fn reload_state(state: &Arc<RwLock<DaemonState>>) -> anyhow::Result<()> {
     new_state
         .reapply_overrides(overrides)
         .map_err(|e| anyhow::anyhow!("--select overrides failed: {e}"))?;
-    new_state.cooldown = cooldown;
 
     let mut st = state.write().await;
     *st = new_state;
@@ -1240,11 +1593,13 @@ mod tests {
                         "🇸🇬 新加坡 02".to_string(),
                         "DIRECT".to_string(),
                     ],
+                    health_check: None,
                 },
                 ProxyGroup {
                     name: "@hk".to_string(),
                     group_type: GroupType::Select,
                     proxies: vec!["🇭🇰 香港 01".to_string(), "🇭🇰 香港 02".to_string()],
+                    health_check: None,
                 },
             ],
             ..Config::default()
@@ -1420,6 +1775,49 @@ mod tests {
     }
 
     #[test]
+    fn build_candidates_demotes_degraded_but_keeps_them() {
+        let config = test_config();
+        let mut state = DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
+        state
+            .selections
+            .insert("🚀 节点选择".to_string(), "🇸🇬 新加坡 01".to_string());
+        let tracker = CooldownTracker::new();
+        tracker.degrade("🇸🇬 新加坡 01");
+        let candidates = state.build_candidate_list("🚀 节点选择", &tracker);
+        // Degraded selected node sinks to the end but is never excluded.
+        assert_eq!(candidates[0].0, "🇭🇰 香港 01");
+        assert_eq!(candidates.last().unwrap().0, "🇸🇬 新加坡 01");
+    }
+
+    #[test]
+    fn probe_schedule_lists_unique_members_without_direct() {
+        let state = DaemonState::from_config(
+            test_config(),
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        );
+        let schedule = state.probe_schedule();
+        let names: Vec<&str> = schedule.iter().map(|(n, _)| n.as_str()).collect();
+        // 🇭🇰 香港 01 appears in both groups but is listed once; DIRECT is excluded.
+        assert_eq!(names.len(), 4);
+        assert!(names.contains(&"🇭🇰 香港 01"));
+        assert!(names.contains(&"🇭🇰 香港 02"));
+        assert!(names.contains(&"🇸🇬 新加坡 01"));
+        assert!(names.contains(&"🇸🇬 新加坡 02"));
+        assert!(!names.contains(&"DIRECT"));
+        // Every scheduled node has a fetchable config and an enabled hc.
+        for (name, hc) in &schedule {
+            assert!(hc.enable);
+            assert!(state.proxy_named(name).is_some());
+        }
+        assert!(state.proxy_named("no-such-node").is_none());
+    }
+
+    #[test]
     fn build_candidates_filters_cooled_down() {
         let config = test_config();
         let state = DaemonState::from_config(
@@ -1467,6 +1865,7 @@ mod tests {
             name: "🐟 漏网之鱼".to_string(),
             group_type: GroupType::Select,
             proxies: vec!["🚀 节点选择".to_string(), "DIRECT".to_string()],
+            health_check: None,
         });
         config.mode = Mode::Rule;
         config.rules = vec!["MATCH,🐟 漏网之鱼".to_string()];
@@ -1536,11 +1935,13 @@ mod tests {
                 name: "A".to_string(),
                 group_type: GroupType::Select,
                 proxies: vec!["B".to_string()],
+                health_check: None,
             },
             ProxyGroup {
                 name: "B".to_string(),
                 group_type: GroupType::Select,
                 proxies: vec!["A".to_string()],
+                health_check: None,
             },
         ];
         config.mode = Mode::Rule;
@@ -1596,5 +1997,200 @@ mod tests {
             assert!(obj.contains_key("proxy_type"));
             assert!(obj.contains_key("tcp_ms") || obj.contains_key("error"));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // first_byte_window tests (loopback only — no external network, no ports
+    // used by a live daemon).
+    // -----------------------------------------------------------------------
+
+    async fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn first_byte_remote_speaks_first() {
+        let (outbound, mut remote) = loopback_pair().await;
+        let (mut inbound, _client) = loopback_pair().await;
+
+        tokio::spawn(async move {
+            remote.write_all(b"SERVER-HELLO").await.unwrap();
+        });
+
+        let mut os = OutboundStream::Tcp(outbound);
+        let mut replay = Vec::new();
+        let prefix = first_byte_window(&mut os, &mut inbound, &mut replay, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(prefix, b"SERVER-HELLO");
+        assert!(replay.is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_byte_silent_remote_no_deadline_before_client_data() {
+        // Idle tunnel (nothing sent): the window must NOT time out — an idle
+        // pre-connected tunnel is indistinguishable from a half-dead node.
+        let (outbound, _remote) = loopback_pair().await;
+        let (mut inbound, _client) = loopback_pair().await;
+
+        let mut os = OutboundStream::Tcp(outbound);
+        let mut replay = Vec::new();
+        let res = tokio::time::timeout(
+            Duration::from_millis(300),
+            first_byte_window(
+                &mut os,
+                &mut inbound,
+                &mut replay,
+                Duration::from_millis(100),
+            ),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "window must stay pending while nothing is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_byte_silent_remote_times_out_after_data_sent() {
+        // Initial data (HTTP plain-proxy path) counts as sent: the remote
+        // must respond within the budget.
+        let (outbound, _remote) = loopback_pair().await;
+        let (mut inbound, _client) = loopback_pair().await;
+
+        let mut os = OutboundStream::Tcp(outbound);
+        let mut replay = b"GET / HTTP/1.1\r\n\r\n".to_vec();
+        let err = first_byte_window(
+            &mut os,
+            &mut inbound,
+            &mut replay,
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, FirstByteError::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn first_byte_deadline_rearms_on_client_write() {
+        // Client sends at ~150ms; remote answers 150ms after that. With a
+        // 200ms budget armed only after the client write, this must succeed —
+        // a fixed window from connect time would have timed out at 200ms.
+        let (outbound, mut remote) = loopback_pair().await;
+        let (mut inbound, mut client) = loopback_pair().await;
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4];
+            remote.read_exact(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            remote.write_all(b"RESP").await.unwrap();
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            client.write_all(b"PING").await.unwrap();
+        });
+
+        let mut os = OutboundStream::Tcp(outbound);
+        let mut replay = Vec::new();
+        let prefix = first_byte_window(
+            &mut os,
+            &mut inbound,
+            &mut replay,
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prefix, b"RESP");
+        assert_eq!(replay, b"PING");
+    }
+
+    #[tokio::test]
+    async fn first_byte_forwards_client_data_and_replays() {
+        let (outbound, mut remote) = loopback_pair().await;
+        let (mut inbound, mut client) = loopback_pair().await;
+
+        // Remote: expect the buffered replay bytes, then the client's chunk,
+        // then respond.
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4];
+            remote.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"INIT");
+            let mut buf = [0u8; 6];
+            remote.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"CLIENT");
+            remote.write_all(b"RESP").await.unwrap();
+        });
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.write_all(b"CLIENT").await.unwrap();
+        });
+
+        let mut os = OutboundStream::Tcp(outbound);
+        let mut replay = b"INIT".to_vec();
+        let prefix = first_byte_window(&mut os, &mut inbound, &mut replay, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(prefix, b"RESP");
+        // Both chunks are buffered for a potential failover replay.
+        assert_eq!(replay, b"INITCLIENT");
+    }
+
+    #[tokio::test]
+    async fn first_byte_client_close_aborts() {
+        let (outbound, _remote) = loopback_pair().await;
+        let (mut inbound, client) = loopback_pair().await;
+        drop(client);
+
+        let mut os = OutboundStream::Tcp(outbound);
+        let mut replay = Vec::new();
+        let err = first_byte_window(&mut os, &mut inbound, &mut replay, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FirstByteError::ClientClosed));
+    }
+
+    #[tokio::test]
+    async fn first_byte_remote_close_is_remote_closed() {
+        let (outbound, remote) = loopback_pair().await;
+        let (mut inbound, _client) = loopback_pair().await;
+        drop(remote);
+
+        let mut os = OutboundStream::Tcp(outbound);
+        let mut replay = Vec::new();
+        let err = first_byte_window(&mut os, &mut inbound, &mut replay, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FirstByteError::RemoteClosed));
+    }
+
+    #[test]
+    fn replay_safety_rules() {
+        assert!(replay_is_safe(b""));
+        // TLS ClientHello (record type 0x16, version 0x0301).
+        assert!(replay_is_safe(&[0x16, 0x03, 0x01, 0x00, 0x2a]));
+        // Idempotent HTTP methods, headers only.
+        assert!(replay_is_safe(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+        assert!(replay_is_safe(b"HEAD /h HTTP/1.0\r\n\r\n"));
+        assert!(replay_is_safe(b"OPTIONS * HTTP/1.1\r\n\r\n"));
+        // Incomplete headers — nothing beyond them can exist.
+        assert!(replay_is_safe(b"GET / HTTP/1.1\r\nHost: x\r\n"));
+        // Anything after the header terminator (body or pipelined request)
+        // makes the buffer non-replayable, even for idempotent methods.
+        assert!(!replay_is_safe(b"PUT /x HTTP/1.1\r\n\r\n{\"a\":1}"));
+        assert!(!replay_is_safe(
+            b"GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n"
+        ));
+        assert!(!replay_is_safe(
+            b"DELETE /x HTTP/1.1\r\n\r\nPOST /y HTTP/1.1\r\n\r\n"
+        ));
+        // Non-idempotent / non-replayable.
+        assert!(!replay_is_safe(b"POST /submit HTTP/1.1\r\n\r\n"));
+        assert!(!replay_is_safe(b"PATCH /x HTTP/1.1\r\n\r\n"));
+        assert!(!replay_is_safe(&[0x05, 0x01, 0x00])); // SOCKS5 greeting
     }
 }
