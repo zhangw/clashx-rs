@@ -118,7 +118,12 @@ pub async fn measure_tcp(proxies: &[Proxy]) -> Vec<ProxyLatencyResult> {
 }
 
 /// Measure full protocol setup latency using actual outbound connectors.
-pub async fn measure_full(proxies: Vec<Proxy>) -> Vec<ProxyLatencyResult> {
+/// Proxy server domains are resolved through `proxy_resolver` (the
+/// proxy-server-nameserver group), same as the data plane.
+pub async fn measure_full(
+    proxies: Vec<Proxy>,
+    proxy_resolver: Arc<clashx_rs_dns::Resolver>,
+) -> Vec<ProxyLatencyResult> {
     let _global = global_latency_lock().acquire().await;
     let deadline = Instant::now() + FULL_DEADLINE;
     let count = proxies.len();
@@ -133,13 +138,15 @@ pub async fn measure_full(proxies: Vec<Proxy>) -> Vec<ProxyLatencyResult> {
         };
         let sem = sem.clone();
         let target = target.clone();
+        let proxy_resolver = Arc::clone(&proxy_resolver);
 
         set.spawn(async move {
             let _permit = sem.acquire().await;
 
             let start = Instant::now();
             let res: Result<()> = async {
-                let mut stream = crate::daemon::connect_outbound(&proxy, &target).await?;
+                let mut stream =
+                    crate::daemon::connect_outbound(&proxy, &target, &proxy_resolver).await?;
                 probe_through_tunnel(&mut stream).await
             }
             .await;

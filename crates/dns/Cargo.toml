@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+clashx-rs-config = { path = "../config" }
 tokio.workspace = true
+reqwest.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"

@@ -12,6 +12,7 @@ pub enum ControlRequest {
     Rules,
     Test { domain: String },
     Latency { full: bool },
+    DnsFlush { host: Option<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -95,5 +96,22 @@ mod tests {
         let json = r#"{"command":"latency","full":false}"#;
         let req: ControlRequest = serde_json::from_str(json).unwrap();
         assert!(matches!(req, ControlRequest::Latency { full: false }));
+    }
+
+    #[test]
+    fn serialize_dnsflush_request() {
+        let req = ControlRequest::DnsFlush {
+            host: Some("example.com".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""command":"dnsflush""#));
+        assert!(json.contains(r#""host":"example.com""#));
+    }
+
+    #[test]
+    fn deserialize_dnsflush_without_host() {
+        let json = r#"{"command":"dnsflush","host":null}"#;
+        let req: ControlRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(req, ControlRequest::DnsFlush { host: None }));
     }
 }

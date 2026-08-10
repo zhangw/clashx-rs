@@ -24,6 +24,9 @@ const REP_SUCCESS: u8 = 0x00;
 ///
 /// If no credentials are provided, only NO_AUTH is offered (original behaviour).
 ///
+/// If `resolved_server_ip` is provided (pre-resolved by the daemon's proxy
+/// resolver), TCP dials that literal address instead of resolving `server`.
+///
 /// The full SOCKS5 setup (TCP connect, method negotiation, optional auth, and
 /// CONNECT reply) must complete within [`PROXY_CONNECT_TIMEOUT`].
 pub async fn connect(
@@ -32,6 +35,7 @@ pub async fn connect(
     target: &TargetAddr,
     username: Option<&str>,
     password: Option<&str>,
+    resolved_server_ip: Option<std::net::IpAddr>,
 ) -> Result<OutboundStream> {
     connect_with_timeout(
         server,
@@ -39,6 +43,7 @@ pub async fn connect(
         target,
         username,
         password,
+        resolved_server_ip,
         PROXY_CONNECT_TIMEOUT,
     )
     .await
@@ -50,10 +55,11 @@ async fn connect_with_timeout(
     target: &TargetAddr,
     username: Option<&str>,
     password: Option<&str>,
+    resolved_server_ip: Option<std::net::IpAddr>,
     timeout: std::time::Duration,
 ) -> Result<OutboundStream> {
     let stream = tokio::time::timeout(timeout, async {
-        let mut stream = TcpStream::connect((server, port)).await?;
+        let mut stream = crate::outbound::dial_server(server, port, resolved_server_ip).await?;
 
         // --- Method negotiation ---
         let have_creds = username.is_some() && password.is_some();
@@ -296,7 +302,7 @@ mod tests {
         tokio::spawn(run_stub_server(listener));
 
         let target = TargetAddr::Domain("example.com".to_string(), 443);
-        let result = connect("127.0.0.1", server_addr.port(), &target, None, None)
+        let result = connect("127.0.0.1", server_addr.port(), &target, None, None, None)
             .await
             .unwrap();
         assert!(matches!(result, OutboundStream::Tcp(_)));
@@ -310,7 +316,7 @@ mod tests {
         tokio::spawn(run_stub_server(listener));
 
         let target = TargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80);
-        let result = connect("127.0.0.1", server_addr.port(), &target, None, None)
+        let result = connect("127.0.0.1", server_addr.port(), &target, None, None, None)
             .await
             .unwrap();
         assert!(matches!(result, OutboundStream::Tcp(_)));
@@ -330,6 +336,7 @@ mod tests {
             &target,
             Some("user"),
             Some("pass"),
+            None,
         )
         .await
         .unwrap();
@@ -350,6 +357,7 @@ mod tests {
             &target,
             Some("user"),
             Some("wrong"),
+            None,
         )
         .await;
         assert!(result.is_err(), "expected auth failure but got success");
@@ -390,6 +398,7 @@ mod tests {
             &target,
             Some("user"),
             Some("pass"),
+            None,
         )
         .await
         .unwrap();
@@ -411,6 +420,7 @@ mod tests {
             "127.0.0.1",
             server_addr.port(),
             &target,
+            None,
             None,
             None,
             Duration::from_millis(50),

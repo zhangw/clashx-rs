@@ -7,7 +7,6 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use sha2::{Digest, Sha224};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use crate::inbound::TargetAddr;
@@ -166,6 +165,11 @@ fn build_trojan_header(password: &str, target: &TargetAddr) -> Result<Vec<u8>> {
 
 /// Connect to a Trojan proxy server and return a ready-to-relay TLS stream.
 ///
+/// When `resolved_server_ip` is provided (pre-resolved by the daemon's proxy
+/// resolver), TCP dials that literal address — but the TLS SNI/ServerName
+/// still uses the configured domain, so certificate verification is
+/// unaffected.
+///
 /// Both the TCP connect and the TLS handshake must complete within [`PROXY_CONNECT_TIMEOUT`].
 pub async fn connect(
     server: &str,
@@ -174,6 +178,7 @@ pub async fn connect(
     sni: Option<&str>,
     skip_cert_verify: bool,
     target: &TargetAddr,
+    resolved_server_ip: Option<IpAddr>,
 ) -> Result<OutboundStream> {
     let connector = get_connector(skip_cert_verify).clone();
 
@@ -183,7 +188,7 @@ pub async fn connect(
     // Wrap both TCP connect and TLS handshake under a single timeout budget.
     let mut tls_stream = tokio::time::timeout(PROXY_CONNECT_TIMEOUT, async {
         // 1. TCP connect
-        let tcp_stream = TcpStream::connect((server, port)).await?;
+        let tcp_stream = crate::outbound::dial_server(server, port, resolved_server_ip).await?;
 
         // 2. TLS handshake
         let tls = connector.connect(server_name, tcp_stream).await?;
