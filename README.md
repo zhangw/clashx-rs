@@ -31,6 +31,7 @@ A pure Rust, headless Clash-compatible proxy CLI for macOS and Linux.
   - `direct`
 - Proxy-group selection with live switching
 - DNS pre-resolve with positive/negative caching and singleflight
+- mihomo-compatible DNS policy — UDP/DoH/DoT nameserver race, `hosts:`, `proxy-server-nameserver`, fail-open system fallback (see docs/dns-resolver-design.md)
 - Lazy two-phase rule evaluation — DNS/process lookups only run when a rule needs them
 - Per-proxy cooldown + failover across candidate proxies
 - Parallel-instance support — socket/pid files are keyed by mixed-port
@@ -60,7 +61,7 @@ This project is usable as a local CLI proxy, but it is still early-stage softwar
 Known caveats:
 
 - `clashx-rs run -d` (background daemon mode) is not implemented yet
-- DNS resolution uses the system resolver with a TTL-based cache; fake-ip mode is deferred
+- DNS honors the mihomo `dns:` block (UDP/DoH/DoT race with system fallback); fake-ip mode and IPv6/AAAA are deferred — see docs/dns-resolver-design.md
 - `PROCESS-NAME` lookup is best-effort and platform-dependent
 - `GEOIP` requires a MaxMind Country mmdb at `~/.config/clashx-rs/Country.mmdb` (or provide `--mmdb <path>`)
 - `allow-lan` can expose an unauthenticated proxy listener on the configured address; use carefully
@@ -99,7 +100,7 @@ Workspace crates:
 - `crates/rule`
   rule parsing, evaluation, and process lookup helpers
 - `crates/dns`
-  system resolver with TTL-based positive/negative cache and singleflight
+  mihomo-compatible resolver — UDP/DoH/DoT upstreams, bootstrap, hosts, TTL/negative cache and singleflight
 - `crates/proxy`
   inbound protocol handling, outbound connectors, relay, and timeouts
 - `crates/sysproxy`
@@ -240,6 +241,7 @@ Commands:
   subscribe enable <name>
   subscribe disable <name>
   subscribe remove <name>
+  dns flush [--host <domain>]
 ```
 
 `--port` overrides the mixed-port so multiple daemons can run in parallel —
