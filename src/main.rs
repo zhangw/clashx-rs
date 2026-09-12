@@ -6,10 +6,11 @@ mod paths;
 mod probe;
 mod retry;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use clashx_rs_config::LogLevel;
 use clashx_rs_sysproxy::SysProxy;
 use tracing_subscriber::EnvFilter;
 
@@ -209,13 +210,29 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+/// Install the log filter.
+///
+/// `RUST_LOG` wins when it is set — an explicit override should not be
+/// second-guessed. Otherwise the config file's `log-level` decides, so the
+/// setting is not silently inert.
+fn init_logging(config_path: &Path) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let directive = match clashx_rs_config::load_log_level(config_path) {
+            LogLevel::Silent => "off",
+            LogLevel::Error => "error",
+            LogLevel::Warning => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+        };
+        EnvFilter::new(directive)
+    });
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
 
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = expand_tilde(&cli.config);
+    init_logging(&config_path);
     let ctrl_port = resolve_port(&cli);
 
     match cli.command {
