@@ -61,6 +61,10 @@ pub(crate) struct DaemonState {
     mmdb_path: PathBuf,
     nameservers: Arc<[IpAddr]>,
     dns_cache: Arc<clashx_rs_dns::DnsCache>,
+    /// Whether this daemon set the system proxy. Cleanup paths consult it so a
+    /// daemon that never touched the setting cannot switch off one the user
+    /// configured by hand.
+    sysproxy_enabled: bool,
 }
 
 impl DaemonState {
@@ -121,6 +125,7 @@ impl DaemonState {
             mmdb_path,
             nameservers,
             dns_cache: Arc::new(clashx_rs_dns::DnsCache::new()),
+            sysproxy_enabled: false,
         }
     }
 
@@ -377,6 +382,7 @@ pub fn start_foreground(
     selections: &[String],
     mmdb_path: PathBuf,
     mmdb_auto_download: bool,
+    sysproxy: bool,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -386,6 +392,7 @@ pub fn start_foreground(
         selections,
         mmdb_path,
         mmdb_auto_download,
+        sysproxy,
     ))
 }
 
@@ -394,9 +401,104 @@ pub fn start_background(
     _selections: &[String],
     _mmdb_path: PathBuf,
     _mmdb_auto_download: bool,
+    _sysproxy: bool,
 ) -> Result<()> {
     println!("background daemon mode is not yet implemented");
     Ok(())
+}
+
+/// Private ranges the sysproxy crate bypasses when no `skip-proxy` is set.
+/// Kept in sync with `DEFAULT_BYPASS` in crates/sysproxy; only the subnet
+/// entries matter here, since only those can swallow an IP-CIDR rule.
+const DEFAULT_BYPASS_CIDRS: &[&str] = &["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"];
+
+/// Warn about rules the system proxy bypass list silently defeats.
+///
+/// A bypass entry takes effect before any traffic reaches us, so a rule that
+/// sends a bypassed subnet through a proxy can never fire. The two settings
+/// contradict each other quietly, which is worth a line in the log.
+fn warn_on_bypassed_rules(
+    bypass: &[String],
+    rules: &[String],
+    resolves_direct: impl Fn(&str) -> bool,
+) {
+    let bypass: Vec<(IpAddr, u8)> = if bypass.is_empty() {
+        // Mirrors the crate's built-in defaults, which cover the private ranges.
+        DEFAULT_BYPASS_CIDRS
+            .iter()
+            .filter_map(|entry| parse_cidr(entry))
+            .collect()
+    } else {
+        bypass
+            .iter()
+            .filter_map(|entry| parse_cidr(entry))
+            .collect()
+    };
+    if bypass.is_empty() {
+        return;
+    }
+
+    for rule in rules {
+        let mut parts = rule.split(',');
+        let kind = parts.next().unwrap_or("").trim();
+        if !kind.eq_ignore_ascii_case("IP-CIDR") && !kind.eq_ignore_ascii_case("IP-CIDR6") {
+            continue;
+        }
+        let Some(target) = parts.next().and_then(parse_cidr) else {
+            continue;
+        };
+        let action = parts.next().unwrap_or("").trim();
+        // A bypassed subnet going DIRECT is what the bypass list already does.
+        // The action is usually a group name, so ask what it actually resolves
+        // to rather than only recognising the literal keyword.
+        if action.eq_ignore_ascii_case("DIRECT") || resolves_direct(action) {
+            continue;
+        }
+        if let Some((net, len)) = bypass
+            .iter()
+            .find(|(net, len)| *len <= target.1 && clashx_rs_rule::ip_in_cidr(target.0, *net, *len))
+        {
+            // Printed rather than logged: the default log filter only lets
+            // errors through, and this is the one thing the user has to see
+            // before their rules silently stop firing.
+            eprintln!(
+                "warning: system proxy bypass {net}/{len} covers rule \"{rule}\"; \
+                 that traffic will not reach the proxy at all"
+            );
+        }
+    }
+}
+
+/// Parse a `network/prefix` entry; anything else (a domain, a bare host) is
+/// not a subnet and cannot swallow an IP-CIDR rule.
+fn parse_cidr(entry: &str) -> Option<(IpAddr, u8)> {
+    let (net, len) = entry.trim().split_once('/')?;
+    Some((net.parse().ok()?, len.parse().ok()?))
+}
+
+/// Wait for SIGINT or SIGTERM, returning the name of whichever arrived.
+///
+/// SIGTERM is what `kill`, a logout and a shutdown send by default, so it has
+/// to reach the same cleanup path as Ctrl-C — otherwise the process dies with
+/// the system proxy still pointing at a port nothing is listening on.
+async fn wait_for_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("failed to install SIGTERM handler: {e}");
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to listen for ctrl-c");
+            return "SIGINT";
+        }
+    };
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +510,7 @@ async fn run_daemon(
     selections: &[String],
     mmdb_path: PathBuf,
     mmdb_auto_download: bool,
+    sysproxy_flag: bool,
 ) -> Result<()> {
     let config = load_config(config_path)?;
     let port = config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT);
@@ -431,8 +534,18 @@ async fn run_daemon(
         "127.0.0.1".to_string()
     };
 
+    // Captured before the config is moved into the daemon state.
+    let sysproxy_enabled = sysproxy_flag || config.sysproxy.unwrap_or(false);
+    let sysproxy_bypass = config.skip_proxy.clone();
+    let sysproxy_rules = if sysproxy_enabled {
+        config.rules.clone()
+    } else {
+        Vec::new()
+    };
+
     let mut daemon_state =
         DaemonState::from_config(config, config_path.to_path_buf(), mmdb_path.clone());
+    daemon_state.sysproxy_enabled = sysproxy_enabled;
     daemon_state.parse_and_apply_overrides(selections)?;
     daemon_state.validate();
     let geoip_loaded = daemon_state.rule_engine.has_geoip_db();
@@ -474,6 +587,24 @@ async fn run_daemon(
 
     println!("clashx-rs started on {bind_addr}:{port}");
     println!("press Ctrl-C to stop");
+
+    // Only after the listener is bound: pointing the system proxy at a port
+    // nothing accepts on would black-hole every app on the machine.
+    if sysproxy_enabled {
+        {
+            let st = state.read().await;
+            warn_on_bypassed_rules(&sysproxy_bypass, &sysproxy_rules, |action| {
+                st.resolve_selection_chain(action).1 == "DIRECT"
+            });
+        }
+        let sysproxy = clashx_rs_sysproxy::SysProxy::new(port, paths::sysproxy_snapshot_path());
+        match sysproxy.enable_with_bypass(&sysproxy_bypass) {
+            Ok(()) => println!("system proxy set to 127.0.0.1:{port}"),
+            // Not fatal: the proxy itself still works, callers just have to
+            // point at it themselves.
+            Err(e) => tracing::warn!("failed to set system proxy: {e}"),
+        }
+    }
 
     // Auto-download mmdb in background if requested and not already loaded.
     if mmdb_auto_download && !geoip_loaded {
@@ -603,14 +734,17 @@ async fn run_daemon(
         subscription_auto_update(sub_state).await;
     });
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl-c");
-    println!("\nshutting down");
+    let signal = wait_for_shutdown_signal().await;
+    println!("\nshutting down ({signal})");
 
-    let sysproxy = clashx_rs_sysproxy::SysProxy::new(port);
-    if let Err(e) = sysproxy.disable() {
-        tracing::warn!("failed to disable system proxy: {e}");
+    if sysproxy_enabled {
+        let sysproxy = clashx_rs_sysproxy::SysProxy::new(port, paths::sysproxy_snapshot_path());
+        if let Err(e) = sysproxy.disable() {
+            // Printed, not logged: the default log filter shows only errors,
+            // and a silent failure here leaves the machine pointing at a port
+            // that is about to stop accepting connections.
+            eprintln!("error: {e}");
+        }
     }
     let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_file(&pid_file);
@@ -1307,15 +1441,21 @@ async fn dispatch_control(
 
         ControlRequest::Stop => {
             let resp = ControlResponse::ok();
-            let port = {
+            let (port, sysproxy_enabled) = {
                 let st = state.read().await;
-                st.config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT)
+                (
+                    st.config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT),
+                    st.sysproxy_enabled,
+                )
             };
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let sysproxy = clashx_rs_sysproxy::SysProxy::new(port);
-                if let Err(e) = sysproxy.disable() {
-                    tracing::warn!("failed to disable system proxy on stop: {e}");
+                if sysproxy_enabled {
+                    let sysproxy =
+                        clashx_rs_sysproxy::SysProxy::new(port, paths::sysproxy_snapshot_path());
+                    if let Err(e) = sysproxy.disable() {
+                        eprintln!("error: {e}");
+                    }
                 }
                 let _ = std::fs::remove_file(paths::socket_path(port));
                 let _ = std::fs::remove_file(paths::pid_path(port));
@@ -1445,6 +1585,9 @@ async fn reload_state(state: &Arc<RwLock<DaemonState>>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("--select overrides failed: {e}"))?;
 
     let mut st = state.write().await;
+    // A reload cannot un-set a system proxy this daemon already installed, so
+    // ownership carries over rather than being re-read from the new config.
+    new_state.sysproxy_enabled = st.sysproxy_enabled;
     *st = new_state;
     Ok(())
 }
@@ -1545,6 +1688,65 @@ fn compute_sleep_secs(config: Option<&clashx_rs_subscribe::SubscriptionConfig>) 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bypassed_rule_detection() {
+        use std::net::IpAddr;
+
+        // The exact conflict that motivated this: a default private-range
+        // bypass swallowing an internal subnet routed to a proxy group.
+        let covered: (IpAddr, u8) = ("10.42.0.0".parse().unwrap(), 16);
+        let (net, len): (IpAddr, u8) = ("10.0.0.0".parse().unwrap(), 8);
+        assert!(len <= covered.1 && clashx_rs_rule::ip_in_cidr(covered.0, net, len));
+
+        // A narrower bypass does not cover a wider rule.
+        let wide: (IpAddr, u8) = ("10.0.0.0".parse().unwrap(), 8);
+        let (bnet, blen): (IpAddr, u8) = ("10.42.0.0".parse().unwrap(), 16);
+        assert!(!(blen <= wide.1 && clashx_rs_rule::ip_in_cidr(wide.0, bnet, blen)));
+
+        // An unrelated range does not.
+        let other: (IpAddr, u8) = ("172.20.0.0".parse().unwrap(), 16);
+        assert!(!clashx_rs_rule::ip_in_cidr(other.0, net, len));
+    }
+
+    #[test]
+    fn parse_cidr_accepts_only_subnets() {
+        assert!(parse_cidr("10.0.0.0/8").is_some());
+        assert!(parse_cidr(" 192.168.0.0/16 ").is_some());
+        // Domains and bare hosts are not subnets.
+        assert!(parse_cidr("localhost").is_none());
+        assert!(parse_cidr("*.local").is_none());
+        assert!(parse_cidr("127.0.0.1").is_none());
+        assert!(parse_cidr("10.0.0.0/notanumber").is_none());
+    }
+
+    #[test]
+    fn bypass_warning_skips_direct_rules() {
+        // Smoke test: the helper must not panic on real-world rule shapes,
+        // including malformed ones.
+        warn_on_bypassed_rules(
+            &["10.0.0.0/8".to_string()],
+            &[
+                "IP-CIDR,10.42.0.0/16,SomeGroup".to_string(),
+                "IP-CIDR,10.42.0.0/16,DIRECT".to_string(),
+                "DOMAIN-SUFFIX,example.com,DIRECT".to_string(),
+                "MATCH,SomeGroup".to_string(),
+                "IP-CIDR".to_string(),
+                String::new(),
+            ],
+            |_| false,
+        );
+        // Empty bypass falls back to the crate defaults, which do cover 10/8.
+        warn_on_bypassed_rules(&[], &["IP-CIDR,10.42.0.0/16,SomeGroup".to_string()], |_| {
+            false
+        });
+        // A group that resolves to DIRECT is not a conflict, so it must not warn.
+        warn_on_bypassed_rules(
+            &[],
+            &["IP-CIDR,10.42.0.0/16,GlobalDirect,no-resolve".to_string()],
+            |action| action == "GlobalDirect",
+        );
+    }
     use super::*;
     use clashx_rs_config::types::{GroupType, Proxy, ProxyGroup, Socks5Proxy};
     use clashx_rs_rule::MatchInput;

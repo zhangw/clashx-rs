@@ -69,6 +69,10 @@ enum Command {
         /// If mmdb is missing, download it in the background after proxy starts
         #[arg(long = "mmdb-auto-download")]
         mmdb_auto_download: bool,
+        /// Set the system proxy while running, and restore it on exit.
+        /// Overrides `sysproxy` in the config file.
+        #[arg(long = "sysproxy")]
+        sysproxy: bool,
     },
     /// Stop the running daemon
     Stop,
@@ -205,6 +209,7 @@ fn main() -> Result<()> {
             selections,
             mmdb,
             mmdb_auto_download,
+            sysproxy,
         } => {
             rustls::crypto::ring::default_provider()
                 .install_default()
@@ -213,9 +218,21 @@ fn main() -> Result<()> {
                 .map(|p| expand_tilde(&p))
                 .unwrap_or_else(paths::default_mmdb_path);
             if daemon {
-                daemon::start_background(&config_path, &selections, mmdb_path, mmdb_auto_download)?;
+                daemon::start_background(
+                    &config_path,
+                    &selections,
+                    mmdb_path,
+                    mmdb_auto_download,
+                    sysproxy,
+                )?;
             } else {
-                daemon::start_foreground(&config_path, &selections, mmdb_path, mmdb_auto_download)?;
+                daemon::start_foreground(
+                    &config_path,
+                    &selections,
+                    mmdb_path,
+                    mmdb_auto_download,
+                    sysproxy,
+                )?;
             }
         }
 
@@ -262,7 +279,8 @@ fn main() -> Result<()> {
                         .map(|c| c.skip_proxy)
                         .unwrap_or_default()
                 };
-                SysProxy::new(ctrl_port).enable_with_bypass(&bypass_rules)?;
+                SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path())
+                    .enable_with_bypass(&bypass_rules)?;
                 if bypass_rules.is_empty() {
                     println!("system proxy enabled on port {ctrl_port} (default bypass rules)");
                 } else {
@@ -273,11 +291,11 @@ fn main() -> Result<()> {
                 }
             }
             SysproxyAction::Off => {
-                SysProxy::new(ctrl_port).disable()?;
+                SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).turn_off()?;
                 println!("system proxy disabled");
             }
             SysproxyAction::Status => {
-                let status = SysProxy::new(ctrl_port).status()?;
+                let status = SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).status()?;
                 println!("{status}");
             }
         },

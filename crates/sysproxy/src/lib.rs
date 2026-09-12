@@ -4,14 +4,21 @@ mod linux;
 mod macos;
 
 use anyhow::Result;
+use std::path::PathBuf;
 
 pub struct SysProxy {
     port: u16,
+    /// Where the pre-enable settings are recorded so `disable` can restore
+    /// them. Only macOS mutates persistent state, so only macOS reads it.
+    snapshot_path: PathBuf,
 }
 
 impl SysProxy {
-    pub fn new(port: u16) -> Self {
-        SysProxy { port }
+    pub fn new(port: u16, snapshot_path: PathBuf) -> Self {
+        SysProxy {
+            port,
+            snapshot_path,
+        }
     }
 
     pub fn enable(&self) -> Result<()> {
@@ -20,7 +27,7 @@ impl SysProxy {
 
     pub fn enable_with_bypass(&self, bypass: &[String]) -> Result<()> {
         #[cfg(target_os = "macos")]
-        return macos::enable(self.port, bypass);
+        return macos::enable(self.port, bypass, &self.snapshot_path);
         #[cfg(target_os = "linux")]
         {
             if !bypass.is_empty() {
@@ -38,7 +45,18 @@ impl SysProxy {
 
     pub fn disable(&self) -> Result<()> {
         #[cfg(target_os = "macos")]
-        return macos::disable();
+        return macos::disable(self.port, &self.snapshot_path);
+        #[cfg(target_os = "linux")]
+        return linux::disable();
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        Ok(())
+    }
+
+    /// Switch the system proxy off outright, whoever set it — the explicit
+    /// `sysproxy off` request, as opposed to [`Self::disable`]'s cleanup.
+    pub fn turn_off(&self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        return macos::turn_off(&self.snapshot_path);
         #[cfg(target_os = "linux")]
         return linux::disable();
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
