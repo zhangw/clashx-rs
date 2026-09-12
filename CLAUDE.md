@@ -26,7 +26,7 @@ Single binary, two modes (daemon + CLI client) in a Cargo workspace: `crates/` h
 - **Rule matching**: DOMAIN-SUFFIX uses dot-boundary check (`foo.com` matches `a.foo.com` but not `afoo.com`)
 - **Control socket**: `~/.config/clashx-rs/clashx-rs.sock` with JSON request-response
 - **DNS resolution**: mihomo-compatible `dns:` block drives rule/DIRECT resolution and proxy-server dialing (UDP/DoH/DoT race, bootstrap, hosts, fail-open system fallback) — see `docs/dns-resolver-design.md`
-- **System proxy cleanup**: signal handlers (SIGTERM/SIGINT) always unset macOS system proxy before exit
+- **System proxy**: opt-in via `--sysproxy` / `sysproxy: true`, off by default. When on, the pre-existing settings are snapshotted to `sysproxy-snapshot.json` and restored on exit (SIGTERM/SIGINT both reach the cleanup path); a service whose proxy points at another port is left alone
 - **Config compatibility**: unknown YAML fields are ignored, not rejected — subscription provider configs work unmodified
 
 ## Protocols in Scope (v1)

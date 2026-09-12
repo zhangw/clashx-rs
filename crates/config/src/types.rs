@@ -31,6 +31,11 @@ pub struct Config {
     pub rules: Vec<String>,
     #[serde(default)]
     pub skip_proxy: Vec<String>,
+
+    /// Set the macOS system proxy while the daemon runs. Off unless asked for:
+    /// it mutates global network settings that outlive a crashed process.
+    #[serde(default)]
+    pub sysproxy: Option<bool>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }

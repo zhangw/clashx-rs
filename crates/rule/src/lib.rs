@@ -243,7 +243,8 @@ fn matches_rule(
     }
 }
 
-fn ip_in_cidr(addr: IpAddr, network: IpAddr, prefix_len: u8) -> bool {
+/// Whether `addr` falls inside `network/prefix_len`.
+pub fn ip_in_cidr(addr: IpAddr, network: IpAddr, prefix_len: u8) -> bool {
     match (addr, network) {
         (IpAddr::V4(a), IpAddr::V4(n)) => ipv4_in_cidr(a, n, prefix_len),
         (IpAddr::V6(a), IpAddr::V6(n)) => ipv6_in_cidr(a, n, prefix_len),
