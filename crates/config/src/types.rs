@@ -19,6 +19,10 @@ pub struct Config {
     pub external_controller: Option<String>,
     #[serde(default)]
     pub dns: Option<DnsConfig>,
+    /// Static host-to-IP mappings (mihomo `hosts:`). Values must be IP
+    /// literals; enforcement lives in the dns crate.
+    #[serde(default)]
+    pub hosts: HashMap<String, String>,
     #[serde(default)]
     pub proxies: Vec<Proxy>,
     #[serde(default)]
@@ -64,6 +68,13 @@ pub struct DnsConfig {
     pub nameserver: Vec<String>,
     #[serde(default)]
     pub default_nameserver: Vec<String>,
+    /// Dedicated nameservers for resolving proxy server domains. Empty falls
+    /// back to the main `nameserver` group.
+    #[serde(default)]
+    pub proxy_server_nameserver: Vec<String>,
+    /// Whether the top-level `hosts:` mappings apply. Absent means enabled.
+    #[serde(default)]
+    pub use_hosts: Option<bool>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }
@@ -311,6 +322,69 @@ proxy-groups:
         assert_eq!(hc.url, "http://cp.cloudflare.com/generate_204");
         assert_eq!(hc.interval, 60);
         assert_eq!(hc.expected_status, 204);
+    }
+
+    #[test]
+    fn parse_dns_config_full_keys() {
+        let yaml = r#"
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+  nameserver:
+    - 223.5.5.5
+    - https://dns.example.com/dns-query
+    - tls://dot.example.com
+  default-nameserver:
+    - 119.29.29.29
+  proxy-server-nameserver:
+    - https://doh.example.net/dns-query
+  use-hosts: false
+hosts:
+  example.com: 1.2.3.4
+  "*.internal.example.com": 10.0.0.1
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let dns = config.dns.as_ref().unwrap();
+        assert!(dns.enable);
+        assert!(!dns.ipv6);
+        assert_eq!(dns.enhanced_mode.as_deref(), Some("fake-ip"));
+        assert_eq!(dns.nameserver.len(), 3);
+        assert_eq!(dns.default_nameserver, vec!["119.29.29.29"]);
+        assert_eq!(
+            dns.proxy_server_nameserver,
+            vec!["https://doh.example.net/dns-query"]
+        );
+        assert_eq!(dns.use_hosts, Some(false));
+        // fake-ip keys stay in extra — parsed but not interpreted.
+        assert!(dns.extra.contains_key("fake-ip-range"));
+        assert!(dns.extra.contains_key("fake-ip-filter"));
+        assert_eq!(
+            config.hosts.get("example.com").map(String::as_str),
+            Some("1.2.3.4")
+        );
+        assert_eq!(
+            config
+                .hosts
+                .get("*.internal.example.com")
+                .map(String::as_str),
+            Some("10.0.0.1")
+        );
+    }
+
+    #[test]
+    fn dns_config_defaults_when_keys_absent() {
+        let yaml = "dns:\n  enable: true\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let dns = config.dns.as_ref().unwrap();
+        assert!(dns.nameserver.is_empty());
+        assert!(dns.proxy_server_nameserver.is_empty());
+        // Absent use-hosts means enabled (dns crate treats None as true).
+        assert_eq!(dns.use_hosts, None);
+        assert!(config.hosts.is_empty());
     }
 
     #[test]

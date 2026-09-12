@@ -25,6 +25,7 @@ Single binary, two modes (daemon + CLI client) in a Cargo workspace: `crates/` h
 - **Trojan protocol**: SHA-224(password) hex-encoded as auth, TLS with configurable SNI, no server response before relay
 - **Rule matching**: DOMAIN-SUFFIX uses dot-boundary check (`foo.com` matches `a.foo.com` but not `afoo.com`)
 - **Control socket**: `~/.config/clashx-rs/clashx-rs.sock` with JSON request-response
+- **DNS resolution**: mihomo-compatible `dns:` block drives rule/DIRECT resolution and proxy-server dialing (UDP/DoH/DoT race, bootstrap, hosts, fail-open system fallback) — see `docs/dns-resolver-design.md`
 - **System proxy cleanup**: signal handlers (SIGTERM/SIGINT) always unset macOS system proxy before exit
 - **Config compatibility**: unknown YAML fields are ignored, not rejected — subscription provider configs work unmodified
 

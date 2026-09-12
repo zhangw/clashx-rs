@@ -125,6 +125,21 @@ enum Command {
         #[command(subcommand)]
         action: SubscribeAction,
     },
+    /// Manage the DNS cache
+    Dns {
+        #[command(subcommand)]
+        action: DnsAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DnsAction {
+    /// Flush the DNS cache (all entries, or a single host with --host)
+    Flush {
+        /// Only invalidate this hostname
+        #[arg(long)]
+        host: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -309,6 +324,28 @@ fn main() -> Result<()> {
         Command::Subscribe { action } => {
             run_subscribe(action, ctrl_port)?;
         }
+
+        Command::Dns { action } => match action {
+            DnsAction::Flush { host } => {
+                let data = client::send_command_with_data(
+                    ControlRequest::DnsFlush { host: host.clone() },
+                    ctrl_port,
+                )?;
+                match host {
+                    Some(h) => {
+                        if data["hit"].as_bool().unwrap_or(false) {
+                            println!("invalidated dns cache entry for '{h}'");
+                        } else {
+                            println!("no dns cache entry for '{h}'");
+                        }
+                    }
+                    None => {
+                        let n = data["flushed"].as_u64().unwrap_or(0);
+                        println!("dns cache flushed ({n} entries)");
+                    }
+                }
+            }
+        },
     }
 
     Ok(())

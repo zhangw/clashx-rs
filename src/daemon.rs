@@ -59,29 +59,17 @@ pub(crate) struct DaemonState {
     startup_overrides: Vec<(String, String)>,
     cooldown: Arc<crate::retry::CooldownTracker>,
     mmdb_path: PathBuf,
-    nameservers: Arc<[IpAddr]>,
-    dns_cache: Arc<clashx_rs_dns::DnsCache>,
+    /// Resolver for target hostnames (rule pre-resolve + DIRECT).
+    resolver: Arc<clashx_rs_dns::Resolver>,
+    /// Resolver for proxy server addresses (proxy-server-nameserver group,
+    /// falling back to the main nameserver group).
+    proxy_resolver: Arc<clashx_rs_dns::Resolver>,
 }
 
 impl DaemonState {
     fn from_config(config: Config, config_path: PathBuf, mmdb_path: PathBuf) -> Self {
-        // Extract plain IP nameservers from dns config for direct DNS queries.
-        // Skip DoH/DoT URLs — only use plain IPs (e.g., 223.5.5.5, 119.29.29.29).
-        let nameservers: Arc<[IpAddr]> = config
-            .dns
-            .as_ref()
-            .map(|d| {
-                d.nameserver
-                    .iter()
-                    .chain(d.default_nameserver.iter())
-                    .filter_map(|s| s.parse::<IpAddr>().ok())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-            .into();
-        if !nameservers.is_empty() {
-            tracing::info!(?nameservers, "using config nameservers for DNS pre-resolve");
-        }
+        let (resolver, proxy_resolver) = clashx_rs_dns::build_resolvers(&config);
+        let (resolver, proxy_resolver) = (Arc::new(resolver), Arc::new(proxy_resolver));
 
         let geoip_db = match GeoIpDb::open(&mmdb_path) {
             Ok(db) => {
@@ -119,9 +107,14 @@ impl DaemonState {
             startup_overrides: Vec::new(),
             cooldown: Arc::new(crate::retry::CooldownTracker::new()),
             mmdb_path,
-            nameservers,
-            dns_cache: Arc::new(clashx_rs_dns::DnsCache::new()),
+            resolver,
+            proxy_resolver,
         }
+    }
+
+    /// Shared proxy-server resolver, for the probe/latency paths.
+    pub(crate) fn proxy_resolver_handle(&self) -> Arc<clashx_rs_dns::Resolver> {
+        Arc::clone(&self.proxy_resolver)
     }
 
     /// Validate that `group` exists and `proxy` is a member, then set the selection.
@@ -640,11 +633,11 @@ async fn handle_connection(
 
     let parsed_ip: Option<std::net::IpAddr> = target_host.parse().ok();
 
-    let (nameservers, dns_cache, rule_engine, mode) = {
+    let (resolver, proxy_resolver, rule_engine, mode) = {
         let st = state.read().await;
         (
-            Arc::clone(&st.nameservers),
-            Arc::clone(&st.dns_cache),
+            Arc::clone(&st.resolver),
+            Arc::clone(&st.proxy_resolver),
             Arc::clone(&st.rule_engine),
             st.config.mode,
         )
@@ -691,13 +684,7 @@ async fn handle_connection(
                     need_process,
                 } => {
                     if need_ip {
-                        ip = match clashx_rs_dns::resolve_with_nameservers(
-                            &target_host,
-                            &nameservers,
-                            &dns_cache,
-                        )
-                        .await
-                        {
+                        ip = match resolver.resolve(&target_host).await {
                             Ok(r) => {
                                 tracing::debug!(host = %target_host, resolved = %r, "DNS pre-resolved");
                                 Some(r)
@@ -783,8 +770,17 @@ async fn handle_connection(
             Ok(())
         }
         "DIRECT" => {
+            // Unified DIRECT resolution: when the rule phase didn't need an
+            // IP (no IP/GEOIP rule matched), resolve the domain through the
+            // configured resolver now so direct::connect can dial a literal
+            // SocketAddr. On failure, direct::connect falls back to tokio's
+            // getaddrinfo.
+            let mut direct_ip = resolved_ip;
+            if direct_ip.is_none() {
+                direct_ip = resolve_server(&resolver, &target_host).await;
+            }
             let outbound = connect_with_retry("DIRECT", &target_host, || {
-                outbound::direct::connect(&target, resolved_ip)
+                outbound::direct::connect(&target, direct_ip)
             })
             .await?;
             relay_streams(inbound_stream, outbound, initial_data, None).await?;
@@ -812,7 +808,7 @@ async fn handle_connection(
                 }
 
                 let mut outbound = match connect_with_retry(cand_name, &target_host, || {
-                    connect_outbound(cand_proxy, &target)
+                    connect_outbound(cand_proxy, &target, &proxy_resolver)
                 })
                 .await
                 {
@@ -950,12 +946,19 @@ async fn handle_connection(
 }
 
 /// Attempt a single outbound connection to the given proxy.
+///
+/// The proxy server address is resolved through the proxy resolver
+/// (`proxy-server-nameserver` group, falling back to the main nameserver
+/// group; hosts mappings apply). On resolution failure the connectors fall
+/// back to tokio's getaddrinfo — never fail the connection over DNS.
 pub(crate) async fn connect_outbound(
     proxy: &Proxy,
     target: &clashx_rs_proxy::inbound::TargetAddr,
+    proxy_resolver: &clashx_rs_dns::Resolver,
 ) -> Result<OutboundStream> {
     match proxy {
         Proxy::Trojan(tp) => {
+            let resolved_server_ip = resolve_server(proxy_resolver, &tp.server).await;
             outbound::trojan::connect(
                 &tp.server,
                 tp.port,
@@ -963,21 +966,45 @@ pub(crate) async fn connect_outbound(
                 tp.sni.as_deref(),
                 tp.skip_cert_verify,
                 target,
+                resolved_server_ip,
             )
             .await
         }
         Proxy::Socks5(sp) => {
+            let resolved_server_ip = resolve_server(proxy_resolver, &sp.server).await;
             outbound::socks5::connect(
                 &sp.server,
                 sp.port,
                 target,
                 sp.username.as_deref(),
                 sp.password.as_deref(),
+                resolved_server_ip,
             )
             .await
         }
         Proxy::Unknown => {
             anyhow::bail!("unsupported proxy type");
+        }
+    }
+}
+
+/// Resolve the address we're about to dial via `resolver`. Failures yield
+/// None — the connector then falls back to the system resolver rather than
+/// failing the connection over DNS. IP literals short-circuit inside
+/// `Resolver::resolve`.
+async fn resolve_server(
+    resolver: &clashx_rs_dns::Resolver,
+    server: &str,
+) -> Option<std::net::IpAddr> {
+    match resolver.resolve(server).await {
+        Ok(ip) => Some(ip),
+        Err(e) => {
+            tracing::debug!(
+                server,
+                err = %e,
+                "resolve failed, connector will use the system resolver"
+            );
+            None
         }
     }
 }
@@ -1385,13 +1412,39 @@ async fn dispatch_control(
         }
 
         ControlRequest::Latency { full } => {
-            let proxies: Vec<Proxy> = state.read().await.proxies.values().cloned().collect();
+            let (proxies, proxy_resolver) = {
+                let st = state.read().await;
+                (
+                    st.proxies.values().cloned().collect::<Vec<Proxy>>(),
+                    st.proxy_resolver_handle(),
+                )
+            };
             let results = if full {
-                crate::latency::measure_full(proxies).await
+                crate::latency::measure_full(proxies, proxy_resolver).await
             } else {
                 crate::latency::measure_tcp(&proxies).await
             };
             ControlResponse::success(serde_json::to_value(&results).unwrap_or_default())
+        }
+
+        ControlRequest::DnsFlush { host } => {
+            let st = state.read().await;
+            // Flush both resolvers (target + proxy-server). The bootstrap
+            // cache is intentionally not exposed — a reload clears it.
+            match host {
+                Some(host) => {
+                    let hit_target = st.resolver.invalidate(&host).await;
+                    let hit_proxy = st.proxy_resolver.invalidate(&host).await;
+                    ControlResponse::success(json!({
+                        "host": host,
+                        "hit": hit_target || hit_proxy,
+                    }))
+                }
+                None => {
+                    let flushed = st.resolver.clear().await + st.proxy_resolver.clear().await;
+                    ControlResponse::success(json!({ "flushed": flushed }))
+                }
+            }
         }
     }
 }

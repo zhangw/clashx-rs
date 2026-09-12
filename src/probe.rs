@@ -114,11 +114,12 @@ async fn probe_once(
     proxy: &clashx_rs_config::types::Proxy,
     target: &ProbeTarget,
     expected_status: u16,
+    proxy_resolver: &clashx_rs_dns::Resolver,
 ) -> Result<Duration> {
     let start = Instant::now();
     tokio::time::timeout(PROBE_TIMEOUT, async {
         let addr = TargetAddr::Domain(target.host.clone(), target.port);
-        let stream = connect_outbound(proxy, &addr).await?;
+        let stream = connect_outbound(proxy, &addr, proxy_resolver).await?;
         let status = match stream {
             OutboundStream::Tcp(mut s) => http_status_exchange(&mut s, target).await?,
             OutboundStream::Tls(mut s) => http_status_exchange(&mut *s, target).await?,
@@ -139,12 +140,13 @@ async fn probe_with_confirm(
     proxy: &clashx_rs_config::types::Proxy,
     target: &ProbeTarget,
     expected_status: u16,
+    proxy_resolver: &clashx_rs_dns::Resolver,
 ) -> bool {
     for attempt in 0..2 {
         if attempt > 0 {
             tokio::time::sleep(CONFIRM_BACKOFF).await;
         }
-        match probe_once(proxy, target, expected_status).await {
+        match probe_once(proxy, target, expected_status, proxy_resolver).await {
             Ok(latency) => {
                 tracing::debug!(proxy = %name, latency_ms = %latency.as_millis(), "health probe succeeded");
                 return true;
@@ -286,12 +288,13 @@ pub async fn run(state: Arc<RwLock<DaemonState>>) {
     let mut prev_cooldown: Option<Arc<CooldownTracker>> = None;
 
     loop {
-        let (schedule, interval_secs, cooldown) = {
+        let (schedule, interval_secs, cooldown, proxy_resolver) = {
             let st = state.read().await;
             (
                 st.probe_schedule(),
                 st.probe_interval_secs(),
                 st.cooldown_handle(),
+                st.proxy_resolver_handle(),
             )
         };
         let recheck = Duration::from_secs(UNHEALTHY_RECHECK_SECS);
@@ -387,10 +390,18 @@ pub async fn run(state: Arc<RwLock<DaemonState>>) {
             for (name, proxy, target, expected_status) in due {
                 let cd: Arc<CooldownTracker> = Arc::clone(&cooldown);
                 let sem = Arc::clone(&sem);
+                let proxy_resolver = Arc::clone(&proxy_resolver);
                 set.spawn(async move {
                     let _permit = sem.acquire().await;
                     let was_sidelined = cd.is_sidelined(&name);
-                    let healthy = probe_with_confirm(&name, &proxy, &target, expected_status).await;
+                    let healthy = probe_with_confirm(
+                        &name,
+                        &proxy,
+                        &target,
+                        expected_status,
+                        &proxy_resolver,
+                    )
+                    .await;
                     (name, healthy, was_sidelined)
                 });
             }

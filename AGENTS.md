@@ -26,6 +26,13 @@ Current implemented shape:
   - `rule`
   - `global`
   - `direct`
+- DNS as a first-class data-plane subsystem (mihomo-compatible keys):
+  - `dns.nameserver` supports plain UDP (bare IP / `udp://`), DoH (`https://`), DoT (`tls://`); unknown schemes are warned about and skipped
+  - all nameservers failing falls back to the system resolver (fail-open)
+  - top-level `hosts:` mappings (exact + `*.suffix`, IP-literal values) honored unless `use-hosts: false`
+  - `proxy-server-nameserver` resolves proxy server domains via a dedicated resolver (bootstrap shared, hosts apply); falls back to the main nameserver group
+  - `default-nameserver` bootstraps DoH/DoT server hostnames (plain UDP only, never the main group)
+  - `dns flush [--host]` clears both resolver caches (see docs/dns-resolver-design.md)
 - startup proxy-group selection overrides:
   - `clashx-rs run --select GROUP=PROXY`
 - active node-liveness probes:
@@ -45,7 +52,10 @@ Current implemented shape:
 ## Current Caveats
 
 - `clashx-rs run -d` is not implemented
-- DNS config is parsed, but DNS policy is not yet a first-class data-plane subsystem
+- `dns.enable=false` → system resolver for everything, `hosts:` ignored
+- `ipv6: true` behaves as `false` (AAAA never queried); pure-IPv6 system results are discarded
+- `enhanced-mode: fake-ip` parses but degrades to plain mode with a one-time warning
+- health-probe reachability pre-check (`server_is_probeable`) and `latency --tcp` still use the system resolver, so they can disagree with the configured DNS policy
 - `PROCESS-NAME` lookup is best-effort and relatively expensive
 - `allow-lan` exposes an unauthenticated proxy on the configured bind address
 - `sysproxy` CLI currently hardcodes the default port `7890` instead of resolving the daemon’s configured port
@@ -72,7 +82,7 @@ Current implemented shape:
 - `crates/rule`
   rule parsing/evaluation and process lookup helpers
 - `crates/dns`
-  system resolver helper
+  mihomo-compatible resolver: UDP/DoH/DoT upstreams, bootstrap, hosts, caches (see docs/dns-resolver-design.md)
 - `crates/proxy`
   inbound protocol handling, outbound connectors, relay, timeouts
 - `crates/sysproxy`
@@ -132,6 +142,6 @@ Typical review outputs should be written to:
 ## Avoid Wrong Assumptions
 
 - Do not assume GUI, TUN, REST API, or fake-IP support exists.
-- Do not assume DNS config actively controls outbound resolution.
+- Do not assume `dns.ipv6` issues AAAA queries — it currently behaves as `false`; see docs/dns-resolver-design.md for the resolver design.
 - Do not assume background daemon mode works.
 - Do not assume `sysproxy` follows the daemon’s configured port unless that behavior has been explicitly changed and verified.
