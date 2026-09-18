@@ -141,6 +141,8 @@ Lint:
 cargo clippy --all-targets -- -D warnings
 ```
 
+For an existing macOS LaunchAgent installation, see [local deployment and service management](docs/local-macos-deployment.md).
+
 ## Usage
 
 Show help:
