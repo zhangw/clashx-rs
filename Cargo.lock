@@ -244,6 +244,7 @@ dependencies = [
  "clashx-rs-subscribe",
  "clashx-rs-sysproxy",
  "dirs",
+ "libc",
  "rustls",
  "serde",
  "serde_json",

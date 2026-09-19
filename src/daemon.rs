@@ -16,7 +16,7 @@ use clashx_rs_rule::{MatchInput, RuleEngine};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::RwLock;
 
 use crate::control::{ControlRequest, ControlResponse};
 use crate::paths::{self, DEFAULT_MIXED_PORT};
@@ -33,11 +33,6 @@ fn match_input_from_host(host: &str) -> MatchInput<'_> {
         ..Default::default()
     }
 }
-
-/// Max concurrent connections before admission control starts rejecting.
-/// For a desktop local proxy this is far above normal browser workloads
-/// (hundreds of parallel fetches). Abusive/buggy clients are bounded here.
-const MAX_CONCURRENT_CONNECTIONS: usize = 2048;
 
 struct MatchedRuleDebug<'a>(Option<&'a clashx_rs_config::rule::RuleEntry>);
 
@@ -505,6 +500,7 @@ async fn run_daemon(
     mmdb_auto_download: bool,
     sysproxy_flag: bool,
 ) -> Result<()> {
+    let budget = crate::resources::initialize()?;
     let config = load_config(config_path)?;
     let port = config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT);
     let allow_lan = config.allow_lan.unwrap_or(false);
@@ -662,18 +658,25 @@ async fn run_daemon(
 
     let ctrl_state = Arc::clone(&state);
     tokio::spawn(async move {
+        let mut overload = crate::resources::OverloadLog::default();
         loop {
             match control_listener.accept().await {
                 Ok((stream, _addr)) => {
+                    let Ok(permit) = budget.controls.clone().try_acquire_owned() else {
+                        overload.record("control connection limit reached");
+                        drop(stream);
+                        continue;
+                    };
                     let s = Arc::clone(&ctrl_state);
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = handle_control(stream, s).await {
                             tracing::warn!(error = %e, "control handler error");
                         }
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "control accept error");
+                    overload.accept_error(&e).await;
                 }
             }
         }
@@ -687,8 +690,9 @@ async fn run_daemon(
     });
 
     let proxy_state = Arc::clone(&state);
-    let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let connection_limit = Arc::clone(&budget.connections);
     tokio::spawn(async move {
+        let mut overload = crate::resources::OverloadLog::default();
         loop {
             match proxy_listener.accept().await {
                 Ok((stream, addr)) => {
@@ -698,11 +702,7 @@ async fn run_daemon(
                     let permit = match connection_limit.clone().try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
-                            tracing::warn!(
-                                peer = %addr,
-                                limit = MAX_CONCURRENT_CONNECTIONS,
-                                "connection limit reached, dropping incoming connection"
-                            );
+                            overload.record("data connection limit reached");
                             drop(stream);
                             continue;
                         }
@@ -716,7 +716,7 @@ async fn run_daemon(
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "proxy accept error");
+                    overload.accept_error(&e).await;
                 }
             }
         }
@@ -1404,7 +1404,11 @@ async fn handle_control(
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    while let Some(line) = lines.next_line().await? {
+    // Bound idle control clients without imposing a deadline on commands
+    // such as full latency measurement or subscription updates.
+    while let Some(line) =
+        tokio::time::timeout(Duration::from_secs(10), lines.next_line()).await??
+    {
         let request: ControlRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -1427,7 +1431,11 @@ async fn send_response(
 ) -> Result<()> {
     let mut payload = serde_json::to_string(resp)?;
     payload.push('\n');
-    writer.write_all(payload.as_bytes()).await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        writer.write_all(payload.as_bytes()),
+    )
+    .await??;
     Ok(())
 }
 
@@ -1463,6 +1471,7 @@ async fn dispatch_control(
                 "rule_count": rule_count,
                 "group_count": group_count,
                 "selections": selections,
+                "resources": crate::resources::status(),
             }))
         }
 

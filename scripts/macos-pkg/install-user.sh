@@ -60,6 +60,7 @@ trap cleanup EXIT
 install -m 755 "$payload/clashx-rs" "$transaction/new-binary"
 if ! $fresh; then
     cp -p "$binary" "$transaction/old-binary"
+    cp -p "$plist" "$transaction/old-plist"
     [[ ! -f "$helper" ]] || cp -p "$helper" "$transaction/old-helper"
     [[ ! -f "$app_dir/package-info.txt" ]] || cp -p "$app_dir/package-info.txt" "$transaction/old-info"
 fi
@@ -72,6 +73,14 @@ fi
 wait_ready() {
     for ((attempt = 0; attempt < 30; attempt++)); do
         if "$binary" --config "$config" status >/dev/null 2>&1; then return 0; fi
+        sleep 1
+    done
+    return 1
+}
+
+wait_stopped() {
+    for ((attempt = 0; attempt < 30; attempt++)); do
+        if ! launchctl print "$service" >/dev/null 2>&1; then return 0; fi
         sleep 1
     done
     return 1
@@ -90,6 +99,7 @@ rollback() {
     local failed=false
     if launchctl print "$service" >/dev/null 2>&1; then
         launchctl bootout "$service" || failed=true
+        wait_stopped || failed=true
     fi
     if $fresh; then
         if ! $failed && [[ -x "$binary" ]]; then
@@ -106,6 +116,7 @@ rollback() {
             rm -f "$config_dir"/clashx-rs-*.sock "$config_dir"/clashx-rs-*.pid || failed=true
         fi
     else
+        cp -p "$transaction/old-plist" "$plist" || failed=true
         cp -p "$transaction/old-binary" "$transaction/rollback-binary" &&
             mv -f "$transaction/rollback-binary" "$binary" || failed=true
         if [[ -f "$transaction/old-helper" ]]; then
@@ -132,7 +143,7 @@ rollback() {
 }
 trap rollback ERR INT TERM
 
-if $was_loaded; then launchctl bootout "$service"; fi
+if $was_loaded; then launchctl bootout "$service"; wait_stopped; fi
 if $fresh; then
     mkdir -p "$config_dir" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/clashx-rs"
     chmod 700 "$config_dir"
@@ -144,6 +155,14 @@ if $fresh; then
     install -m 644 "$payload/launchagent.plist" "$plist"
 fi
 mv -f "$transaction/new-binary" "$binary"
+fd_soft=$(/usr/libexec/PlistBuddy -c 'Print :SoftResourceLimits:NumberOfFiles' "$plist" 2>/dev/null || echo 0)
+fd_hard=$(/usr/libexec/PlistBuddy -c 'Print :HardResourceLimits:NumberOfFiles' "$plist" 2>/dev/null || echo 8192)
+fd_target=8192
+if [[ "$fd_hard" -ge 0 && "$fd_hard" -lt "$fd_target" ]]; then fd_target=$fd_hard; fi
+if [[ "$fd_soft" -ge 0 && "$fd_soft" -lt "$fd_target" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :SoftResourceLimits:NumberOfFiles $fd_target" "$plist" 2>/dev/null ||
+        /usr/libexec/PlistBuddy -c "Add :SoftResourceLimits:NumberOfFiles integer $fd_target" "$plist"
+fi
 install -m 755 "$payload/local-service.sh" "$helper"
 install -m 600 "$payload/package-info.txt" "$app_dir/package-info.txt"
 if $fresh; then launchctl enable "$service"; fi

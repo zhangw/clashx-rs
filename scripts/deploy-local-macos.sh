@@ -42,6 +42,7 @@ PYTHON
 # Stage on the same filesystem; never overwrite an executable in use.
 install -m 755 "$artifact" "$binary.new"
 cp -p "$binary" "$binary.previous"
+cp -p "$plist" "$deploy_tmp/previous.plist"
 # Capture immediately before stopping, after the potentially lengthy build.
 "$binary" --config "$config" status > "$deploy_tmp/status.json"
 python3 - "$deploy_tmp/status.json" <<'PYTHON'
@@ -59,6 +60,16 @@ PYTHON
 wait_ready() {
     for ((attempt = 0; attempt < 30; attempt++)); do
         if "$binary" --config "$config" status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+wait_stopped() {
+    for ((attempt = 0; attempt < 30; attempt++)); do
+        if ! launchctl print "$service" >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
@@ -88,6 +99,8 @@ rollback() {
     trap - ERR
     echo 'Deployment failed; restoring previous binary and selections' >&2
     launchctl bootout "$service" >/dev/null 2>&1 || true
+    wait_stopped || true
+    cp -p "$deploy_tmp/previous.plist" "$plist"
     if mv -f "$binary.previous" "$binary" &&
         launchctl bootstrap "gui/$(id -u)" "$plist" &&
         wait_ready && restore_selections; then
@@ -99,6 +112,15 @@ rollback() {
 }
 trap rollback ERR
 launchctl bootout "$service"
+wait_stopped
+fd_soft=$(/usr/libexec/PlistBuddy -c 'Print :SoftResourceLimits:NumberOfFiles' "$plist" 2>/dev/null || echo 0)
+fd_hard=$(/usr/libexec/PlistBuddy -c 'Print :HardResourceLimits:NumberOfFiles' "$plist" 2>/dev/null || echo 8192)
+fd_target=8192
+if [[ "$fd_hard" -ge 0 && "$fd_hard" -lt "$fd_target" ]]; then fd_target=$fd_hard; fi
+if [[ "$fd_soft" -ge 0 && "$fd_soft" -lt "$fd_target" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :SoftResourceLimits:NumberOfFiles $fd_target" "$plist" 2>/dev/null ||
+        /usr/libexec/PlistBuddy -c "Add :SoftResourceLimits:NumberOfFiles integer $fd_target" "$plist"
+fi
 mv -f "$binary.new" "$binary"
 launchctl bootstrap "gui/$(id -u)" "$plist"
 wait_ready

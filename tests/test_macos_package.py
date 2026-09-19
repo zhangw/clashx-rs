@@ -148,13 +148,18 @@ state_path.write_text(json.dumps(data))
         self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
         return result
 
-    def assert_preserved(self):
+    def assert_preserved(self, upgraded=False):
         self.assertEqual(self.config.read_text(), 'target custom config\n')
         self.assertEqual((self.config.parent / 'subscriptions.yaml').read_text(), 'target subscriptions\n')
-        self.assertEqual(self.plist.read_bytes(), (self.payload / 'launchagent.plist').read_bytes())
+        expected = plistlib.loads((self.payload / 'launchagent.plist').read_bytes())
+        if upgraded:
+            expected['SoftResourceLimits'] = {'NumberOfFiles': 8192}
+        self.assertEqual(plistlib.loads(self.plist.read_bytes()), expected)
 
     def test_first_install(self):
         self.run_install()
+        self.assertEqual(plistlib.loads(self.plist.read_bytes())['SoftResourceLimits'],
+                         {'NumberOfFiles': 8192})
         self.assertEqual(self.config.read_text(), 'source config\n')
         self.assertTrue(json.loads(self.state.read_text())['loaded'])
         self.assertIn("VERSION = 'new'", self.binary.read_text().splitlines())
@@ -164,7 +169,7 @@ state_path.write_text(json.dumps(data))
     def test_upgrade_preserves_configuration_and_unicode_selections(self):
         self.existing()
         self.run_install()
-        self.assert_preserved()
+        self.assert_preserved(upgraded=True)
         data = json.loads(self.state.read_text())
         # launchd resets choices; restore must produce exactly the saved mapping.
         self.assertEqual(data['selections'], SELECTED)
@@ -174,7 +179,7 @@ state_path.write_text(json.dumps(data))
     def test_upgrade_preserves_disabled_and_stopped_state(self):
         self.existing(loaded=False, disabled=True)
         self.run_install()
-        self.assert_preserved()
+        self.assert_preserved(upgraded=True)
         data = json.loads(self.state.read_text())
         self.assertFalse(data['loaded'])
         self.assertTrue(data['disabled'])
@@ -183,11 +188,34 @@ state_path.write_text(json.dumps(data))
 
     def test_bootstrap_failure_rolls_back(self):
         self.existing()
+        previous_plist = self.plist.read_bytes()
         result = self.run_install(fail='bootstrap', success=False)
+        self.assertEqual(self.plist.read_bytes(), previous_plist)
         self.assert_preserved()
         self.assertIn("VERSION = 'old'", self.binary.read_text().splitlines())
         self.assertEqual(json.loads(self.state.read_text())['selections'], SELECTED)
         self.assertIn('Previous installation state restored.', result.stderr)
+
+    def check_resource_limits(self, soft, hard, expected):
+        self.existing()
+        settings = plistlib.loads(self.plist.read_bytes())
+        settings['SoftResourceLimits'] = {'NumberOfFiles': soft, 'Core': 0}
+        settings['HardResourceLimits'] = {'NumberOfFiles': hard}
+        self.plist.write_bytes(plistlib.dumps(settings))
+        self.run_install()
+        installed = plistlib.loads(self.plist.read_bytes())
+        self.assertEqual(installed['SoftResourceLimits'],
+                         {'NumberOfFiles': expected, 'Core': 0})
+        self.assertEqual(installed['HardResourceLimits'], {'NumberOfFiles': hard})
+
+    def test_resource_limits_raise_soft(self):
+        self.check_resource_limits(256, 16384, 8192)
+
+    def test_resource_limits_preserve_higher_soft(self):
+        self.check_resource_limits(16384, 32768, 16384)
+
+    def test_resource_limits_respect_lower_hard(self):
+        self.check_resource_limits(128, 256, 256)
 
     def test_selection_failure_rolls_back(self):
         self.existing()

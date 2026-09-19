@@ -4,6 +4,7 @@ mod daemon;
 mod latency;
 mod paths;
 mod probe;
+mod resources;
 mod retry;
 
 use std::path::{Path, PathBuf};
