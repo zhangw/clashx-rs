@@ -1,0 +1,30 @@
+#!/bin/bash
+# Installer runs this wrapper as root; all application operations run as vincent.
+set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+scripts_dir="$(cd "$(dirname "$0")" && pwd)"
+fail() { echo "clashx-rs installer: $*" >&2; exit 1; }
+
+[[ "$(id -u)" == 0 ]] || fail 'Administrator authorization is required.'
+[[ "${3:-}" == / ]] || fail 'Only installation on the current startup volume is supported.'
+[[ "$(uname -m)" == arm64 ]] || fail 'An Apple Silicon Mac is required.'
+expected_major="$(cat "$scripts_dir/payload/macos-major")"
+actual_version="$(sw_vers -productVersion)"
+[[ "${actual_version%%.*}" == "$expected_major" ]] || fail "macOS $expected_major is required."
+[[ "$(stat -f %Su /dev/console)" == vincent ]] || fail 'Log into the vincent desktop before installing.'
+target_uid="$(id -u vincent)"
+[[ "$target_uid" -ge 501 ]] || fail 'Invalid target user.'
+[[ "$(dscl . -read /Users/vincent NFSHomeDirectory)" == 'NFSHomeDirectory: /Users/vincent' ]] ||
+    fail 'The vincent home directory must be /Users/vincent.'
+launchctl print "gui/$target_uid" >/dev/null || fail 'The vincent GUI session is unavailable.'
+
+# Installer's extracted scripts may not be traversable by the target user.
+stage="$(mktemp -d /private/tmp/clashx-rs-pkg.XXXXXX)"
+trap 'rm -rf "$stage"' EXIT
+cp -R "$scripts_dir/payload" "$stage/"
+cp "$scripts_dir/install-user.sh" "$scripts_dir/selections.js" "$stage/"
+chown -R "$target_uid:$(id -g vincent)" "$stage"
+chmod 700 "$stage"
+launchctl asuser "$target_uid" /usr/bin/sudo -H -u vincent \
+    /usr/bin/env HOME=/Users/vincent PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    /bin/bash "$stage/install-user.sh"

@@ -195,6 +195,9 @@ enum SysproxyAction {
     },
     /// Disable system proxy
     Off,
+    /// Restore the saved pre-enable settings; leave unrelated proxies unchanged
+    #[cfg(target_os = "macos")]
+    Restore,
     /// Show system proxy status
     Status,
 }
@@ -325,6 +328,11 @@ fn main() -> Result<()> {
             SysproxyAction::Off => {
                 SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).turn_off()?;
                 println!("system proxy disabled");
+            }
+            #[cfg(target_os = "macos")]
+            SysproxyAction::Restore => {
+                SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).disable()?;
+                println!("system proxy snapshot restoration completed");
             }
             SysproxyAction::Status => {
                 let status = SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).status()?;

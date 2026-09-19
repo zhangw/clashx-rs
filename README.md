@@ -141,7 +141,7 @@ Lint:
 cargo clippy --all-targets -- -D warnings
 ```
 
-For an existing macOS LaunchAgent installation, see [local deployment and service management](docs/local-macos-deployment.md).
+For a native macOS installer, see [macOS package installation and upgrades](docs/macos-package.md). For source-based updates to an existing LaunchAgent, see [local deployment and service management](docs/local-macos-deployment.md).
 
 ## Usage
 
@@ -235,7 +235,7 @@ Commands:
   rules
   switch <group> <proxy>
   test <domain>
-  sysproxy on [--bypass <pattern>]... | off | status
+  sysproxy on [--bypass <pattern>]... | off | restore (macOS) | status
   mmdb-download [--proxy <url>] [--url <url>] [--output <path>]
   subscribe add --name <n> --url <u> --output <path> [--interval <secs>]
   subscribe list

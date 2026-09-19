@@ -1,5 +1,7 @@
 # 本机 macOS 部署与服务管理
 
+使用原生安装包首次安装或升级，请参阅 [macOS 安装包](macos-package.md)。
+
 适用于已经安装的 Vincent 用户 LaunchAgent（`com.vincent.clashx-rs`）。登录后启动，退出或崩溃后由 launchd 自动拉起；无需运行 `local-run.sh` 或 `local-sysproxy.sh`。
 
 ## 更新版本
