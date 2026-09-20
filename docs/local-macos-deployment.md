@@ -2,7 +2,7 @@
 
 使用原生安装包首次安装或升级，请参阅 [macOS 安装包](macos-package.md)。
 
-适用于已经安装的 Vincent 用户 LaunchAgent（`com.vincent.clashx-rs`）。登录后启动，退出或崩溃后由 launchd 自动拉起；无需运行 `local-run.sh` 或 `local-sysproxy.sh`。
+适用于当前用户已安装的 LaunchAgent（新安装标识为 `org.clashx-rs.agent`）。脚本按程序路径识别并保留旧安装标识；下方手动命令使用新标识，旧安装请改用实际标识和 plist 路径。登录后启动，退出或崩溃后由 launchd 自动拉起；无需运行 `local-run.sh` 或 `local-sysproxy.sh`。
 
 ## 更新版本
 
@@ -18,7 +18,7 @@
 
 - 二进制：`~/Library/Application Support/clashx-rs/bin/clashx-rs`
 - 上一个版本：同目录下的 `clashx-rs.previous`
-- 启动项：`~/Library/LaunchAgents/com.vincent.clashx-rs.plist`
+- 启动项：`~/Library/LaunchAgents/org.clashx-rs.agent.plist`
 - 配置：`~/.config/clashx-rs/config.yaml`
 - 日志：`~/Library/Logs/clashx-rs/stdout.log` 和 `stderr.log`
 
@@ -43,7 +43,7 @@ curl --proxy http://127.0.0.1:7890 --max-time 20 -o /dev/null -w '%{http_code}\n
 对应的手动指令：
 
 ```bash
-launchctl bootout "gui/$(id -u)/com.vincent.clashx-rs"
+launchctl bootout "gui/$(id -u)/org.clashx-rs.agent"
 ```
 
 这会卸载本次会话的服务并发送终止信号，阻止 KeepAlive 重新拉起。clashx 正常退出时会尝试恢复原系统代理设置。由于启用前可能已经存在指向 clashx 的代理设置，如需明确关闭系统代理，再执行：
@@ -65,7 +65,7 @@ launchctl bootout "gui/$(id -u)/com.vincent.clashx-rs"
 对应的手动指令：
 
 ```bash
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.vincent.clashx-rs.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/org.clashx-rs.agent.plist"
 ```
 
 服务启动后通过 `--sysproxy` 重新开启系统代理。
@@ -73,7 +73,7 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.vincent.clash
 ## 查看状态
 
 ```bash
-launchctl print "gui/$(id -u)/com.vincent.clashx-rs"
+launchctl print "gui/$(id -u)/org.clashx-rs.agent"
 "$HOME/Library/Application Support/clashx-rs/bin/clashx-rs" status
 "$HOME/Library/Application Support/clashx-rs/bin/clashx-rs" sysproxy status
 ```
@@ -83,14 +83,14 @@ launchctl print "gui/$(id -u)/com.vincent.clashx-rs"
 永久禁用与临时停止不同，需要显式 disable：
 
 ```bash
-launchctl disable "gui/$(id -u)/com.vincent.clashx-rs"
-launchctl bootout "gui/$(id -u)/com.vincent.clashx-rs"
+launchctl disable "gui/$(id -u)/org.clashx-rs.agent"
+launchctl bootout "gui/$(id -u)/org.clashx-rs.agent"
 "$HOME/Library/Application Support/clashx-rs/bin/clashx-rs" sysproxy off
 ```
 
 恢复自启动并立即运行：
 
 ```bash
-launchctl enable "gui/$(id -u)/com.vincent.clashx-rs"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.vincent.clashx-rs.plist"
+launchctl enable "gui/$(id -u)/org.clashx-rs.agent"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/org.clashx-rs.agent.plist"
 ```

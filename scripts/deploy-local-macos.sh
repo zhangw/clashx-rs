@@ -7,8 +7,23 @@ repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
 install_dir="$HOME/Library/Application Support/clashx-rs/bin"
 binary="$install_dir/clashx-rs"
 config="$HOME/.config/clashx-rs/config.yaml"
-plist="$HOME/Library/LaunchAgents/com.vincent.clashx-rs.plist"
-service="gui/$(id -u)/com.vincent.clashx-rs"
+plist="$HOME/Library/LaunchAgents/org.clashx-rs.agent.plist"
+service="gui/$(id -u)/org.clashx-rs.agent"
+# Discover older service labels by executable path, without assuming an account name.
+matched_plist=''
+for candidate in "$HOME/Library/LaunchAgents/"*.plist; do
+    [[ -f "$candidate" ]] || continue
+    candidate_binary=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$candidate" 2>/dev/null) || continue
+    [[ "$candidate_binary" == "$binary" ]] || continue
+    [[ -z "$matched_plist" ]] || { echo 'Multiple clashx-rs LaunchAgents found; inspect them before continuing.' >&2; exit 1; }
+    matched_plist="$candidate"
+done
+if [[ -n "$matched_plist" ]]; then
+    plist="$matched_plist"
+    label=$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist")
+    [[ -n "$label" ]] || { echo 'LaunchAgent label is empty.' >&2; exit 1; }
+    service="gui/$(id -u)/$label"
+fi
 [[ -x "$binary" && -f "$plist" && -f "$config" ]] || {
     echo 'Existing clashx-rs LaunchAgent installation is required' >&2; exit 1;
 }

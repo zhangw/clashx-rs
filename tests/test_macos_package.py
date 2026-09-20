@@ -20,11 +20,12 @@ class MacOSPackageTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.home = self.root / 'home'
+        self.home = self.root / 'desktop user'
+        self.home.mkdir()
         self.app = self.home / 'Library/Application Support/clashx-rs'
         self.binary = self.app / 'bin/clashx-rs'
         self.config = self.home / '.config/clashx-rs/config.yaml'
-        self.plist = self.home / 'Library/LaunchAgents/com.vincent.clashx-rs.plist'
+        self.plist = self.home / 'Library/LaunchAgents/org.clashx-rs.agent.plist'
         self.stage = self.root / 'stage'
         self.payload = self.stage / 'payload'
         (self.payload / 'config').mkdir(parents=True)
@@ -86,7 +87,7 @@ else:
             snapshot.unlink()
         print('proxy state')
     elif 'status' in args:
-        if not data['loaded'] or (failure == 'ready' and VERSION == 'new'):
+        if not (data['loaded'] or data.get('external_daemon', False)) or (failure == 'ready' and VERSION == 'new'):
             sys.exit(1)
         print(json.dumps({'selections': data['selections']}))
     elif 'switch' in args:
@@ -104,14 +105,13 @@ state_path.write_text(json.dumps(data))
         (self.payload / 'config/subscriptions.yaml').write_text('source subscriptions\n')
         (self.payload / 'package-info.txt').write_text('new package\n')
         (self.payload / 'macos-major').write_text('27\n')
-        (self.payload / 'launchagent.plist').write_bytes(plistlib.dumps({
-            'Label': 'com.vincent.clashx-rs',
-            'ProgramArguments': [str(self.binary), '--config', str(self.config), 'run', '--sysproxy'],
-        }))
+        template = plistlib.loads((ROOT / 'scripts/macos-pkg/launchagent.plist').read_bytes())
+        template['ProgramArguments'][0] = str(self.binary)
+        template['ProgramArguments'][2] = str(self.config)
+        (self.payload / 'launchagent.plist').write_bytes(plistlib.dumps(template))
         self.checksums()
         source = (ROOT / 'scripts/macos-pkg/install-user.sh').read_text()
-        # Only adapt the fixed user home; real commands run against temporary files.
-        (self.stage / 'install-user.sh').write_text(source.replace('/Users/vincent', str(self.home)))
+        (self.stage / 'install-user.sh').write_text(source)
         shutil.copy(ROOT / 'scripts/macos-pkg/selections.js', self.stage / 'selections.js')
         self.env = dict(os.environ, HOME=str(self.home),
                         PATH=str(self.commands) + ':' + os.environ['PATH'],
@@ -157,7 +157,15 @@ state_path.write_text(json.dumps(data))
         self.assertEqual(plistlib.loads(self.plist.read_bytes()), expected)
 
     def test_first_install(self):
+        shutil.copy(ROOT / 'scripts/macos-pkg/launchagent.plist', self.payload / 'launchagent.plist')
+        self.checksums()
         self.run_install()
+        installed = plistlib.loads(self.plist.read_bytes())
+        self.assertEqual(installed['ProgramArguments'][:4],
+                         [str(self.binary), '--config', str(self.config), 'run'])
+        self.assertEqual(installed['EnvironmentVariables']['HOME'], str(self.home))
+        self.assertEqual(installed['WorkingDirectory'], str(self.home))
+        self.assertEqual(installed['StandardOutPath'], str(self.home / 'Library/Logs/clashx-rs/stdout.log'))
         self.assertEqual(plistlib.loads(self.plist.read_bytes())['SoftResourceLimits'],
                          {'NumberOfFiles': 8192})
         self.assertEqual(self.config.read_text(), 'source config\n')
@@ -185,6 +193,27 @@ state_path.write_text(json.dumps(data))
         self.assertTrue(data['disabled'])
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertFalse(any(c[:2] in [['launchctl', 'enable'], ['launchctl', 'bootstrap']] for c in calls))
+
+    def test_upgrade_preserves_legacy_service_label(self):
+        self.existing()
+        previous = self.plist
+        self.plist = previous.with_name('org.example.previous-agent.plist')
+        settings = plistlib.loads(previous.read_bytes())
+        settings['Label'] = 'org.example.previous-agent'
+        self.plist.write_bytes(plistlib.dumps(settings))
+        previous.unlink()
+        self.run_install()
+        self.assertEqual(plistlib.loads(self.plist.read_bytes())['Label'], settings['Label'])
+        self.assertFalse(previous.exists())
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertIn(['launchctl', 'bootout', 'gui/501/org.example.previous-agent'], calls)
+
+    def test_duplicate_services_are_rejected(self):
+        self.existing()
+        shutil.copy(self.plist, self.plist.with_name('duplicate.plist'))
+        result = self.run_install(success=False)
+        self.assertIn('Multiple clashx-rs LaunchAgents', result.stderr)
+        self.assertTrue(json.loads(self.state.read_text())['loaded'])
 
     def test_bootstrap_failure_rolls_back(self):
         self.existing()
@@ -280,9 +309,62 @@ state_path.write_text(json.dumps(data))
     def test_incomplete_install_is_left_untouched(self):
         self.config.parent.mkdir(parents=True)
         self.config.write_text('keep me')
+        self.plist.parent.mkdir(parents=True)
+        self.plist.write_bytes((self.payload / 'launchagent.plist').read_bytes())
         self.run_install(success=False)
         self.assertEqual(self.config.read_text(), 'keep me')
         self.assertFalse(self.binary.exists())
+
+    def test_first_install_preserves_existing_configuration(self):
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text('target config')
+        self.config.chmod(0o600)
+        (self.config.parent / 'subscriptions.yaml').write_text('target subscriptions')
+        self.run_install()
+        self.assertEqual(self.config.read_text(), 'target config')
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.config.parent / 'subscriptions.yaml').read_text(), 'target subscriptions')
+        self.assertFalse((self.config.parent / 'Country.mmdb').exists())
+        self.assertTrue(self.binary.exists())
+        self.assertTrue(self.plist.exists())
+        self.assertTrue(json.loads(self.state.read_text())['loaded'])
+
+    def test_existing_configuration_survives_first_install_rollback(self):
+        self.config.parent.mkdir(parents=True)
+        originals = {'config.yaml': b'target config', 'Country.mmdb': b'target database',
+                     'subscriptions.yaml': b'target subscriptions',
+                     'wgetcloud.origin.yaml': b'target origin', 'custom.txt': b'keep me'}
+        for name, content in originals.items():
+            (self.config.parent / name).write_bytes(content)
+        self.run_install(fail='ready', success=False)
+        for name, content in originals.items():
+            self.assertEqual((self.config.parent / name).read_bytes(), content)
+        self.assertFalse(self.binary.exists())
+        self.assertFalse(self.plist.exists())
+        self.assertFalse(self.app.exists())
+        self.run_install()
+        self.assertEqual(self.config.read_bytes(), originals['config.yaml'])
+
+    def test_configuration_only_running_daemon_is_left_untouched(self):
+        self.config.parent.mkdir(parents=True)
+        originals = {'config.yaml': b'target config', 'clashx-rs-7890.pid': b'456',
+                     'clashx-rs-7890.sock': b'control socket sentinel'}
+        for name, content in originals.items():
+            (self.config.parent / name).write_bytes(content)
+        state = json.loads(self.state.read_text())
+        state['external_daemon'] = True
+        self.state.write_text(json.dumps(state))
+        result = self.run_install(success=False)
+        self.assertIn('stop it before installing', result.stderr)
+        self.assertEqual(json.loads(self.state.read_text()), state)
+        for name, content in originals.items():
+            self.assertEqual((self.config.parent / name).read_bytes(), content)
+        self.assertFalse(self.app.exists())
+        self.assertFalse(self.plist.exists())
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertIn(['clashx-rs', '--config', str(self.config), 'status'], calls)
+        self.assertFalse(any(c[0] == 'launchctl' and c[1] != 'print' for c in calls))
+        self.assertFalse(any('sysproxy' in c for c in calls))
 
     def test_tampered_payload_does_not_stop_service(self):
         self.existing()
@@ -303,11 +385,11 @@ args = sys.argv[1:]
 with open(os.environ['TEST_LOG'], 'a') as stream:
     stream.write(json.dumps([name] + args) + '\\n')
 if name == 'id':
-    print('501' if 'vincent' in args else '0')
+    print('501' if 'desktop-user' in args else '0')
 elif name == 'uname': print(os.environ.get('TEST_ARCH', 'arm64'))
 elif name == 'sw_vers': print(os.environ.get('TEST_OS', '27.2'))
-elif name == 'stat': print(os.environ.get('TEST_CONSOLE', 'vincent'))
-elif name == 'dscl': print('NFSHomeDirectory: /Users/vincent')
+elif name == 'stat': print(os.environ.get('TEST_CONSOLE', 'desktop-user'))
+elif name == 'dscl': print('NFSHomeDirectory: ' + os.environ['HOME'])
 # chown and launchctl are recorded, never performed (including asuser).
 '''
         for name in ('id', 'uname', 'sw_vers', 'stat', 'dscl', 'chown', 'launchctl'):
@@ -315,7 +397,8 @@ elif name == 'dscl': print('NFSHomeDirectory: /Users/vincent')
         env = dict(self.env, TEST_WRAPPER_PATH=str(self.commands) + ':/usr/bin:/bin:/usr/sbin:/sbin')
         for settings, volume, success in [({}, '/', True), ({'TEST_ARCH': 'x86_64'}, '/', False),
                                           ({'TEST_OS': '26.1'}, '/', False),
-                                          ({'TEST_CONSOLE': 'other'}, '/', False),
+                                          ({'TEST_CONSOLE': 'root'}, '/', False),
+                                          ({'TEST_CONSOLE': 'loginwindow'}, '/', False),
                                           ({}, '/Volumes/Other', False)]:
             with self.subTest(settings=settings, volume=volume):
                 self.log.write_text('')
@@ -327,7 +410,8 @@ elif name == 'dscl': print('NFSHomeDirectory: /Users/vincent')
                             if json.loads(line)[:2] == ['launchctl', 'asuser']]
                 self.assertEqual(len(dispatch), 1 if success else 0)
                 if success:
-                    self.assertEqual(dispatch[0][2:8], ['501', '/usr/bin/sudo', '-H', '-u', 'vincent', '/usr/bin/env'])
+                    self.assertEqual(dispatch[0][2:8], ['501', '/usr/bin/sudo', '-H', '-u', 'desktop-user', '/usr/bin/env'])
+                    self.assertIn('HOME=' + str(self.home), dispatch[0])
                     self.assertFalse(Path(dispatch[0][-1]).exists(), 'Wrapper must clean up staging files')
 
 

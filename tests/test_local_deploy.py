@@ -26,7 +26,7 @@ class LocalDeploymentTest(unittest.TestCase):
             config = home / '.config/clashx-rs/config.yaml'
             config.parent.mkdir(parents=True)
             config.touch()
-            plist = home / 'Library/LaunchAgents/com.vincent.clashx-rs.plist'
+            plist = home / 'Library/LaunchAgents/org.clashx-rs.agent.plist'
             plist.parent.mkdir(parents=True)
             plist.touch()
             commands = root / 'commands'
@@ -41,13 +41,22 @@ import json, os, pathlib, sys
 name = pathlib.Path(sys.argv[0]).name
 state = pathlib.Path(os.environ['TEST_STATE'])
 if name == 'uname': print('Darwin')
-elif name == 'PlistBuddy': print(os.environ['TEST_BINARY'])
+elif name == 'PlistBuddy':
+    command = sys.argv[2]
+    if command == 'Print :ProgramArguments:0': print(os.environ['TEST_BINARY'])
+    elif command == 'Print :Label': print('org.clashx-rs.agent')
+    elif command.startswith('Print :'): print('8192')
 elif name == 'cargo':
     if 'build' in sys.argv:
         print(json.dumps({'reason': 'compiler-artifact', 'target': {'name': 'clashx-rs', 'kind': ['bin']}, 'executable': os.environ['TEST_ARTIFACT']}))
 elif name == 'launchctl':
+    data = json.loads(state.read_text())
+    if sys.argv[1] == 'print': sys.exit(0 if data.get('loaded', True) else 1)
+    if sys.argv[1] == 'bootout':
+        data['loaded'] = False
+        state.write_text(json.dumps(data))
     if sys.argv[1] == 'bootstrap':
-        state.write_text(json.dumps({'selections': {'🚀 group with spaces': 'default'}}))
+        state.write_text(json.dumps({'loaded': True, 'selections': {'🚀 group with spaces': 'default'}}))
 else:
     if '--version' in sys.argv: print(VERSION)
     elif 'switch' in sys.argv:

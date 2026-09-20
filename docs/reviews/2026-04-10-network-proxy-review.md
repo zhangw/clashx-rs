@@ -136,5 +136,5 @@ Blocked:
 - `cargo deny check`
 
 Blocker:
-- in the current environment, `cargo deny` could not acquire a writable advisory DB lock under `/Users/vincent/.cargo/advisory-dbs/db.lock`
+- in the current environment, `cargo deny` could not acquire a writable advisory DB lock under `~/.cargo/advisory-dbs/db.lock`
 - before clearing proxy env, it also inherited dead proxy settings pointing at `127.0.0.1:7890`

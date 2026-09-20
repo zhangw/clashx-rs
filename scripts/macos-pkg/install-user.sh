@@ -9,18 +9,34 @@ binary="$app_dir/bin/clashx-rs"
 helper="$app_dir/local-service.sh"
 config_dir="$HOME/.config/clashx-rs"
 config="$config_dir/config.yaml"
-plist="$HOME/Library/LaunchAgents/com.vincent.clashx-rs.plist"
-service="gui/$(id -u)/com.vincent.clashx-rs"
+plist="$HOME/Library/LaunchAgents/org.clashx-rs.agent.plist"
+service="gui/$(id -u)/org.clashx-rs.agent"
 transaction="$app_dir/.pkg-install"
 fresh=true
+preserve_config=false
 was_loaded=false
 keep_backup=false
 
 fail() { echo "clashx-rs installer: $*" >&2; exit 1; }
-[[ "$(id -u)" != 0 && "$HOME" == /Users/vincent ]] || fail 'Run as the vincent user.'
+[[ "$(id -u)" != 0 && "$HOME" == /* && "$HOME" != / && -d "$HOME" ]] || fail 'Run as the target desktop user with a valid home directory.'
 (cd "$payload" && shasum -a 256 -c SHA256SUMS) || fail 'Package checksum verification failed.'
 "$payload/clashx-rs" --version
 plutil -lint "$payload/launchagent.plist"
+# Discover older service labels by executable path, without assuming an account name.
+matched_plist=''
+for candidate in "$HOME/Library/LaunchAgents/"*.plist; do
+    [[ -f "$candidate" ]] || continue
+    candidate_binary=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$candidate" 2>/dev/null) || continue
+    [[ "$candidate_binary" == "$binary" ]] || continue
+    [[ -z "$matched_plist" ]] || { echo 'Multiple clashx-rs LaunchAgents found; inspect them before continuing.' >&2; exit 1; }
+    matched_plist="$candidate"
+done
+if [[ -n "$matched_plist" ]]; then
+    plist="$matched_plist"
+    label=$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist")
+    [[ -n "$label" ]] || { echo 'LaunchAgent label is empty.' >&2; exit 1; }
+    service="gui/$(id -u)/$label"
+fi
 
 # Do not follow a prior installation's links when replacing files.
 for path in "$HOME/.config" "$config_dir" "$config" "$app_dir" "$app_dir/bin" \
@@ -28,7 +44,7 @@ for path in "$HOME/.config" "$config_dir" "$config" "$app_dir" "$app_dir/bin" \
     "$HOME/Library/LaunchAgents" "$plist"; do
     [[ ! -L "$path" ]] || fail "Symlink installation paths are unsupported: $path"
 done
-if [[ -e "$binary" || -e "$config" || -e "$plist" ]]; then
+if [[ -e "$binary" || -e "$plist" ]]; then
     fresh=false
     [[ -x "$binary" && -f "$config" && -f "$plist" ]] || fail 'Incomplete existing installation; repair it before upgrading.'
     [[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist")" == "$binary" &&
@@ -37,13 +53,19 @@ if [[ -e "$binary" || -e "$config" || -e "$plist" ]]; then
        "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$plist")" == run ]] ||
         fail 'Existing LaunchAgent does not match the supported installation.'
 else
-    [[ ! -e "$app_dir" && ! -e "$config_dir" ]] || fail 'Existing application/configuration directories need manual inspection.'
+    [[ ! -e "$app_dir" ]] || fail 'Existing application directory needs manual inspection.'
+    if [[ -e "$config_dir" ]]; then
+        [[ -d "$config_dir" && -f "$config" ]] || fail 'Existing configuration directory must contain config.yaml.'
+        preserve_config=true
+    fi
 fi
 if launchctl print "$service" >/dev/null 2>&1; then
     $fresh && fail 'A service is already loaded without a complete installation.'
     was_loaded=true
 elif ! $fresh && "$binary" --config "$config" status >/dev/null 2>&1; then
     fail 'A daemon is running outside this LaunchAgent; stop it before upgrading.'
+elif $preserve_config && "$payload/clashx-rs" --config "$config" status >/dev/null 2>&1; then
+    fail 'A daemon is using the existing configuration; stop it before installing.'
 fi
 
 mkdir -p "$app_dir/bin"
@@ -52,7 +74,8 @@ cleanup() {
     if ! $keep_backup; then
         rm -rf "$transaction"
         if $fresh; then
-            rmdir "$app_dir/bin" "$app_dir" "$config_dir" 2>/dev/null || true
+            rmdir "$app_dir/bin" "$app_dir" 2>/dev/null || true
+            $preserve_config || rmdir "$config_dir" 2>/dev/null || true
         fi
     fi
 }
@@ -109,11 +132,13 @@ rollback() {
         fi
         if ! $failed; then
             rm -f "$binary" "$helper" "$app_dir/package-info.txt" "$plist" || failed=true
-            for name in config.yaml Country.mmdb subscriptions.yaml wgetcloud.origin.yaml; do
-                rm -f "$config_dir/$name" || failed=true
-            done
-            # A startup error before the daemon's shutdown handler can leave these.
-            rm -f "$config_dir"/clashx-rs-*.sock "$config_dir"/clashx-rs-*.pid || failed=true
+            if ! $preserve_config; then
+                for name in config.yaml Country.mmdb subscriptions.yaml wgetcloud.origin.yaml; do
+                    rm -f "$config_dir/$name" || failed=true
+                done
+                # A startup error before the daemon's shutdown handler can leave these.
+                rm -f "$config_dir"/clashx-rs-*.sock "$config_dir"/clashx-rs-*.pid || failed=true
+            fi
         fi
     else
         cp -p "$transaction/old-plist" "$plist" || failed=true
@@ -146,13 +171,24 @@ trap rollback ERR INT TERM
 if $was_loaded; then launchctl bootout "$service"; wait_stopped; fi
 if $fresh; then
     mkdir -p "$config_dir" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/clashx-rs"
-    chmod 700 "$config_dir"
-    for name in config.yaml Country.mmdb subscriptions.yaml wgetcloud.origin.yaml; do
-        if [[ -f "$payload/config/$name" ]]; then
-            install -m 600 "$payload/config/$name" "$config_dir/$name"
-        fi
-    done
+    if ! $preserve_config; then
+        chmod 700 "$config_dir"
+        for name in config.yaml Country.mmdb subscriptions.yaml wgetcloud.origin.yaml; do
+            if [[ -f "$payload/config/$name" ]]; then
+                install -m 600 "$payload/config/$name" "$config_dir/$name"
+            fi
+        done
+    fi
     install -m 644 "$payload/launchagent.plist" "$plist"
+    plutil -remove ProgramArguments.0 "$plist"
+    plutil -insert ProgramArguments.0 -string "$binary" "$plist"
+    plutil -remove ProgramArguments.2 "$plist"
+    plutil -insert ProgramArguments.2 -string "$config" "$plist"
+    plutil -replace EnvironmentVariables -json '{}' "$plist"
+    plutil -replace EnvironmentVariables.HOME -string "$HOME" "$plist"
+    plutil -replace WorkingDirectory -string "$HOME" "$plist"
+    plutil -replace StandardOutPath -string "$HOME/Library/Logs/clashx-rs/stdout.log" "$plist"
+    plutil -replace StandardErrorPath -string "$HOME/Library/Logs/clashx-rs/stderr.log" "$plist"
 fi
 mv -f "$transaction/new-binary" "$binary"
 fd_soft=$(/usr/libexec/PlistBuddy -c 'Print :SoftResourceLimits:NumberOfFiles' "$plist" 2>/dev/null || echo 0)

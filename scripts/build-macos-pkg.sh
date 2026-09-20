@@ -10,10 +10,9 @@ case "$#" in
        artifact="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")" ;;
     *) echo "Usage: $0 [--binary PATH]" >&2; exit 2 ;;
 esac
-[[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 && "$HOME" == /Users/vincent ]] || {
-    echo 'Build on the vincent Apple Silicon Mac.' >&2; exit 1;
+[[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || {
+    echo 'Build on an Apple Silicon Mac.' >&2; exit 1;
 }
-source_plist="$HOME/Library/LaunchAgents/com.vincent.clashx-rs.plist"
 source_config="$HOME/.config/clashx-rs"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -23,7 +22,7 @@ payload="$work/scripts/payload"
 cd "$repo_dir"
 
 if [[ -z "$artifact" ]]; then
-    python3 -m unittest discover -s tests -p 'test_macos_package.py'
+    python3 -m unittest discover -s tests -p 'test_*package*.py'
     cargo test --locked
     cargo clippy --locked --all-targets -- -D warnings
     cargo build --locked --release --message-format=json-render-diagnostics > "$work/build.jsonl"
@@ -57,19 +56,7 @@ for name in subscriptions.yaml wgetcloud.origin.yaml; do
         install -m 644 "$source_config/$name" "$payload/config/$name"
     fi
 done
-cp "$source_plist" "$payload/launchagent.plist"
-python3 - "$payload/launchagent.plist" <<'PY'
-import plistlib
-import sys
-with open(sys.argv[1], 'rb') as stream:
-    plist = plistlib.load(stream)
-expected = ['/Users/vincent/Library/Application Support/clashx-rs/bin/clashx-rs',
-            '--config', '/Users/vincent/.config/clashx-rs/config.yaml', 'run']
-if (plist.get('Label') != 'com.vincent.clashx-rs' or
-        plist.get('ProgramArguments', [])[:4] != expected or
-        plist.get('EnvironmentVariables', {}).get('HOME') != '/Users/vincent'):
-    raise SystemExit('Source LaunchAgent does not match the supported installation')
-PY
+install -m 644 scripts/macos-pkg/launchagent.plist "$payload/launchagent.plist"
 macos_version="$(sw_vers -productVersion)"
 macos_major="${macos_version%%.*}"
 printf '%s\n' "$macos_major" > "$payload/macos-major"
@@ -87,7 +74,7 @@ package_name="clashx-rs-$binary_version-$package_version-macos$macos_major-arm64
 )
 install -m 755 scripts/macos-pkg/postinstall "$work/scripts/postinstall"
 install -m 644 scripts/macos-pkg/install-user.sh scripts/macos-pkg/selections.js "$work/scripts/"
-pkgbuild --nopayload --scripts "$work/scripts" --identifier com.vincent.clashx-rs \
+pkgbuild --nopayload --scripts "$work/scripts" --identifier org.clashx-rs.agent \
     --version "$package_version" "$work/component.pkg"
 cat > "$work/distribution.xml" <<XML
 <?xml version="1.0" encoding="utf-8"?>
@@ -99,16 +86,16 @@ cat > "$work/distribution.xml" <<XML
   <welcome file="welcome.txt" mime-type="text/plain"/>
   <conclusion file="conclusion.txt" mime-type="text/plain"/>
   <choices-outline><line choice="default"/></choices-outline>
-  <choice id="default" visible="false"><pkg-ref id="com.vincent.clashx-rs"/></choice>
-  <pkg-ref id="com.vincent.clashx-rs" version="$package_version" onConclusion="none">component.pkg</pkg-ref>
+  <choice id="default" visible="false"><pkg-ref id="org.clashx-rs.agent"/></choice>
+  <pkg-ref id="org.clashx-rs.agent" version="$package_version" onConclusion="none">component.pkg</pkg-ref>
 </installer-gui-script>
 XML
 mkdir "$work/resources"
 cat > "$work/resources/welcome.txt" <<TEXT
 clashx-rs $binary_version — macOS $macos_major / Apple Silicon
 
-请登录 vincent 用户桌面后安装，需要管理员授权。
-首次安装采用包内初始配置，并启用登录自启动和系统代理。
+请登录需要安装的用户桌面后安装，需要管理员授权；程序归属于当前桌面用户。
+首次安装保留目标机已有配置；没有配置时采用包内初始配置，并启用登录自启动和系统代理。
 初始配置来自构建机器，可能开放局域网代理；本安装包含私密代理配置。
 升级保留现有配置、启动参数和停止/禁用状态；运行中的服务会短暂重启。
 安装期间请勿手动部署或切换节点。
@@ -123,6 +110,9 @@ cat > "$work/resources/conclusion.txt" <<'TEXT'
 TEXT
 productbuild --distribution "$work/distribution.xml" --package-path "$work" \
     --resources "$work/resources" "$work/$package_name"
+pkgutil --expand-full "$work/$package_name" "$work/expanded"
+(cd "$work/expanded/component.pkg/Scripts/payload" && shasum -a 256 -c SHA256SUMS)
 install -m 600 "$work/$package_name" "$repo_dir/dist/$package_name"
 (cd "$repo_dir/dist" && shasum -a 256 "$package_name" > "$package_name.sha256")
+python3 "$repo_dir/scripts/prune-macos-packages.py" "$repo_dir/dist"
 printf 'Installer: %s/dist/%s\nThis private package is unsigned and contains proxy credentials.\n' "$repo_dir" "$package_name"
