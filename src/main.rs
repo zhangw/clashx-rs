@@ -81,7 +81,11 @@ enum Command {
     /// Reload the daemon configuration
     Reload,
     /// Show daemon status
-    Status,
+    Status {
+        /// Emit machine-readable JSON with no logging on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// List all proxies
     Proxies,
     /// List proxy groups
@@ -219,24 +223,33 @@ fn expand_tilde(path: &str) -> PathBuf {
 /// `RUST_LOG` wins when it is set — an explicit override should not be
 /// second-guessed. Otherwise the config file's `log-level` decides, so the
 /// setting is not silently inert.
-fn init_logging(config_path: &Path) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        let directive = match clashx_rs_config::load_log_level(config_path) {
-            LogLevel::Silent => "off",
-            LogLevel::Error => "error",
-            LogLevel::Warning => "warn",
-            LogLevel::Info => "info",
-            LogLevel::Debug => "debug",
-        };
-        EnvFilter::new(directive)
-    });
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+fn init_logging(config_path: &Path, quiet: bool) {
+    let filter = if quiet {
+        EnvFilter::new("off")
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            let directive = match clashx_rs_config::load_log_level(config_path) {
+                LogLevel::Silent => "off",
+                LogLevel::Error => "error",
+                LogLevel::Warning => "warn",
+                LogLevel::Info => "info",
+                LogLevel::Debug => "debug",
+            };
+            EnvFilter::new(directive)
+        })
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = expand_tilde(&cli.config);
-    init_logging(&config_path);
+    let machine_status = matches!(&cli.command, Command::Status { json: true });
+    init_logging(&config_path, machine_status);
     let ctrl_port = resolve_port(&cli);
 
     match cli.command {
@@ -274,7 +287,7 @@ fn main() -> Result<()> {
 
         Command::Stop => client::send_command(ControlRequest::Stop, ctrl_port)?,
         Command::Reload => client::send_command(ControlRequest::Reload, ctrl_port)?,
-        Command::Status => client::send_command(ControlRequest::Status, ctrl_port)?,
+        Command::Status { .. } => client::send_command(ControlRequest::Status, ctrl_port)?,
         Command::Proxies => client::send_command(ControlRequest::Proxies, ctrl_port)?,
         Command::Groups => client::send_command(ControlRequest::Groups, ctrl_port)?,
         Command::Rules => client::send_command(ControlRequest::Rules, ctrl_port)?,
@@ -590,7 +603,20 @@ fn redact_url_for_display(url: &str) -> String {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::redact_url_for_display;
+    use super::{redact_url_for_display, Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn machine_status_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["clashx-rs", "status", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Status { json: true }));
+    }
+
+    #[test]
+    fn human_status_does_not_enable_machine_mode() {
+        let cli = Cli::try_parse_from(["clashx-rs", "status"]).unwrap();
+        assert!(matches!(cli.command, Command::Status { json: false }));
+    }
 
     #[test]
     fn redact_url_hides_query_and_fragment() {

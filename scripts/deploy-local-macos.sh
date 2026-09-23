@@ -59,7 +59,7 @@ install -m 755 "$artifact" "$binary.new"
 cp -p "$binary" "$binary.previous"
 cp -p "$plist" "$deploy_tmp/previous.plist"
 # Capture immediately before stopping, after the potentially lengthy build.
-"$binary" --config "$config" status > "$deploy_tmp/status.json"
+"$binary" --config "$config" status --json > "$deploy_tmp/status.json"
 python3 - "$deploy_tmp/status.json" <<'PYTHON'
 import json
 import sys
@@ -104,7 +104,7 @@ with open(snapshot) as stream:
 command = [binary, '--config', config]
 for group, proxy in selections.items():
     subprocess.run(command + ['switch', '--', group, proxy], check=True)
-actual = json.loads(subprocess.check_output(command + ['status']))['selections']
+actual = json.loads(subprocess.check_output(command + ['status', '--json']))['selections']
 if actual != selections:
     raise SystemExit('Runtime selections differ after restoration')
 PYTHON

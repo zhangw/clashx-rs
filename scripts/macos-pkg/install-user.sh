@@ -88,7 +88,7 @@ if ! $fresh; then
     [[ ! -f "$app_dir/package-info.txt" ]] || cp -p "$app_dir/package-info.txt" "$transaction/old-info"
 fi
 if $was_loaded; then
-    "$binary" --config "$config" status > "$transaction/status.json"
+    "$binary" --config "$config" status --json > "$transaction/status.json"
     osascript -l JavaScript "$scripts_dir/selections.js" commands \
         "$transaction/status.json" "$binary" "$config" > "$transaction/restore.sh"
 fi
@@ -111,7 +111,7 @@ wait_stopped() {
 restore_selections() {
     $was_loaded || return 0
     /bin/bash "$transaction/restore.sh" || return 1
-    "$binary" --config "$config" status > "$transaction/restored.json" || return 1
+    "$binary" --config "$config" status --json > "$transaction/restored.json" || return 1
     osascript -l JavaScript "$scripts_dir/selections.js" verify \
         "$transaction/status.json" "$transaction/restored.json"
 }
