@@ -58,8 +58,24 @@ PYTHON
 install -m 755 "$artifact" "$binary.new"
 cp -p "$binary" "$binary.previous"
 cp -p "$plist" "$deploy_tmp/previous.plist"
-# Capture immediately before stopping, after the potentially lengthy build.
-"$binary" --config "$config" status --json > "$deploy_tmp/status.json"
+capture_status() {
+    local output=$1
+    local error_file="$output.stderr"
+    if "$binary" --config "$config" status --json > "$output" 2>"$error_file"; then
+        rm -f "$error_file"
+        return 0
+    fi
+    if grep -Fq "unexpected argument '--json'" "$error_file"; then
+        "$binary" --config "$config" status > "$output"
+        rm -f "$error_file"
+        return 0
+    fi
+    cat "$error_file" >&2
+    rm -f "$error_file"
+    return 1
+}
+
+capture_status "$deploy_tmp/status.json"
 python3 - "$deploy_tmp/status.json" <<'PYTHON'
 import json
 import sys
@@ -104,7 +120,7 @@ with open(snapshot) as stream:
 command = [binary, '--config', config]
 for group, proxy in selections.items():
     subprocess.run(command + ['switch', '--', group, proxy], check=True)
-actual = json.loads(subprocess.check_output(command + ['status', '--json']))['selections']
+actual = json.loads(subprocess.check_output(command + ['status']))['selections']
 if actual != selections:
     raise SystemExit('Runtime selections differ after restoration')
 PYTHON

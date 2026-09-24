@@ -87,8 +87,24 @@ if ! $fresh; then
     [[ ! -f "$helper" ]] || cp -p "$helper" "$transaction/old-helper"
     [[ ! -f "$app_dir/package-info.txt" ]] || cp -p "$app_dir/package-info.txt" "$transaction/old-info"
 fi
+status_snapshot() {
+    local output=$1
+    if "$binary" --config "$config" status --json > "$output" 2>"$output.stderr"; then
+        rm -f "$output.stderr"
+        return 0
+    fi
+    if grep -Fq "unexpected argument '--json'" "$output.stderr"; then
+        "$binary" --config "$config" status > "$output"
+        rm -f "$output.stderr"
+        return 0
+    fi
+    cat "$output.stderr" >&2
+    rm -f "$output.stderr"
+    return 1
+}
+
 if $was_loaded; then
-    "$binary" --config "$config" status --json > "$transaction/status.json"
+    status_snapshot "$transaction/status.json"
     osascript -l JavaScript "$scripts_dir/selections.js" commands \
         "$transaction/status.json" "$binary" "$config" > "$transaction/restore.sh"
 fi
@@ -111,7 +127,7 @@ wait_stopped() {
 restore_selections() {
     $was_loaded || return 0
     /bin/bash "$transaction/restore.sh" || return 1
-    "$binary" --config "$config" status --json > "$transaction/restored.json" || return 1
+    status_snapshot "$transaction/restored.json"
     osascript -l JavaScript "$scripts_dir/selections.js" verify \
         "$transaction/status.json" "$transaction/restored.json"
 }
