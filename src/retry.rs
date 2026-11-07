@@ -17,9 +17,40 @@ pub const COOLDOWN_FAILURE_THRESHOLD: u32 = 2;
 pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Cap on client bytes buffered for replay during the first-byte window.
-/// Once the cap is reached the window stops reading the client and only
-/// waits for the remote, bounding memory per pending connection.
+/// Bytes beyond the cap are still forwarded to the remote; only the failover
+/// replay is marked unsafe, so a large prompt never stalls the upload.
 pub const MAX_REPLAY_BUFFER: usize = 64 * 1024;
+
+// ---------------------------------------------------------------------------
+// Relay lifetime policy
+// ---------------------------------------------------------------------------
+
+/// Close a connection when neither direction has carried a byte for an hour.
+/// Long enough for LLM reasoning gaps, short enough to reclaim truly dead
+/// connections (matches Envoy TCP proxy / Istio defaults).
+pub const RELAY_IDLE: Duration = Duration::from_secs(60 * 60);
+
+/// Half-close inactivity for ordinary traffic. Most protocols do not
+/// half-close; a minute is enough to drain a response and reclaim quickly.
+pub const HALF_CLOSE_GENERAL: Duration = Duration::from_secs(60);
+
+/// Half-close inactivity after a connection is promoted to long-lived.
+/// The OpenAI SDK's default read timeout is 10 minutes, so the proxy must not
+/// be stricter than the clients it serves.
+pub const HALF_CLOSE_STREAMING: Duration = Duration::from_secs(10 * 60);
+
+/// Connections still open after this long are treated as long-lived (SSE,
+/// WebSocket, large downloads) and promoted to the streaming pool.
+/// Must stay below [`HALF_CLOSE_GENERAL`] so a half-closed connection can be
+/// re-armed before the general timer fires.
+pub const PROMOTE_AFTER: Duration = Duration::from_secs(30);
+
+// The general half-close timer must outlive the promotion age, otherwise a
+// half-closed connection could be reaped before it gets the streaming budget.
+const _: () = {
+    assert!(PROMOTE_AFTER.as_secs() < HALF_CLOSE_GENERAL.as_secs());
+    assert!(HALF_CLOSE_GENERAL.as_secs() < HALF_CLOSE_STREAMING.as_secs());
+};
 
 /// Whether an outbound connect error is a timeout. Timeouts indicate a dead or
 /// unreachable node — retrying the same node 100ms later is futile, so callers

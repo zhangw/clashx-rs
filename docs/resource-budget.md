@@ -21,14 +21,44 @@ guarantee that an exhausted system can serve control requests; it prevents
 normal admitted data traffic from consuming the control reserve.
 
 Control clients have a ten-second idle read/write deadline; executing a
-command is not subject to that deadline. Data tunnels retain their existing
-long-lived and half-close semantics. Configuration reload keeps the same
-process-wide budget, permits and counters.
+command is not subject to that deadline.
 
-`status.resources` exposes the startup soft/hard FD limits, effective data
-connection limit, active data/control connections and resource-pressure
-count. Active control connections include the status request itself. These
-are connection counts, not a live enumeration of all process descriptors.
+## Connection classes and lifetime
+
+Every data connection starts in the `general` class. The two class pools
+(1536 permits each) sit under the 2048 global cap, so each class is always
+guaranteed at least 512 permits. A class cannot exceed 1536 even when the
+other is idle; the remaining headroom is the other class's guarantee. A connection still open after 30 seconds is promoted to the
+`streaming` class: the class permit is swapped and the half-close inactivity
+timeout changes from 60 seconds to 10 minutes. Promotion is based on observed
+lifetime, not on the destination host, so short and long requests to the same
+API domain land in different classes. If the streaming pool is full, the
+connection keeps its general permit but still receives the long timeout; the
+failed upgrade is counted in `status.resources`.
+
+Relay lifetime is activity-based, never a total-duration cap:
+
+- no bytes in either direction for 1 hour → close (idle);
+- after the first EOF, no bytes for 60s (general) or 10m (streaming) → close
+  (half-closed);
+- an immediate RST is surfaced by the copy error and closes both sides;
+  a FIN-only cancellation is reclaimed by the half-close timer.
+
+This keeps LLM reasoning streams (long silent gaps, slow token output) alive
+while still reclaiming cancelled or dead tunnels. The 10-minute streaming
+half-close is aligned with the OpenAI Python SDK's default 10-minute read
+timeout; the proxy must not be stricter than the clients it serves. `TCP_NODELAY` and a
+60s/15s/3 TCP keepalive profile are applied to inbound and outbound sockets;
+keepalive is a backstop for vanished peers, not a substitute for the timers.
+
+Configuration reload keeps the same process-wide budget, permits and
+counters.
+
+`status.resources` exposes the startup soft/hard FD limits, the global
+connection limit, per-class limits and active counts, promotion success and
+failure counts, and the resource-pressure counters. Active control
+connections include the status request itself. These are connection counts,
+not a live enumeration of all process descriptors.
 
 Local deployment and package installation set the LaunchAgent soft limit to
 8192, preserve higher existing values and respect lower explicit hard limits.

@@ -1,10 +1,19 @@
-//! Process-wide socket budget, independent of configuration reloads.
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, OnceLock,
-};
+//! Process-wide connection budgets, independent of configuration reloads.
+//!
+//! Two class pools sit under one global fd budget:
+//!
+//! - `general`: every new connection starts here.
+//! - `streaming`: connections promoted after [`crate::retry::PROMOTE_AFTER`]
+//!   because they proved long-lived (LLM SSE, WebSocket, large downloads).
+//!
+//! The caps overlap deliberately: with a global limit of 2048 and per-class
+//! caps of 1536, each class is guaranteed at least 512 permits. A class
+//! cannot exceed 1536 even when the other is idle; the unused headroom is the
+//! other class's guarantee.
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const TARGET: u64 = 8192;
 // Listeners, runtime, logs, four control requests (including latency probes),
@@ -13,15 +22,32 @@ const RESERVED: u64 = 128;
 // Two tunnel sockets plus headroom for connection establishment.
 const PER_CONNECTION: u64 = 3;
 pub const CONTROL_LIMIT: usize = 4;
+
+/// Ceiling for long-lived connections. With the global limit at 2048 this
+/// leaves general traffic at least 512 permits even when the pool is full.
+pub const STREAMING_LIMIT: usize = 1536;
+/// Ceiling for short-lived traffic; symmetric with [`STREAMING_LIMIT`].
+pub const GENERAL_LIMIT: usize = 1536;
+
 static BUDGET: OnceLock<Budget> = OnceLock::new();
 
 pub struct Budget {
     soft: u64,
     hard: u64,
     limit: usize,
-    pub connections: Arc<Semaphore>,
+    streaming_limit: usize,
+    general_limit: usize,
+    /// Global admission: every connection holds one permit here.
+    pub global: Arc<Semaphore>,
+    /// Long-lived class pool, acquired by promotion.
+    pub streaming: Arc<Semaphore>,
+    /// Short-lived class pool, acquired at accept.
+    pub general: Arc<Semaphore>,
     pub controls: Arc<Semaphore>,
     overloads: AtomicU64,
+    general_overloads: AtomicU64,
+    promotions: AtomicU64,
+    promotion_failures: AtomicU64,
 }
 
 fn capacity(soft: u64) -> usize {
@@ -62,18 +88,29 @@ pub fn initialize() -> anyhow::Result<&'static Budget> {
         limit > 0,
         "file descriptor limit {soft} is too small (reserve {RESERVED})"
     );
+    let streaming_limit = STREAMING_LIMIT.min(limit);
+    let general_limit = GENERAL_LIMIT.min(limit);
     let _ = BUDGET.set(Budget {
         soft,
         hard,
         limit,
-        connections: Arc::new(Semaphore::new(limit)),
+        streaming_limit,
+        general_limit,
+        global: Arc::new(Semaphore::new(limit)),
+        streaming: Arc::new(Semaphore::new(streaming_limit)),
+        general: Arc::new(Semaphore::new(general_limit)),
         controls: Arc::new(Semaphore::new(CONTROL_LIMIT)),
         overloads: AtomicU64::new(0),
+        general_overloads: AtomicU64::new(0),
+        promotions: AtomicU64::new(0),
+        promotion_failures: AtomicU64::new(0),
     });
     tracing::info!(
         soft,
         hard,
         connection_limit = limit,
+        streaming_limit,
+        general_limit,
         reserved = RESERVED,
         "file descriptor budget"
     );
@@ -87,12 +124,107 @@ pub fn status() -> serde_json::Value {
             serde_json::json!({
                 "fd_soft_limit": b.soft, "fd_hard_limit": b.hard,
                 "connection_limit": b.limit,
-                "active_connections": b.limit - b.connections.available_permits(),
+                "active_connections": b.limit.saturating_sub(b.global.available_permits()),
+                "streaming_limit": b.streaming_limit,
+                "active_streaming": b.streaming_limit.saturating_sub(b.streaming.available_permits()),
+                "general_limit": b.general_limit,
+                "active_general": b.general_limit.saturating_sub(b.general.available_permits()),
                 "active_control_connections": CONTROL_LIMIT - b.controls.available_permits(),
                 "overload_count": b.overloads.load(Ordering::Relaxed),
+                "general_overload_count": b.general_overloads.load(Ordering::Relaxed),
+                "promotion_count": b.promotions.load(Ordering::Relaxed),
+                "promotion_failure_count": b.promotion_failures.load(Ordering::Relaxed),
             })
         })
         .unwrap_or(serde_json::Value::Null)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionClass {
+    General,
+    Streaming,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireError {
+    /// Global connection limit is exhausted.
+    Global,
+    /// The general class pool is exhausted (the global pool had room).
+    General,
+}
+
+/// Admission permit set for one connection.
+///
+/// Starts in the general pool and may be promoted to the streaming pool once
+/// the connection proves long-lived. Dropping it releases every permit it
+/// still holds.
+pub struct ConnectionSlot {
+    budget: &'static Budget,
+    _global: OwnedSemaphorePermit,
+    class_permit: Option<OwnedSemaphorePermit>,
+    class: ConnectionClass,
+}
+
+impl ConnectionSlot {
+    /// Acquire a global permit plus a general-class permit.
+    pub fn try_acquire() -> Result<Self, AcquireError> {
+        let budget = BUDGET.get().ok_or(AcquireError::Global)?;
+        Self::try_acquire_from(budget)
+    }
+
+    fn try_acquire_from(budget: &'static Budget) -> Result<Self, AcquireError> {
+        let global = budget
+            .global
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AcquireError::Global)?;
+        let class_permit = budget
+            .general
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AcquireError::General)?;
+        Ok(Self {
+            budget,
+            _global: global,
+            class_permit: Some(class_permit),
+            class: ConnectionClass::General,
+        })
+    }
+
+    /// Promote to the streaming pool and return the streaming half-close
+    /// timeout.
+    ///
+    /// The timeout change is applied even when the streaming pool is full:
+    /// the connection has already proved it is long-lived, so cutting it at
+    /// the general 60s half-close would be wrong. The failed pool upgrade is
+    /// counted so saturation is visible.
+    pub fn try_promote(&mut self) -> Duration {
+        if self.class == ConnectionClass::General {
+            match self.budget.streaming.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    self.class_permit = Some(permit);
+                    self.class = ConnectionClass::Streaming;
+                    self.budget.promotions.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    self.budget
+                        .promotion_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        crate::retry::HALF_CLOSE_STREAMING
+    }
+
+    pub fn class(&self) -> ConnectionClass {
+        self.class
+    }
+}
+
+impl clashx_rs_proxy::relay::RelayPromotion for ConnectionSlot {
+    fn promote(&mut self) -> Option<Duration> {
+        Some(self.try_promote())
+    }
 }
 
 /// A separate limiter per listener; every occurrence is still counted.
@@ -112,6 +244,20 @@ impl OverloadLog {
             self.0 = Some(now);
         }
     }
+
+    /// Global admission failed: no connection permit at all.
+    pub fn record_global(&mut self, reason: &str) {
+        self.record(reason);
+    }
+
+    /// General class pool is full while the global pool still has room.
+    pub fn record_general(&mut self, reason: &str) {
+        if let Some(b) = BUDGET.get() {
+            b.general_overloads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record(reason);
+    }
+
     pub async fn accept_error(&mut self, error: &std::io::Error) {
         self.record(&format!("accept: {error}"));
         // Includes EMFILE/ENFILE; also prevents other persistent accept errors
@@ -123,12 +269,67 @@ impl OverloadLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_budget(global: usize, streaming: usize, general: usize) -> &'static Budget {
+        Box::leak(Box::new(Budget {
+            soft: 0,
+            hard: 0,
+            limit: global,
+            streaming_limit: streaming,
+            general_limit: general,
+            global: Arc::new(Semaphore::new(global)),
+            streaming: Arc::new(Semaphore::new(streaming)),
+            general: Arc::new(Semaphore::new(general)),
+            controls: Arc::new(Semaphore::new(CONTROL_LIMIT)),
+            overloads: AtomicU64::new(0),
+            general_overloads: AtomicU64::new(0),
+            promotions: AtomicU64::new(0),
+            promotion_failures: AtomicU64::new(0),
+        }))
+    }
+
     #[test]
     fn budgets_leave_headroom() {
         assert_eq!(capacity(256), 42);
         assert_eq!(capacity(8192), 2048);
         assert_eq!(capacity(128), 0);
         assert_eq!(capacity(u64::MAX), 2048);
+    }
+
+    #[test]
+    fn class_caps_leave_a_floor() {
+        // 2048 - 1536 = 512 permits are always available to each class while
+        // the other is at its ceiling.
+        assert_eq!(2048 - STREAMING_LIMIT, 512);
+        assert_eq!(2048 - GENERAL_LIMIT, 512);
+        const { assert!(STREAMING_LIMIT + GENERAL_LIMIT > 2048) };
+    }
+
+    #[test]
+    fn promotion_swaps_pool_and_keeps_floor() {
+        let budget = test_budget(3, 1, 2);
+        let mut first = ConnectionSlot::try_acquire_from(budget).unwrap();
+        let mut second = ConnectionSlot::try_acquire_from(budget).unwrap();
+        assert!(matches!(
+            ConnectionSlot::try_acquire_from(budget),
+            Err(AcquireError::General)
+        ));
+
+        assert_eq!(first.class(), ConnectionClass::General);
+        assert_eq!(first.try_promote(), crate::retry::HALF_CLOSE_STREAMING);
+        assert_eq!(first.class(), ConnectionClass::Streaming);
+
+        // Streaming is full; the connection keeps its general permit but still
+        // gets the long half-close timeout.
+        assert_eq!(second.try_promote(), crate::retry::HALF_CLOSE_STREAMING);
+        assert_eq!(second.class(), ConnectionClass::General);
+        assert_eq!(budget.promotion_failures.load(Ordering::Relaxed), 1);
+
+        drop(first);
+        drop(second);
+        assert_eq!(budget.global.available_permits(), 3);
+        assert_eq!(budget.streaming.available_permits(), 1);
+        assert_eq!(budget.general.available_permits(), 2);
     }
 
     #[test]

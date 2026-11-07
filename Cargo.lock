@@ -300,6 +300,7 @@ dependencies = [
  "clashx-rs-config",
  "clashx-rs-dns",
  "hex",
+ "libc",
  "rustls",
  "serde",
  "sha2",

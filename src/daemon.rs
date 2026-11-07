@@ -3,7 +3,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clashx_rs_config::load_config;
@@ -11,7 +11,7 @@ use clashx_rs_config::types::{Config, Mode, Proxy};
 use clashx_rs_geoip::GeoIpDb;
 use clashx_rs_proxy::inbound::{self, InboundResult};
 use clashx_rs_proxy::outbound::{self, OutboundStream};
-use clashx_rs_proxy::relay::relay;
+use clashx_rs_proxy::relay::{relay_with_policy, RelayPolicy};
 use clashx_rs_rule::{MatchInput, RuleEngine};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -690,27 +690,40 @@ async fn run_daemon(
     });
 
     let proxy_state = Arc::clone(&state);
-    let connection_limit = Arc::clone(&budget.connections);
     tokio::spawn(async move {
         let mut overload = crate::resources::OverloadLog::default();
         loop {
             match proxy_listener.accept().await {
                 Ok((stream, addr)) => {
-                    // Admission control: cap concurrent connections. If exhausted,
-                    // drop the new connection with a log line — a bursty/abusive
-                    // client cannot blow fd/memory budget.
-                    let permit = match connection_limit.clone().try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            overload.record("data connection limit reached");
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::debug!(error = %e, peer = %addr, "failed to set TCP_NODELAY");
+                    }
+                    let _ = clashx_rs_proxy::socket::set_keepalive(
+                        &stream,
+                        clashx_rs_proxy::timeout::KEEPALIVE_IDLE,
+                        clashx_rs_proxy::timeout::KEEPALIVE_INTERVAL,
+                        clashx_rs_proxy::timeout::KEEPALIVE_COUNT,
+                    );
+                    // Admission control: every connection holds a global permit
+                    // and starts in the general class pool. Exhaustion drops the
+                    // new connection without closing established tunnels.
+                    let slot = match crate::resources::ConnectionSlot::try_acquire() {
+                        Ok(slot) => slot,
+                        Err(crate::resources::AcquireError::Global) => {
+                            overload.record_global("data connection limit reached");
+                            drop(stream);
+                            continue;
+                        }
+                        Err(crate::resources::AcquireError::General) => {
+                            overload.record_general("general connection limit reached");
                             drop(stream);
                             continue;
                         }
                     };
                     let s = Arc::clone(&proxy_state);
+                    let started_at = Instant::now();
                     tokio::spawn(async move {
-                        let _permit = permit; // released on task exit
-                        if let Err(e) = handle_connection(stream, addr, s).await {
+                        if let Err(e) = handle_connection(stream, addr, s, slot, started_at).await {
                             tracing::debug!(error = %e, peer = %addr, "connection handler error");
                         }
                     });
@@ -754,6 +767,8 @@ async fn handle_connection(
     stream: TcpStream,
     source_addr: std::net::SocketAddr,
     state: Arc<RwLock<DaemonState>>,
+    mut slot: crate::resources::ConnectionSlot,
+    started_at: Instant,
 ) -> Result<()> {
     let InboundResult {
         target,
@@ -917,7 +932,15 @@ async fn handle_connection(
                 outbound::direct::connect(&target, direct_ip)
             })
             .await?;
-            relay_streams(inbound_stream, outbound, initial_data, None).await?;
+            relay_streams(
+                inbound_stream,
+                outbound,
+                initial_data,
+                None,
+                &mut slot,
+                started_at,
+            )
+            .await?;
             Ok(())
         }
         _ => {
@@ -930,6 +953,9 @@ async fn handle_connection(
             // the next candidate on failover. Starts as the HTTP plain-proxy
             // initial data (if any); grows with the client's first chunk(s).
             let mut replay: Vec<u8> = initial_data.unwrap_or_default();
+            // Set once the replay buffer overflows: bytes are still forwarded,
+            // but replaying the prefix would truncate the request.
+            let mut replay_truncated = false;
 
             for (i, (cand_name, cand_proxy)) in candidates.iter().enumerate() {
                 if i > 0 {
@@ -969,12 +995,22 @@ async fn handle_connection(
                     &mut inbound_stream,
                     &mut replay,
                     crate::retry::FIRST_BYTE_TIMEOUT,
+                    crate::retry::RELAY_IDLE,
+                    &mut replay_truncated,
                 )
                 .await
                 {
                     Ok(prefix) => {
                         cooldown.record_success(cand_name);
-                        relay_streams(inbound_stream, outbound, None, Some(prefix)).await?;
+                        relay_streams(
+                            inbound_stream,
+                            outbound,
+                            None,
+                            Some(prefix),
+                            &mut slot,
+                            started_at,
+                        )
+                        .await?;
                         return Ok(());
                     }
                     Err(FirstByteError::ClientClosed) => {
@@ -984,11 +1020,18 @@ async fn handle_connection(
                         );
                         return Ok(());
                     }
+                    Err(FirstByteError::Idle) => {
+                        tracing::debug!(
+                            target = %target_host,
+                            "idle tunnel reclaimed before first byte"
+                        );
+                        return Ok(());
+                    }
                     Err(FirstByteError::TimedOut) => {
                         // Not node-attributable: the origin may simply be
                         // slow. Never feed passive cooldown from here — the
                         // health probe owns that.
-                        if replay_is_safe(&replay) {
+                        if replay_is_safe(&replay, replay_truncated) {
                             if i + 1 == candidates.len() {
                                 // Every candidate gave the same answer — far
                                 // more likely a slow origin than N nodes dead
@@ -1000,7 +1043,15 @@ async fn handle_connection(
                                     target = %target_host,
                                     "no response on last candidate; continuing relay"
                                 );
-                                relay_streams(inbound_stream, outbound, None, None).await?;
+                                relay_streams(
+                                    inbound_stream,
+                                    outbound,
+                                    None,
+                                    None,
+                                    &mut slot,
+                                    started_at,
+                                )
+                                .await?;
                                 return Ok(());
                             }
                             cooldown.degrade(cand_name);
@@ -1023,7 +1074,15 @@ async fn handle_connection(
                                 target = %target_host,
                                 "no response after sending data; not replayable, continuing relay"
                             );
-                            relay_streams(inbound_stream, outbound, None, None).await?;
+                            relay_streams(
+                                inbound_stream,
+                                outbound,
+                                None,
+                                None,
+                                &mut slot,
+                                started_at,
+                            )
+                            .await?;
                             return Ok(());
                         }
                     }
@@ -1031,7 +1090,7 @@ async fn handle_connection(
                         // The remote definitely hung up. Not node-attributable
                         // either (the origin may RST this specific request),
                         // but there is nothing to continue with here.
-                        if replay_is_safe(&replay) {
+                        if replay_is_safe(&replay, replay_truncated) {
                             cooldown.degrade(cand_name);
                             tracing::warn!(
                                 proxy = %cand_name,
@@ -1213,6 +1272,9 @@ enum FirstByteError {
     RemoteClosed,
     /// The client went away before anything was exchanged; nothing to salvage.
     ClientClosed,
+    /// Neither side spoke within the relay idle budget (for example an idle
+    /// pre-connected tunnel); reclaim the resources.
+    Idle,
     /// The tunnel itself errored mid-write/mid-read — the connection *to the
     /// node* broke, which is node-attributable and may feed passive cooldown.
     Outbound(anyhow::Error),
@@ -1231,7 +1293,12 @@ enum FirstByteError {
 ///   request body or a pipelined second request (e.g. a POST), which must
 ///   never be duplicated. Phase 2 appends chunks as they arrive, so a
 ///   `starts_with` check alone is not sufficient.
-fn replay_is_safe(replay: &[u8]) -> bool {
+fn replay_is_safe(replay: &[u8], truncated: bool) -> bool {
+    // A prefix of the client's bytes is not a safe replay: the request would
+    // reach the next node incomplete.
+    if truncated {
+        return false;
+    }
     if replay.is_empty() {
         return true;
     }
@@ -1252,10 +1319,11 @@ fn replay_is_safe(replay: &[u8]) -> bool {
 
 /// Post-connect "first byte" window. Two phases:
 ///
-/// 1. Nothing forwarded yet — wait *without a deadline* for either the
-///    client to send data or the remote to speak first (SSH/SMTP banners).
-///    An idle pre-connected tunnel is indistinguishable from a half-dead
-///    node at this point, so we must not time out and misjudge the node.
+/// 1. Nothing forwarded yet — wait for either the client to send data or the
+///    remote to speak first (SSH/SMTP banners). This phase has no first-byte
+///    deadline: an idle pre-connected tunnel is indistinguishable from a
+///    half-dead node. It is bounded only by the longer relay idle budget so
+///    a genuinely idle tunnel is eventually reclaimed.
 /// 2. Client data has been forwarded — a response is now expected. Wait up
 ///    to `timeout` for the remote's first byte; the deadline re-arms on
 ///    every forwarded chunk so a late client request still gets the full
@@ -1269,10 +1337,16 @@ async fn first_byte_window(
     inbound: &mut TcpStream,
     replay: &mut Vec<u8>,
     timeout: Duration,
+    idle: Duration,
+    replay_truncated: &mut bool,
 ) -> Result<Vec<u8>, FirstByteError> {
     match outbound {
-        OutboundStream::Tcp(s) => first_byte_window_io(s, inbound, replay, timeout).await,
-        OutboundStream::Tls(s) => first_byte_window_io(&mut **s, inbound, replay, timeout).await,
+        OutboundStream::Tcp(s) => {
+            first_byte_window_io(s, inbound, replay, timeout, idle, replay_truncated).await
+        }
+        OutboundStream::Tls(s) => {
+            first_byte_window_io(&mut **s, inbound, replay, timeout, idle, replay_truncated).await
+        }
         OutboundStream::Rejected => Err(FirstByteError::Outbound(anyhow::anyhow!(
             "outbound rejected"
         ))),
@@ -1284,6 +1358,8 @@ async fn first_byte_window_io<S>(
     inbound: &mut TcpStream,
     replay: &mut Vec<u8>,
     timeout: Duration,
+    idle: Duration,
+    replay_truncated: &mut bool,
 ) -> Result<Vec<u8>, FirstByteError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1318,6 +1394,9 @@ where
                     }
                 }
             }
+            _ = tokio::time::sleep(idle), if !idle.is_zero() => {
+                return Err(FirstByteError::Idle);
+            }
         }
     } else {
         outbound
@@ -1330,7 +1409,7 @@ where
     // re-armed on every forwarded chunk.
     loop {
         let deadline = tokio::time::Instant::now() + timeout;
-        let read_client = !client_eof && replay.len() < crate::retry::MAX_REPLAY_BUFFER;
+        let read_client = !client_eof;
         tokio::select! {
             res = tokio::time::timeout_at(deadline, outbound.read(&mut out_buf)) => {
                 match res {
@@ -1345,7 +1424,16 @@ where
                     Err(_) => return Err(FirstByteError::ClientClosed),
                     Ok(0) => client_eof = true,
                     Ok(n) => {
-                        replay.extend_from_slice(&in_buf[..n]);
+                        // Forward everything, but cap only the replay buffer:
+                        // stopping the read at the cap would stall a large
+                        // prompt while the origin waits for the rest of it.
+                        let room = crate::retry::MAX_REPLAY_BUFFER.saturating_sub(replay.len());
+                        if room > 0 {
+                            replay.extend_from_slice(&in_buf[..room.min(n)]);
+                        }
+                        if n > room {
+                            *replay_truncated = true;
+                        }
                         outbound
                             .write_all(&in_buf[..n])
                             .await
@@ -1366,7 +1454,16 @@ async fn relay_streams(
     outbound: OutboundStream,
     initial_data: Option<Vec<u8>>,
     remote_prefix: Option<Vec<u8>>,
+    slot: &mut crate::resources::ConnectionSlot,
+    started_at: Instant,
 ) -> Result<()> {
+    let policy = RelayPolicy {
+        idle: crate::retry::RELAY_IDLE,
+        half_close_idle: crate::retry::HALF_CLOSE_GENERAL,
+        // The connection may already be older than the promotion age (slow
+        // first-byte window); promote on the first relay tick in that case.
+        promote_after: Some(crate::retry::PROMOTE_AFTER.saturating_sub(started_at.elapsed())),
+    };
     match outbound {
         OutboundStream::Tcp(mut tcp) => {
             if let Some(data) = initial_data {
@@ -1375,7 +1472,8 @@ async fn relay_streams(
             if let Some(prefix) = remote_prefix {
                 inbound.write_all(&prefix).await?;
             }
-            relay(inbound, tcp).await?;
+            let stats = relay_with_policy(inbound, tcp, policy, slot).await?;
+            log_relay(&stats, slot.class());
         }
         OutboundStream::Tls(mut tls) => {
             if let Some(data) = initial_data {
@@ -1384,13 +1482,25 @@ async fn relay_streams(
             if let Some(prefix) = remote_prefix {
                 inbound.write_all(&prefix).await?;
             }
-            relay(&mut inbound, &mut *tls).await?;
+            let stats = relay_with_policy(&mut inbound, &mut *tls, policy, slot).await?;
+            log_relay(&stats, slot.class());
         }
         OutboundStream::Rejected => {
             drop(inbound);
         }
     }
     Ok(())
+}
+
+fn log_relay(stats: &clashx_rs_proxy::relay::RelayStats, class: crate::resources::ConnectionClass) {
+    tracing::debug!(
+        ?class,
+        bytes_in = stats.a_to_b,
+        bytes_out = stats.b_to_a,
+        end = ?stats.end,
+        promoted = stats.promoted,
+        "relay finished"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2287,22 +2397,33 @@ mod tests {
 
         let mut os = OutboundStream::Tcp(outbound);
         let mut replay = Vec::new();
-        let prefix = first_byte_window(&mut os, &mut inbound, &mut replay, Duration::from_secs(2))
-            .await
-            .unwrap();
+        let mut truncated = false;
+        let prefix = first_byte_window(
+            &mut os,
+            &mut inbound,
+            &mut replay,
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            &mut truncated,
+        )
+        .await
+        .unwrap();
         assert_eq!(prefix, b"SERVER-HELLO");
         assert!(replay.is_empty());
+        assert!(!truncated);
     }
 
     #[tokio::test]
     async fn first_byte_silent_remote_no_deadline_before_client_data() {
-        // Idle tunnel (nothing sent): the window must NOT time out — an idle
-        // pre-connected tunnel is indistinguishable from a half-dead node.
+        // Idle tunnel (nothing sent): the first-byte window must NOT time out.
+        // The relay's long idle budget is what eventually reclaims it, not the
+        // first-byte timeout.
         let (outbound, _remote) = loopback_pair().await;
         let (mut inbound, _client) = loopback_pair().await;
 
         let mut os = OutboundStream::Tcp(outbound);
         let mut replay = Vec::new();
+        let mut truncated = false;
         let res = tokio::time::timeout(
             Duration::from_millis(300),
             first_byte_window(
@@ -2310,6 +2431,8 @@ mod tests {
                 &mut inbound,
                 &mut replay,
                 Duration::from_millis(100),
+                Duration::from_secs(30),
+                &mut truncated,
             ),
         )
         .await;
@@ -2317,6 +2440,27 @@ mod tests {
             res.is_err(),
             "window must stay pending while nothing is sent"
         );
+    }
+
+    #[tokio::test]
+    async fn first_byte_idle_times_out() {
+        let (outbound, _remote) = loopback_pair().await;
+        let (mut inbound, _client) = loopback_pair().await;
+
+        let mut os = OutboundStream::Tcp(outbound);
+        let mut replay = Vec::new();
+        let mut truncated = false;
+        let err = first_byte_window(
+            &mut os,
+            &mut inbound,
+            &mut replay,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+            &mut truncated,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, FirstByteError::Idle));
     }
 
     #[tokio::test]
@@ -2328,11 +2472,14 @@ mod tests {
 
         let mut os = OutboundStream::Tcp(outbound);
         let mut replay = b"GET / HTTP/1.1\r\n\r\n".to_vec();
+        let mut truncated = false;
         let err = first_byte_window(
             &mut os,
             &mut inbound,
             &mut replay,
             Duration::from_millis(200),
+            Duration::from_secs(30),
+            &mut truncated,
         )
         .await
         .unwrap_err();
@@ -2360,11 +2507,14 @@ mod tests {
 
         let mut os = OutboundStream::Tcp(outbound);
         let mut replay = Vec::new();
+        let mut truncated = false;
         let prefix = first_byte_window(
             &mut os,
             &mut inbound,
             &mut replay,
             Duration::from_millis(200),
+            Duration::from_secs(30),
+            &mut truncated,
         )
         .await
         .unwrap();
@@ -2396,12 +2546,21 @@ mod tests {
 
         let mut os = OutboundStream::Tcp(outbound);
         let mut replay = b"INIT".to_vec();
-        let prefix = first_byte_window(&mut os, &mut inbound, &mut replay, Duration::from_secs(2))
-            .await
-            .unwrap();
+        let mut truncated = false;
+        let prefix = first_byte_window(
+            &mut os,
+            &mut inbound,
+            &mut replay,
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            &mut truncated,
+        )
+        .await
+        .unwrap();
         assert_eq!(prefix, b"RESP");
         // Both chunks are buffered for a potential failover replay.
         assert_eq!(replay, b"INITCLIENT");
+        assert!(!truncated);
     }
 
     #[tokio::test]
@@ -2412,9 +2571,17 @@ mod tests {
 
         let mut os = OutboundStream::Tcp(outbound);
         let mut replay = Vec::new();
-        let err = first_byte_window(&mut os, &mut inbound, &mut replay, Duration::from_secs(2))
-            .await
-            .unwrap_err();
+        let mut truncated = false;
+        let err = first_byte_window(
+            &mut os,
+            &mut inbound,
+            &mut replay,
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            &mut truncated,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, FirstByteError::ClientClosed));
     }
 
@@ -2426,35 +2593,47 @@ mod tests {
 
         let mut os = OutboundStream::Tcp(outbound);
         let mut replay = Vec::new();
-        let err = first_byte_window(&mut os, &mut inbound, &mut replay, Duration::from_secs(2))
-            .await
-            .unwrap_err();
+        let mut truncated = false;
+        let err = first_byte_window(
+            &mut os,
+            &mut inbound,
+            &mut replay,
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            &mut truncated,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, FirstByteError::RemoteClosed));
     }
 
     #[test]
     fn replay_safety_rules() {
-        assert!(replay_is_safe(b""));
+        assert!(replay_is_safe(b"", false));
         // TLS ClientHello (record type 0x16, version 0x0301).
-        assert!(replay_is_safe(&[0x16, 0x03, 0x01, 0x00, 0x2a]));
+        assert!(replay_is_safe(&[0x16, 0x03, 0x01, 0x00, 0x2a], false));
         // Idempotent HTTP methods, headers only.
-        assert!(replay_is_safe(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
-        assert!(replay_is_safe(b"HEAD /h HTTP/1.0\r\n\r\n"));
-        assert!(replay_is_safe(b"OPTIONS * HTTP/1.1\r\n\r\n"));
+        assert!(replay_is_safe(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", false));
+        assert!(replay_is_safe(b"HEAD /h HTTP/1.0\r\n\r\n", false));
+        assert!(replay_is_safe(b"OPTIONS * HTTP/1.1\r\n\r\n", false));
         // Incomplete headers — nothing beyond them can exist.
-        assert!(replay_is_safe(b"GET / HTTP/1.1\r\nHost: x\r\n"));
+        assert!(replay_is_safe(b"GET / HTTP/1.1\r\nHost: x\r\n", false));
         // Anything after the header terminator (body or pipelined request)
         // makes the buffer non-replayable, even for idempotent methods.
-        assert!(!replay_is_safe(b"PUT /x HTTP/1.1\r\n\r\n{\"a\":1}"));
+        assert!(!replay_is_safe(b"PUT /x HTTP/1.1\r\n\r\n{\"a\":1}", false));
         assert!(!replay_is_safe(
-            b"GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n"
+            b"GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n",
+            false
         ));
         assert!(!replay_is_safe(
-            b"DELETE /x HTTP/1.1\r\n\r\nPOST /y HTTP/1.1\r\n\r\n"
+            b"DELETE /x HTTP/1.1\r\n\r\nPOST /y HTTP/1.1\r\n\r\n",
+            false
         ));
         // Non-idempotent / non-replayable.
-        assert!(!replay_is_safe(b"POST /submit HTTP/1.1\r\n\r\n"));
-        assert!(!replay_is_safe(b"PATCH /x HTTP/1.1\r\n\r\n"));
-        assert!(!replay_is_safe(&[0x05, 0x01, 0x00])); // SOCKS5 greeting
+        assert!(!replay_is_safe(b"POST /submit HTTP/1.1\r\n\r\n", false));
+        assert!(!replay_is_safe(b"PATCH /x HTTP/1.1\r\n\r\n", false));
+        assert!(!replay_is_safe(&[0x05, 0x01, 0x00], false)); // SOCKS5 greeting
+                                                              // A truncated prefix must never be replayed, even if it looks safe.
+        assert!(!replay_is_safe(b"GET / HTTP/1.1\r\n\r\n", true));
     }
 }

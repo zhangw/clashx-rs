@@ -11,6 +11,11 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// fast and failover can move on; a healthy node handshakes in well under 1s.
 pub const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// TCP keepalive backstop for peers that vanish without FIN/RST.
+pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub const KEEPALIVE_COUNT: u32 = 3;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -21,8 +21,18 @@ pub(crate) async fn dial_server(
     port: u16,
     resolved_ip: Option<IpAddr>,
 ) -> std::io::Result<TcpStream> {
-    match resolved_ip {
-        Some(ip) => TcpStream::connect(SocketAddr::new(ip, port)).await,
-        None => TcpStream::connect((server, port)).await,
-    }
+    let stream = match resolved_ip {
+        Some(ip) => TcpStream::connect(SocketAddr::new(ip, port)).await?,
+        None => TcpStream::connect((server, port)).await?,
+    };
+    // Token streams are small, latency-sensitive writes; Nagle would batch
+    // them on the order of tens of milliseconds.
+    let _ = stream.set_nodelay(true);
+    let _ = crate::socket::set_keepalive(
+        &stream,
+        crate::timeout::KEEPALIVE_IDLE,
+        crate::timeout::KEEPALIVE_INTERVAL,
+        crate::timeout::KEEPALIVE_COUNT,
+    );
+    Ok(stream)
 }

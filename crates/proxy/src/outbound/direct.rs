@@ -30,6 +30,13 @@ pub async fn connect(target: &TargetAddr, resolved_ip: Option<IpAddr>) -> Result
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect)
         .await
         .context("direct connect timed out")??;
+    let _ = stream.set_nodelay(true);
+    let _ = crate::socket::set_keepalive(
+        &stream,
+        crate::timeout::KEEPALIVE_IDLE,
+        crate::timeout::KEEPALIVE_INTERVAL,
+        crate::timeout::KEEPALIVE_COUNT,
+    );
     Ok(OutboundStream::Tcp(stream))
 }
 
