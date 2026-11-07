@@ -55,7 +55,18 @@ pub struct Budget {
     stalled: AtomicU64,
     relay_errors: AtomicU64,
     half_closed_current: AtomicU64,
+    peer_closed: AtomicU64,
+    last_relay_error: std::sync::Mutex<Option<LastRelayError>>,
+    relay_error_warned: std::sync::Mutex<Option<Instant>>,
     promotion_failure_warned: std::sync::Mutex<Option<Instant>>,
+}
+
+#[derive(Debug, Clone)]
+struct LastRelayError {
+    at: Instant,
+    target: String,
+    proxy: String,
+    message: String,
 }
 
 fn capacity(soft: u64) -> usize {
@@ -119,6 +130,9 @@ pub fn initialize() -> anyhow::Result<&'static Budget> {
         stalled: AtomicU64::new(0),
         relay_errors: AtomicU64::new(0),
         half_closed_current: AtomicU64::new(0),
+        peer_closed: AtomicU64::new(0),
+        last_relay_error: std::sync::Mutex::new(None),
+        relay_error_warned: std::sync::Mutex::new(None),
         promotion_failure_warned: std::sync::Mutex::new(None),
     });
     tracing::info!(
@@ -131,6 +145,24 @@ pub fn initialize() -> anyhow::Result<&'static Budget> {
         "file descriptor budget"
     );
     Ok(BUDGET.get().expect("budget initialized"))
+}
+
+fn last_relay_error(budget: &Budget) -> serde_json::Value {
+    budget
+        .last_relay_error
+        .lock()
+        .ok()
+        .and_then(|last| {
+            last.as_ref().map(|error| {
+                serde_json::json!({
+                    "age_secs": error.at.elapsed().as_secs(),
+                    "target": error.target,
+                    "proxy": error.proxy,
+                    "message": error.message,
+                })
+            })
+        })
+        .unwrap_or(serde_json::Value::Null)
 }
 
 pub fn status() -> serde_json::Value {
@@ -156,7 +188,9 @@ pub fn status() -> serde_json::Value {
                 "admitted_count": b.admitted.load(Ordering::Relaxed),
                 "stalled_count": b.stalled.load(Ordering::Relaxed),
                 "relay_error_count": b.relay_errors.load(Ordering::Relaxed),
+                "peer_closed_count": b.peer_closed.load(Ordering::Relaxed),
                 "current_half_closed": b.half_closed_current.load(Ordering::Relaxed),
+                "last_relay_error": last_relay_error(b),
             })
         })
         .unwrap_or(serde_json::Value::Null)
@@ -203,6 +237,7 @@ pub struct Counters {
     pub idle_reaped: u64,
     pub half_closed_reaped: u64,
     pub relay_errors: u64,
+    pub peer_closed: u64,
     pub stalled: u64,
     pub overloads: u64,
     pub general_overloads: u64,
@@ -220,6 +255,7 @@ impl Counters {
                 .half_closed_reaped
                 .saturating_sub(previous.half_closed_reaped),
             relay_errors: self.relay_errors.saturating_sub(previous.relay_errors),
+            peer_closed: self.peer_closed.saturating_sub(previous.peer_closed),
             stalled: self.stalled.saturating_sub(previous.stalled),
             overloads: self.overloads.saturating_sub(previous.overloads),
             general_overloads: self
@@ -242,6 +278,7 @@ pub fn counters() -> Counters {
             idle_reaped: b.idle_reaped.load(Ordering::Relaxed),
             half_closed_reaped: b.half_closed_reaped.load(Ordering::Relaxed),
             relay_errors: b.relay_errors.load(Ordering::Relaxed),
+            peer_closed: b.peer_closed.load(Ordering::Relaxed),
             stalled: b.stalled.load(Ordering::Relaxed),
             overloads: b.overloads.load(Ordering::Relaxed),
             general_overloads: b.general_overloads.load(Ordering::Relaxed),
@@ -257,9 +294,29 @@ pub fn record_stalled() {
     }
 }
 
-pub fn record_relay_error() {
-    if let Some(budget) = BUDGET.get() {
-        budget.relay_errors.fetch_add(1, Ordering::Relaxed);
+/// Record a genuine relay error (not a peer reset/abort, which the relay
+/// classifies as `RelayEnd::PeerClosed`). Keeps the most recent error for
+/// remote diagnosis via `status` and emits a throttled warning.
+pub fn record_relay_error(error: &anyhow::Error, target: &str, proxy: &str) {
+    let Some(budget) = BUDGET.get() else {
+        return;
+    };
+    budget.relay_errors.fetch_add(1, Ordering::Relaxed);
+    let message = format!("{error:#}");
+    if let Ok(mut last) = budget.last_relay_error.lock() {
+        *last = Some(LastRelayError {
+            at: Instant::now(),
+            target: target.to_string(),
+            proxy: proxy.to_string(),
+            message: message.clone(),
+        });
+    }
+
+    let now = Instant::now();
+    let mut warned = budget.relay_error_warned.lock().unwrap();
+    if warned.is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(60)) {
+        tracing::warn!(target, proxy, error = %message, "relay error");
+        *warned = Some(now);
     }
 }
 
@@ -278,6 +335,9 @@ pub fn record_relay_end(end: clashx_rs_proxy::relay::RelayEnd) {
         }
         clashx_rs_proxy::relay::RelayEnd::HalfClosed => {
             budget.half_closed_reaped.fetch_add(1, Ordering::Relaxed);
+        }
+        clashx_rs_proxy::relay::RelayEnd::PeerClosed => {
+            budget.peer_closed.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -497,6 +557,9 @@ mod tests {
             stalled: AtomicU64::new(0),
             relay_errors: AtomicU64::new(0),
             half_closed_current: AtomicU64::new(0),
+            peer_closed: AtomicU64::new(0),
+            last_relay_error: std::sync::Mutex::new(None),
+            relay_error_warned: std::sync::Mutex::new(None),
             promotion_failure_warned: std::sync::Mutex::new(None),
         }))
     }

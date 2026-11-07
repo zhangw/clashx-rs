@@ -759,6 +759,7 @@ async fn run_daemon(
                 idle_reaped = delta.idle_reaped,
                 half_closed_reaped = delta.half_closed_reaped,
                 relay_errors = delta.relay_errors,
+                peer_closed = delta.peer_closed,
                 stalled = delta.stalled,
                 overloads = delta.overloads,
                 general_overloads = delta.general_overloads,
@@ -1596,7 +1597,7 @@ async fn relay_streams(
             let stats = match relay_with_policy(inbound, tcp, policy, slot).await {
                 Ok(stats) => stats,
                 Err(error) => {
-                    crate::resources::record_relay_error();
+                    crate::resources::record_relay_error(&error, context.target, context.proxy);
                     return Err(error);
                 }
             };
@@ -1612,7 +1613,7 @@ async fn relay_streams(
             let stats = match relay_with_policy(&mut inbound, &mut *tls, policy, slot).await {
                 Ok(stats) => stats,
                 Err(error) => {
-                    crate::resources::record_relay_error();
+                    crate::resources::record_relay_error(&error, context.target, context.proxy);
                     return Err(error);
                 }
             };

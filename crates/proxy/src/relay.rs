@@ -46,6 +46,9 @@ pub enum RelayEnd {
     /// One direction reached EOF and the other went idle within
     /// `half_close_idle`.
     HalfClosed,
+    /// A peer reset/aborted the connection or closed without a clean TLS
+    /// shutdown. This is a normal termination, not a relay error.
+    PeerClosed,
 }
 
 #[derive(Debug)]
@@ -138,6 +141,19 @@ impl<R: AsyncRead + Unpin> AsyncRead for ActivityReader<R> {
     }
 }
 
+/// Peer-driven closes are normal termination for a proxy: clients reset
+/// HTTP/2 connections, and TLS peers often close without close_notify.
+fn is_peer_closed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+    )
+}
+
 fn tick_interval(policy: &RelayPolicy) -> Duration {
     let mut tick = MAX_TICK;
     for duration in [policy.idle, policy.half_close_idle] {
@@ -222,6 +238,17 @@ where
                         activity.touch();
                         let _ = time::timeout(SHUTDOWN_TIMEOUT, b_writer.shutdown()).await;
                     }
+                    Err(error) if is_peer_closed(&error) => {
+                        if half_closed_reported {
+                            promotion.on_half_closed(false);
+                        }
+                        return Ok(RelayStats {
+                            a_to_b: a_to_b_count.load(Ordering::Relaxed),
+                            b_to_a: b_to_a_count.load(Ordering::Relaxed),
+                            end: RelayEnd::PeerClosed,
+                            promoted,
+                        });
+                    }
                     Err(error) => {
                         if half_closed_reported {
                             promotion.on_half_closed(false);
@@ -241,6 +268,17 @@ where
                         }
                         activity.touch();
                         let _ = time::timeout(SHUTDOWN_TIMEOUT, a_writer.shutdown()).await;
+                    }
+                    Err(error) if is_peer_closed(&error) => {
+                        if half_closed_reported {
+                            promotion.on_half_closed(false);
+                        }
+                        return Ok(RelayStats {
+                            a_to_b: a_to_b_count.load(Ordering::Relaxed),
+                            b_to_a: b_to_a_count.load(Ordering::Relaxed),
+                            end: RelayEnd::PeerClosed,
+                            promoted,
+                        });
                     }
                     Err(error) => {
                         if half_closed_reported {
@@ -340,6 +378,22 @@ mod tests {
             half_close_idle: half_close,
             promote_after: None,
         }
+    }
+
+    #[test]
+    fn peer_closed_error_kinds() {
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::NotConnected,
+        ] {
+            assert!(is_peer_closed(&io::Error::from(kind)), "{kind:?}");
+        }
+        assert!(!is_peer_closed(&io::Error::from(
+            io::ErrorKind::InvalidData
+        )));
     }
 
     #[tokio::test]

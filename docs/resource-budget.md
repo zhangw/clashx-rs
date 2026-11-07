@@ -70,9 +70,11 @@ counters.
 
 `status.resources` exposes the startup soft/hard FD limits, the global
 connection limit, per-class limits and active counts, admissions, promotion
-success/failure, relay errors, stalled writes, the current half-closed gauge,
-relay completion/idle/half-close reap counts, and the resource-pressure
-counters (`overload_count` includes general-class rejections). Active control
+success/failure, relay errors and peer-closed terminations, stalled writes,
+the current half-closed gauge, relay completion/idle/half-close/peer-closed
+reap counts, the most recent genuine relay error (`last_relay_error`), and
+the resource-pressure counters (`overload_count` includes general-class
+rejections). Active control
 connections include the status request itself. These are connection counts,
 not a live enumeration of all process descriptors.
 
@@ -86,6 +88,12 @@ not a live enumeration of all process descriptors.
   occupancy; `promotion_failure_count` carries the exact rate.
 - WARN `upstream stopped reading` is emitted at most once per 30 seconds per
   proxy; `stalled_count` carries the exact rate.
+- Peer resets, aborts, broken pipes and TLS EOF are classified as
+  `PeerClosed` (normal termination) and counted in `peer_closed_count`, not in
+  `relay_error_count`.
+- A genuine relay error increments `relay_error_count`, updates
+  `last_relay_error` (age, target, proxy, message) and emits a WARN at most
+  once per minute.
 - INFO `hourly connection summary` reports per-hour deltas plus current pool
   occupancy, so a headless daemon has a heartbeat without per-connection logs.
 - Per-connection routing and relay-end lines are DEBUG and include peer,
