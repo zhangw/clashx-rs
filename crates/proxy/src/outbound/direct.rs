@@ -31,12 +31,14 @@ pub async fn connect(target: &TargetAddr, resolved_ip: Option<IpAddr>) -> Result
         .await
         .context("direct connect timed out")??;
     let _ = stream.set_nodelay(true);
-    let _ = crate::socket::set_keepalive(
+    if let Err(e) = crate::socket::set_keepalive(
         &stream,
         crate::timeout::KEEPALIVE_IDLE,
         crate::timeout::KEEPALIVE_INTERVAL,
         crate::timeout::KEEPALIVE_COUNT,
-    );
+    ) {
+        tracing::debug!(error = %e, "could not enable TCP keepalive");
+    }
     Ok(OutboundStream::Tcp(stream))
 }
 

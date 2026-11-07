@@ -20,6 +20,12 @@ listener. Freed capacity automatically admits new connections. This is not a
 guarantee that an exhausted system can serve control requests; it prevents
 normal admitted data traffic from consuming the control reserve.
 
+Admission always starts in the `general` class: at most 1536 connections
+younger than 30 seconds can be admitted at once. The remaining 512 global
+permits are reserved for the `streaming` class and only become reachable via
+promotion. `general_overload_count` is the signal for this pre-promotion
+ceiling; the overall `connection_limit` in `status.resources` remains 2048.
+
 Control clients have a ten-second idle read/write deadline; executing a
 command is not subject to that deadline.
 
@@ -28,9 +34,13 @@ command is not subject to that deadline.
 Every data connection starts in the `general` class. The two class pools
 (1536 permits each) sit under the 2048 global cap, so each class is always
 guaranteed at least 512 permits. A class cannot exceed 1536 even when the
-other is idle; the remaining headroom is the other class's guarantee. A connection still open after 30 seconds is promoted to the
-`streaming` class: the class permit is swapped and the half-close inactivity
-timeout changes from 60 seconds to 10 minutes. Promotion is based on observed
+other is idle; the remaining headroom is the other class's guarantee. A
+connection still open after 30 seconds is promoted to the `streaming` class:
+the class permit is swapped and the half-close inactivity timeout changes
+from 60 seconds to 10 minutes. Promotion is attempted once; if the streaming
+pool is full the connection keeps its general permit but still receives the
+streaming timeout, and `promotion_failure_count` records the sticky failure
+(it is not retried in this version). Promotion is based on observed
 lifetime, not on the destination host, so short and long requests to the same
 API domain land in different classes. If the streaming pool is full, the
 connection keeps its general permit but still receives the long timeout; the
@@ -47,8 +57,9 @@ Relay lifetime is activity-based, never a total-duration cap:
 This keeps LLM reasoning streams (long silent gaps, slow token output) alive
 while still reclaiming cancelled or dead tunnels. The 10-minute streaming
 half-close is aligned with the OpenAI Python SDK's default 10-minute read
-timeout; the proxy must not be stricter than the clients it serves. `TCP_NODELAY` and a
-60s/15s/3 TCP keepalive profile are applied to inbound and outbound sockets;
+timeout; the proxy must not be stricter than the clients it serves.
+`TCP_NODELAY` and a 60s/15s/3 TCP keepalive profile are applied to inbound and
+outbound sockets;
 keepalive is a backstop for vanished peers, not a substitute for the timers.
 
 Configuration reload keeps the same process-wide budget, permits and
@@ -56,7 +67,8 @@ counters.
 
 `status.resources` exposes the startup soft/hard FD limits, the global
 connection limit, per-class limits and active counts, promotion success and
-failure counts, and the resource-pressure counters. Active control
+failure counts, relay completion/idle/half-close reap counts, and the
+resource-pressure counters. Active control
 connections include the status request itself. These are connection counts,
 not a live enumeration of all process descriptors.
 

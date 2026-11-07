@@ -698,12 +698,14 @@ async fn run_daemon(
                     if let Err(e) = stream.set_nodelay(true) {
                         tracing::debug!(error = %e, peer = %addr, "failed to set TCP_NODELAY");
                     }
-                    let _ = clashx_rs_proxy::socket::set_keepalive(
+                    if let Err(e) = clashx_rs_proxy::socket::set_keepalive(
                         &stream,
                         clashx_rs_proxy::timeout::KEEPALIVE_IDLE,
                         clashx_rs_proxy::timeout::KEEPALIVE_INTERVAL,
                         clashx_rs_proxy::timeout::KEEPALIVE_COUNT,
-                    );
+                    ) {
+                        tracing::debug!(error = %e, peer = %addr, "could not enable TCP keepalive");
+                    }
                     // Admission control: every connection holds a global permit
                     // and starts in the general class pool. Exhaustion drops the
                     // new connection without closing established tunnels.
@@ -1111,6 +1113,21 @@ async fn handle_connection(
                             ));
                         }
                     }
+                    Err(FirstByteError::Stalled) => {
+                        // The node stopped reading mid-request. A timeout may
+                        // have interrupted a partial write, so failing over
+                        // would send a truncated request: close and let the
+                        // client retry from scratch.
+                        cooldown.record_failure(cand_name);
+                        tracing::warn!(
+                            proxy = %cand_name,
+                            target = %target_host,
+                            "upstream stopped reading; closing stalled tunnel"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "upstream stalled while receiving the request via {cand_name}"
+                        ));
+                    }
                     Err(FirstByteError::Outbound(e)) => {
                         // The tunnel to the node itself broke — this *is*
                         // node-attributable.
@@ -1275,6 +1292,10 @@ enum FirstByteError {
     /// Neither side spoke within the relay idle budget (for example an idle
     /// pre-connected tunnel); reclaim the resources.
     Idle,
+    /// The remote stopped reading while client bytes were being forwarded.
+    /// The request may have been partially delivered, so this is not a
+    /// replay-safe failure: close the connection and let the client retry.
+    Stalled,
     /// The tunnel itself errored mid-write/mid-read — the connection *to the
     /// node* broke, which is node-attributable and may feed passive cooldown.
     Outbound(anyhow::Error),
@@ -1371,7 +1392,8 @@ where
     // on its way and the client can still receive it.
     let mut client_eof = false;
 
-    // Phase 1: nothing sent yet — wait indefinitely for someone to speak.
+    // Phase 1: nothing sent yet — wait for the first event, bounded by the
+    // relay idle budget so an idle pre-connect cannot hold a permit forever.
     if replay.is_empty() {
         tokio::select! {
             res = outbound.read(&mut out_buf) => {
@@ -1387,10 +1409,15 @@ where
                     Ok(0) => return Err(FirstByteError::ClientClosed),
                     Ok(n) => {
                         replay.extend_from_slice(&in_buf[..n]);
-                        outbound
-                            .write_all(&in_buf[..n])
-                            .await
-                            .map_err(|e| FirstByteError::Outbound(e.into()))?;
+                        // A node that accepts the tunnel but stops reading must
+                        // not pin this handler: bound the forward by the same
+                        // budget. A partial write cannot be replayed safely.
+                        match tokio::time::timeout(timeout, outbound.write_all(&in_buf[..n])).await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(FirstByteError::Outbound(e.into())),
+                            Err(_) => return Err(FirstByteError::Stalled),
+                        }
                     }
                 }
             }
@@ -1399,10 +1426,11 @@ where
             }
         }
     } else {
-        outbound
-            .write_all(replay)
-            .await
-            .map_err(|e| FirstByteError::Outbound(e.into()))?;
+        match tokio::time::timeout(timeout, outbound.write_all(replay)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(FirstByteError::Outbound(e.into())),
+            Err(_) => return Err(FirstByteError::Stalled),
+        }
     }
 
     // Phase 2: client data sent — expect a response within `timeout`,
@@ -1434,10 +1462,16 @@ where
                         if n > room {
                             *replay_truncated = true;
                         }
-                        outbound
-                            .write_all(&in_buf[..n])
+                        // Use a fresh per-write budget rather than the read
+                        // deadline: a slow client read must not consume the
+                        // budget available to forward the bytes it just sent.
+                        match tokio::time::timeout(timeout, outbound.write_all(&in_buf[..n]))
                             .await
-                            .map_err(|e| FirstByteError::Outbound(e.into()))?;
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(FirstByteError::Outbound(e.into())),
+                            Err(_) => return Err(FirstByteError::Stalled),
+                        }
                         // Keep waiting; the deadline re-arms next iteration.
                     }
                 }
@@ -1449,6 +1483,18 @@ where
 /// Write any initial data from HTTP plain proxy plus any already-consumed
 /// remote prefix bytes, then relay between inbound and the appropriate
 /// outbound stream variant.
+/// Write pre-relay bytes with a bound; a stuck upstream must not hold the
+/// connection before the relay's own timers exist.
+async fn write_initial<W>(writer: &mut W, data: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(crate::retry::FIRST_BYTE_TIMEOUT, writer.write_all(data))
+        .await
+        .context("initial write timed out")??;
+    Ok(())
+}
+
 async fn relay_streams(
     mut inbound: TcpStream,
     outbound: OutboundStream,
@@ -1467,20 +1513,20 @@ async fn relay_streams(
     match outbound {
         OutboundStream::Tcp(mut tcp) => {
             if let Some(data) = initial_data {
-                tcp.write_all(&data).await?;
+                write_initial(&mut tcp, &data).await?;
             }
             if let Some(prefix) = remote_prefix {
-                inbound.write_all(&prefix).await?;
+                write_initial(&mut inbound, &prefix).await?;
             }
             let stats = relay_with_policy(inbound, tcp, policy, slot).await?;
             log_relay(&stats, slot.class());
         }
         OutboundStream::Tls(mut tls) => {
             if let Some(data) = initial_data {
-                tls.write_all(&data).await?;
+                write_initial(&mut tls, &data).await?;
             }
             if let Some(prefix) = remote_prefix {
-                inbound.write_all(&prefix).await?;
+                write_initial(&mut inbound, &prefix).await?;
             }
             let stats = relay_with_policy(&mut inbound, &mut *tls, policy, slot).await?;
             log_relay(&stats, slot.class());
@@ -1493,12 +1539,13 @@ async fn relay_streams(
 }
 
 fn log_relay(stats: &clashx_rs_proxy::relay::RelayStats, class: crate::resources::ConnectionClass) {
+    crate::resources::record_relay_end(stats.end);
     tracing::debug!(
         ?class,
         bytes_in = stats.a_to_b,
         bytes_out = stats.b_to_a,
         end = ?stats.end,
-        promoted = stats.promoted,
+        promotion_attempted = stats.promoted,
         "relay finished"
     );
 }
@@ -2461,6 +2508,31 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, FirstByteError::Idle));
+    }
+
+    #[tokio::test]
+    async fn first_byte_stalled_write_times_out() {
+        // A node that accepts the tunnel but stops reading must not pin the
+        // handler: the forward is bounded and surfaces as Stalled.
+        let (mut client, mut inbound) = loopback_pair().await;
+        let (mut outbound, _peer) = tokio::io::duplex(1);
+        tokio::spawn(async move {
+            client.write_all(&[b'x'; 8192]).await.unwrap();
+        });
+
+        let mut replay = Vec::new();
+        let mut truncated = false;
+        let err = first_byte_window_io(
+            &mut outbound,
+            &mut inbound,
+            &mut replay,
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            &mut truncated,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, FirstByteError::Stalled));
     }
 
     #[tokio::test]

@@ -28,11 +28,13 @@ pub(crate) async fn dial_server(
     // Token streams are small, latency-sensitive writes; Nagle would batch
     // them on the order of tens of milliseconds.
     let _ = stream.set_nodelay(true);
-    let _ = crate::socket::set_keepalive(
+    if let Err(e) = crate::socket::set_keepalive(
         &stream,
         crate::timeout::KEEPALIVE_IDLE,
         crate::timeout::KEEPALIVE_INTERVAL,
         crate::timeout::KEEPALIVE_COUNT,
-    );
+    ) {
+        tracing::debug!(error = %e, "could not enable TCP keepalive");
+    }
     Ok(stream)
 }

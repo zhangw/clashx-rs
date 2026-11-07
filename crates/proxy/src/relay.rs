@@ -53,6 +53,8 @@ pub struct RelayStats {
     pub a_to_b: u64,
     pub b_to_a: u64,
     pub end: RelayEnd,
+    /// The promotion callback was invoked. The resource-pool upgrade may
+    /// still have been denied; use the connection class for the actual state.
     pub promoted: bool,
 }
 
@@ -106,6 +108,7 @@ impl Activity {
 struct ActivityReader<R> {
     inner: R,
     activity: Arc<Activity>,
+    bytes: Arc<AtomicU64>,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for ActivityReader<R> {
@@ -118,8 +121,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for ActivityReader<R> {
         let before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
-                if buf.filled().len() > before {
+                let read = buf.filled().len().saturating_sub(before);
+                if read > 0 {
                     this.activity.touch();
+                    this.bytes.fetch_add(read as u64, Ordering::Relaxed);
                 }
                 Poll::Ready(Ok(()))
             }
@@ -135,11 +140,10 @@ fn tick_interval(policy: &RelayPolicy) -> Duration {
             tick = tick.min(duration / 4);
         }
     }
-    if let Some(duration) = policy.promote_after {
-        if !duration.is_zero() {
-            tick = tick.min(duration / 4);
-        }
-    }
+    // Promotion is checked on the regular tick. 5s of precision is well
+    // below the 60s general half-close floor, and tying the tick to a
+    // near-term promotion age would leave late-starting relays on a
+    // millisecond ticker for their whole life.
     tick.max(MIN_TICK)
 }
 
@@ -171,8 +175,10 @@ where
 
     let mut a_to_b_done = false;
     let mut b_to_a_done = false;
-    let mut a_to_b_bytes = 0u64;
-    let mut b_to_a_bytes = 0u64;
+    // Incremented on every read, so the counters are meaningful even when a
+    // connection is reaped before either copy future completes.
+    let a_to_b_count = Arc::new(AtomicU64::new(0));
+    let b_to_a_count = Arc::new(AtomicU64::new(0));
     let mut promoted = false;
 
     // Both futures borrow their own halves; replacing a finished future with
@@ -181,6 +187,7 @@ where
         let mut reader = ActivityReader {
             inner: &mut a_reader,
             activity: activity.clone(),
+            bytes: a_to_b_count.clone(),
         };
         tokio::io::copy(&mut reader, &mut b_writer).await
     });
@@ -188,6 +195,7 @@ where
         let mut reader = ActivityReader {
             inner: &mut b_reader,
             activity: activity.clone(),
+            bytes: b_to_a_count.clone(),
         };
         tokio::io::copy(&mut reader, &mut a_writer).await
     });
@@ -198,8 +206,7 @@ where
                 a_to_b_done = true;
                 a_to_b = Box::pin(std::future::pending());
                 match result {
-                    Ok(bytes) => {
-                        a_to_b_bytes = bytes;
+                    Ok(_) => {
                         // The remaining direction starts its half-close clock
                         // now, not at the last data byte.
                         activity.touch();
@@ -212,8 +219,7 @@ where
                 b_to_a_done = true;
                 b_to_a = Box::pin(std::future::pending());
                 match result {
-                    Ok(bytes) => {
-                        b_to_a_bytes = bytes;
+                    Ok(_) => {
                         activity.touch();
                         let _ = time::timeout(SHUTDOWN_TIMEOUT, a_writer.shutdown()).await;
                     }
@@ -235,8 +241,8 @@ where
                 let idle_for = activity.elapsed().saturating_sub(activity.last());
                 if !policy.idle.is_zero() && idle_for >= policy.idle {
                     return Ok(RelayStats {
-                        a_to_b: a_to_b_bytes,
-                        b_to_a: b_to_a_bytes,
+                        a_to_b: a_to_b_count.load(Ordering::Relaxed),
+                        b_to_a: b_to_a_count.load(Ordering::Relaxed),
                         end: RelayEnd::Idle,
                         promoted,
                     });
@@ -246,8 +252,8 @@ where
                     && idle_for >= half_close_idle
                 {
                     return Ok(RelayStats {
-                        a_to_b: a_to_b_bytes,
-                        b_to_a: b_to_a_bytes,
+                        a_to_b: a_to_b_count.load(Ordering::Relaxed),
+                        b_to_a: b_to_a_count.load(Ordering::Relaxed),
                         end: RelayEnd::HalfClosed,
                         promoted,
                     });
@@ -257,8 +263,8 @@ where
 
         if a_to_b_done && b_to_a_done {
             return Ok(RelayStats {
-                a_to_b: a_to_b_bytes,
-                b_to_a: b_to_a_bytes,
+                a_to_b: a_to_b_count.load(Ordering::Relaxed),
+                b_to_a: b_to_a_count.load(Ordering::Relaxed),
                 end: RelayEnd::Completed,
                 promoted,
             });
@@ -446,6 +452,55 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Some(self.next)
         }
+    }
+
+    #[tokio::test]
+    async fn promotion_with_zero_age_happens_on_first_tick() {
+        let (mut client, relay_a) = duplex(1024);
+        let (relay_b, mut server) = duplex(1024);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let promotion = TestPromotion {
+            calls: calls.clone(),
+            next: Duration::from_secs(10),
+        };
+        let handle = tokio::spawn(async move {
+            let mut promotion = promotion;
+            relay_with_policy(
+                relay_a,
+                relay_b,
+                RelayPolicy {
+                    idle: Duration::from_secs(30),
+                    half_close_idle: Duration::from_millis(150),
+                    promote_after: Some(Duration::ZERO),
+                },
+                &mut promotion,
+            )
+            .await
+        });
+
+        client.write_all(b"x").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut buf = [0u8; 1];
+        server.read_exact(&mut buf).await.unwrap();
+
+        // Without promotion the 150ms half-close would fire; a zero-age
+        // promotion must extend it immediately.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !handle.is_finished(),
+            "zero-age promotion must extend half-close"
+        );
+
+        server.shutdown().await.unwrap();
+        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(stats.promoted);
+        assert_eq!(stats.end, RelayEnd::Completed);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

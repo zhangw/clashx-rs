@@ -45,7 +45,8 @@ Current implemented shape:
 - failover/retry tuning:
   - proxy-node connect timeout 5s (DIRECT stays 10s)
   - timeout errors skip same-node retries and fail over immediately
-  - first-byte window: no deadline until client data is sent; afterwards the remote must answer within 8s (re-armed per chunk). On timeout, safely replayable bytes (TLS handshake / bodiless idempotent HTTP) fail over; non-replayable requests keep the connection and fall back to plain relay. If even the last candidate times out, the connection relays on instead of failing (all nodes answering alike implies a slow origin)
+  - first-byte window: phase 1 is bounded by the 1h relay idle budget; after client data is sent the remote must answer within 8s (re-armed per chunk). On timeout, safely replayable bytes (TLS handshake / bodiless idempotent HTTP) fail over; non-replayable requests keep the connection and fall back to plain relay. If even the last candidate times out, the connection relays on instead of failing (all nodes answering alike implies a slow origin)
+  - connection lifetime: 1h with no bytes in either direction; after the first EOF, 60s (general) / 10m (streaming) inactivity. Connections still open after 30s are promoted to the streaming class; global 2048, general/streaming 1536 each (512 floor each)
   - first-byte failures never feed cooldown; they only degrade the node in candidate ordering for 120s (ordering-only, never excluded)
   - passive cooldown: 2 consecutive connect/tunnel failures → 60s timed cooldown; reload resets the tracker
 

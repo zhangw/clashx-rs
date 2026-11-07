@@ -48,6 +48,9 @@ pub struct Budget {
     general_overloads: AtomicU64,
     promotions: AtomicU64,
     promotion_failures: AtomicU64,
+    completed_count: AtomicU64,
+    idle_reaped: AtomicU64,
+    half_closed_reaped: AtomicU64,
 }
 
 fn capacity(soft: u64) -> usize {
@@ -104,6 +107,9 @@ pub fn initialize() -> anyhow::Result<&'static Budget> {
         general_overloads: AtomicU64::new(0),
         promotions: AtomicU64::new(0),
         promotion_failures: AtomicU64::new(0),
+        completed_count: AtomicU64::new(0),
+        idle_reaped: AtomicU64::new(0),
+        half_closed_reaped: AtomicU64::new(0),
     });
     tracing::info!(
         soft,
@@ -134,9 +140,31 @@ pub fn status() -> serde_json::Value {
                 "general_overload_count": b.general_overloads.load(Ordering::Relaxed),
                 "promotion_count": b.promotions.load(Ordering::Relaxed),
                 "promotion_failure_count": b.promotion_failures.load(Ordering::Relaxed),
+                "completed_count": b.completed_count.load(Ordering::Relaxed),
+                "idle_reaped_count": b.idle_reaped.load(Ordering::Relaxed),
+                "half_closed_reaped_count": b.half_closed_reaped.load(Ordering::Relaxed),
             })
         })
         .unwrap_or(serde_json::Value::Null)
+}
+
+/// Count how a relay ended, so `status.resources` shows the reclamation
+/// policy working rather than only the admission counters.
+pub fn record_relay_end(end: clashx_rs_proxy::relay::RelayEnd) {
+    let Some(budget) = BUDGET.get() else {
+        return;
+    };
+    match end {
+        clashx_rs_proxy::relay::RelayEnd::Completed => {
+            budget.completed_count.fetch_add(1, Ordering::Relaxed);
+        }
+        clashx_rs_proxy::relay::RelayEnd::Idle => {
+            budget.idle_reaped.fetch_add(1, Ordering::Relaxed);
+        }
+        clashx_rs_proxy::relay::RelayEnd::HalfClosed => {
+            budget.half_closed_reaped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +313,9 @@ mod tests {
             general_overloads: AtomicU64::new(0),
             promotions: AtomicU64::new(0),
             promotion_failures: AtomicU64::new(0),
+            completed_count: AtomicU64::new(0),
+            idle_reaped: AtomicU64::new(0),
+            half_closed_reaped: AtomicU64::new(0),
         }))
     }
 
