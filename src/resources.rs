@@ -51,6 +51,11 @@ pub struct Budget {
     completed_count: AtomicU64,
     idle_reaped: AtomicU64,
     half_closed_reaped: AtomicU64,
+    admitted: AtomicU64,
+    stalled: AtomicU64,
+    relay_errors: AtomicU64,
+    half_closed_current: AtomicU64,
+    promotion_failure_warned: std::sync::Mutex<Option<Instant>>,
 }
 
 fn capacity(soft: u64) -> usize {
@@ -110,6 +115,11 @@ pub fn initialize() -> anyhow::Result<&'static Budget> {
         completed_count: AtomicU64::new(0),
         idle_reaped: AtomicU64::new(0),
         half_closed_reaped: AtomicU64::new(0),
+        admitted: AtomicU64::new(0),
+        stalled: AtomicU64::new(0),
+        relay_errors: AtomicU64::new(0),
+        half_closed_current: AtomicU64::new(0),
+        promotion_failure_warned: std::sync::Mutex::new(None),
     });
     tracing::info!(
         soft,
@@ -143,9 +153,114 @@ pub fn status() -> serde_json::Value {
                 "completed_count": b.completed_count.load(Ordering::Relaxed),
                 "idle_reaped_count": b.idle_reaped.load(Ordering::Relaxed),
                 "half_closed_reaped_count": b.half_closed_reaped.load(Ordering::Relaxed),
+                "admitted_count": b.admitted.load(Ordering::Relaxed),
+                "stalled_count": b.stalled.load(Ordering::Relaxed),
+                "relay_error_count": b.relay_errors.load(Ordering::Relaxed),
+                "current_half_closed": b.half_closed_current.load(Ordering::Relaxed),
             })
         })
         .unwrap_or(serde_json::Value::Null)
+}
+
+/// Point-in-time pool occupancy, included in pressure/saturation warnings so
+/// an operator can tell which class is full without polling status.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Occupancy {
+    pub global_limit: usize,
+    pub global_active: usize,
+    pub general_limit: usize,
+    pub general_active: usize,
+    pub streaming_limit: usize,
+    pub streaming_active: usize,
+}
+
+fn occupancy_from(budget: &Budget) -> Occupancy {
+    Occupancy {
+        global_limit: budget.limit,
+        global_active: budget
+            .limit
+            .saturating_sub(budget.global.available_permits()),
+        general_limit: budget.general_limit,
+        general_active: budget
+            .general_limit
+            .saturating_sub(budget.general.available_permits()),
+        streaming_limit: budget.streaming_limit,
+        streaming_active: budget
+            .streaming_limit
+            .saturating_sub(budget.streaming.available_permits()),
+    }
+}
+
+pub fn occupancy() -> Occupancy {
+    BUDGET.get().map(occupancy_from).unwrap_or_default()
+}
+
+/// Cumulative counters for the hourly heartbeat and external polling.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Counters {
+    pub admitted: u64,
+    pub completed: u64,
+    pub idle_reaped: u64,
+    pub half_closed_reaped: u64,
+    pub relay_errors: u64,
+    pub stalled: u64,
+    pub overloads: u64,
+    pub general_overloads: u64,
+    pub promotions: u64,
+    pub promotion_failures: u64,
+}
+
+impl Counters {
+    pub fn since(&self, previous: &Counters) -> Counters {
+        Counters {
+            admitted: self.admitted.saturating_sub(previous.admitted),
+            completed: self.completed.saturating_sub(previous.completed),
+            idle_reaped: self.idle_reaped.saturating_sub(previous.idle_reaped),
+            half_closed_reaped: self
+                .half_closed_reaped
+                .saturating_sub(previous.half_closed_reaped),
+            relay_errors: self.relay_errors.saturating_sub(previous.relay_errors),
+            stalled: self.stalled.saturating_sub(previous.stalled),
+            overloads: self.overloads.saturating_sub(previous.overloads),
+            general_overloads: self
+                .general_overloads
+                .saturating_sub(previous.general_overloads),
+            promotions: self.promotions.saturating_sub(previous.promotions),
+            promotion_failures: self
+                .promotion_failures
+                .saturating_sub(previous.promotion_failures),
+        }
+    }
+}
+
+pub fn counters() -> Counters {
+    BUDGET
+        .get()
+        .map(|b| Counters {
+            admitted: b.admitted.load(Ordering::Relaxed),
+            completed: b.completed_count.load(Ordering::Relaxed),
+            idle_reaped: b.idle_reaped.load(Ordering::Relaxed),
+            half_closed_reaped: b.half_closed_reaped.load(Ordering::Relaxed),
+            relay_errors: b.relay_errors.load(Ordering::Relaxed),
+            stalled: b.stalled.load(Ordering::Relaxed),
+            overloads: b.overloads.load(Ordering::Relaxed),
+            general_overloads: b.general_overloads.load(Ordering::Relaxed),
+            promotions: b.promotions.load(Ordering::Relaxed),
+            promotion_failures: b.promotion_failures.load(Ordering::Relaxed),
+        })
+        .unwrap_or_default()
+}
+
+pub fn record_stalled() {
+    if let Some(budget) = BUDGET.get() {
+        budget.stalled.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn record_relay_error() {
+    if let Some(budget) = BUDGET.get() {
+        budget.relay_errors.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Count how a relay ended, so `status.resources` shows the reclamation
@@ -211,6 +326,7 @@ impl ConnectionSlot {
             .clone()
             .try_acquire_owned()
             .map_err(|_| AcquireError::General)?;
+        budget.admitted.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             budget,
             _global: global,
@@ -238,6 +354,7 @@ impl ConnectionSlot {
                     self.budget
                         .promotion_failures
                         .fetch_add(1, Ordering::Relaxed);
+                    warn_promotion_saturated(self.budget);
                 }
             }
         }
@@ -249,41 +366,101 @@ impl ConnectionSlot {
     }
 }
 
+/// Warn at most once per 10 minutes when a long-lived connection cannot enter
+/// the streaming pool. The counter carries the exact rate; the log explains
+/// the consequence (squatting in general) before admission starts failing.
+fn warn_promotion_saturated(budget: &Budget) {
+    let now = Instant::now();
+    let mut last = budget.promotion_failure_warned.lock().unwrap();
+    if last.is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(600)) {
+        let occupancy = occupancy_from(budget);
+        tracing::warn!(
+            global_active = occupancy.global_active,
+            global_limit = occupancy.global_limit,
+            general_active = occupancy.general_active,
+            general_limit = occupancy.general_limit,
+            streaming_active = occupancy.streaming_active,
+            streaming_limit = occupancy.streaming_limit,
+            "streaming pool saturated; long-lived connections stay in the general class"
+        );
+        *last = Some(now);
+    }
+}
+
 impl clashx_rs_proxy::relay::RelayPromotion for ConnectionSlot {
     fn promote(&mut self) -> Option<Duration> {
         Some(self.try_promote())
     }
+
+    fn on_half_closed(&mut self, half_closed: bool) {
+        if half_closed {
+            self.budget
+                .half_closed_current
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.budget
+                .half_closed_current
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// A separate limiter per listener; every occurrence is still counted.
+///
+/// Global and general-class pressure have independent throttle keys so a
+/// global warning cannot hide a class transition within the same 5s window.
 #[derive(Default)]
-pub struct OverloadLog(Option<Instant>);
+pub struct OverloadLog {
+    accept: Option<Instant>,
+    global: Option<Instant>,
+    general: Option<Instant>,
+}
+
 impl OverloadLog {
+    fn throttled(slot: &mut Option<Instant>, log: impl FnOnce()) {
+        let now = Instant::now();
+        if slot.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5)) {
+            log();
+            *slot = Some(now);
+        }
+    }
+
+    fn warn_pressure(reason: &str) {
+        let occupancy = occupancy();
+        tracing::warn!(
+            reason,
+            global_active = occupancy.global_active,
+            global_limit = occupancy.global_limit,
+            general_active = occupancy.general_active,
+            general_limit = occupancy.general_limit,
+            streaming_active = occupancy.streaming_active,
+            streaming_limit = occupancy.streaming_limit,
+            "proxy resource pressure"
+        );
+    }
+
     pub fn record(&mut self, reason: &str) {
         if let Some(b) = BUDGET.get() {
             b.overloads.fetch_add(1, Ordering::Relaxed);
         }
-        let now = Instant::now();
-        if self
-            .0
-            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5))
-        {
-            tracing::warn!(reason, "proxy resource pressure");
-            self.0 = Some(now);
-        }
+        Self::throttled(&mut self.accept, || Self::warn_pressure(reason));
     }
 
     /// Global admission failed: no connection permit at all.
     pub fn record_global(&mut self, reason: &str) {
-        self.record(reason);
+        if let Some(b) = BUDGET.get() {
+            b.overloads.fetch_add(1, Ordering::Relaxed);
+        }
+        Self::throttled(&mut self.global, || Self::warn_pressure(reason));
     }
 
     /// General class pool is full while the global pool still has room.
     pub fn record_general(&mut self, reason: &str) {
         if let Some(b) = BUDGET.get() {
             b.general_overloads.fetch_add(1, Ordering::Relaxed);
+            b.overloads.fetch_add(1, Ordering::Relaxed);
         }
-        self.record(reason);
+        Self::throttled(&mut self.general, || Self::warn_pressure(reason));
     }
 
     pub async fn accept_error(&mut self, error: &std::io::Error) {
@@ -316,6 +493,11 @@ mod tests {
             completed_count: AtomicU64::new(0),
             idle_reaped: AtomicU64::new(0),
             half_closed_reaped: AtomicU64::new(0),
+            admitted: AtomicU64::new(0),
+            stalled: AtomicU64::new(0),
+            relay_errors: AtomicU64::new(0),
+            half_closed_current: AtomicU64::new(0),
+            promotion_failure_warned: std::sync::Mutex::new(None),
         }))
     }
 
@@ -361,6 +543,18 @@ mod tests {
         assert_eq!(budget.global.available_permits(), 3);
         assert_eq!(budget.streaming.available_permits(), 1);
         assert_eq!(budget.general.available_permits(), 2);
+    }
+
+    #[test]
+    fn half_closed_gauge_is_balanced() {
+        use clashx_rs_proxy::relay::RelayPromotion;
+
+        let budget = test_budget(4, 2, 4);
+        let mut slot = ConnectionSlot::try_acquire_from(budget).unwrap();
+        slot.on_half_closed(true);
+        assert_eq!(budget.half_closed_current.load(Ordering::Relaxed), 1);
+        slot.on_half_closed(false);
+        assert_eq!(budget.half_closed_current.load(Ordering::Relaxed), 0);
     }
 
     #[test]

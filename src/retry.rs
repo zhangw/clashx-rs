@@ -6,6 +6,8 @@ pub const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(100), Duration::
 pub const MAX_FAILOVER_ATTEMPTS: usize = 3;
 pub const COOLDOWN_DURATION: Duration = Duration::from_secs(60);
 pub const COOLDOWN_FAILURE_THRESHOLD: u32 = 2;
+/// Minimum interval between "upstream stalled" warnings for one proxy.
+pub const STALLED_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Max wait for the first response byte from the remote once client data has
 /// been forwarded (the deadline re-arms on every forwarded chunk, so this
@@ -39,14 +41,15 @@ pub const HALF_CLOSE_GENERAL: Duration = Duration::from_secs(60);
 /// be stricter than the clients it serves.
 pub const HALF_CLOSE_STREAMING: Duration = Duration::from_secs(10 * 60);
 
-/// Connections still open after this long are treated as long-lived (SSE,
-/// WebSocket, large downloads) and promoted to the streaming pool.
-/// Must stay below [`HALF_CLOSE_GENERAL`] so a half-closed connection can be
-/// re-armed before the general timer fires.
+/// Connections still open in both directions after this long are treated as
+/// long-lived (SSE, WebSocket, large downloads) and promoted to the streaming
+/// pool. A connection that has already half-closed is not promoted: it stays
+/// in the general class and is reclaimed by the shorter general drain.
 pub const PROMOTE_AFTER: Duration = Duration::from_secs(30);
 
-// The general half-close timer must outlive the promotion age, otherwise a
-// half-closed connection could be reaped before it gets the streaming budget.
+// A connection that remains open must be promoted before the general drain
+// could apply; half-closed connections are deliberately excluded from
+// promotion and use HALF_CLOSE_GENERAL directly.
 const _: () = {
     assert!(PROMOTE_AFTER.as_secs() < HALF_CLOSE_GENERAL.as_secs());
     assert!(HALF_CLOSE_GENERAL.as_secs() < HALF_CLOSE_STREAMING.as_secs());
@@ -84,6 +87,8 @@ pub struct CooldownTracker {
     // Not node-attributable with certainty, so it only demotes the node in
     // candidate ordering (see build_candidate_list) and never excludes it.
     degraded: std::sync::RwLock<HashMap<String, Instant>>,
+    // Per-proxy throttle for "upstream stalled" warnings.
+    stalled_warns: std::sync::RwLock<HashMap<String, Instant>>,
 }
 
 impl CooldownTracker {
@@ -92,6 +97,21 @@ impl CooldownTracker {
             failures: std::sync::RwLock::new(HashMap::new()),
             sidelined: std::sync::RwLock::new(std::collections::HashSet::new()),
             degraded: std::sync::RwLock::new(HashMap::new()),
+            stalled_warns: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Whether a stalled-upstream warning should be emitted for this proxy.
+    /// The counter carries the full rate; the log only carries the story.
+    pub fn should_warn_stalled(&self, proxy: &str) -> bool {
+        let now = Instant::now();
+        let mut warns = self.stalled_warns.write().unwrap();
+        match warns.get(proxy) {
+            Some(last) if now.duration_since(*last) < STALLED_WARN_INTERVAL => false,
+            _ => {
+                warns.insert(proxy.to_string(), now);
+                true
+            }
         }
     }
 
@@ -276,5 +296,12 @@ mod tests {
         let refused =
             anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
         assert!(!is_timeout_error(&refused));
+    }
+    #[test]
+    fn stalled_warnings_are_throttled_per_proxy() {
+        let tracker = CooldownTracker::new();
+        assert!(tracker.should_warn_stalled("a"));
+        assert!(!tracker.should_warn_stalled("a"));
+        assert!(tracker.should_warn_stalled("b"));
     }
 }

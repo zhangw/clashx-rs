@@ -35,9 +35,11 @@ Every data connection starts in the `general` class. The two class pools
 (1536 permits each) sit under the 2048 global cap, so each class is always
 guaranteed at least 512 permits. A class cannot exceed 1536 even when the
 other is idle; the remaining headroom is the other class's guarantee. A
-connection still open after 30 seconds is promoted to the `streaming` class:
-the class permit is swapped and the half-close inactivity timeout changes
-from 60 seconds to 10 minutes. Promotion is attempted once; if the streaming
+connection still open in both directions after 30 seconds is promoted to the
+`streaming` class: the class permit is swapped and the half-close inactivity
+timeout changes from 60 seconds to 10 minutes. A connection that has already
+half-closed is not promoted; it stays in the general class and is reclaimed
+by the 60-second general drain. Promotion is attempted once; if the streaming
 pool is full the connection keeps its general permit but still receives the
 streaming timeout, and `promotion_failure_count` records the sticky failure
 (it is not retried in this version). Promotion is based on observed
@@ -49,7 +51,8 @@ failed upgrade is counted in `status.resources`.
 Relay lifetime is activity-based, never a total-duration cap:
 
 - no bytes in either direction for 1 hour → close (idle);
-- after the first EOF, no bytes for 60s (general) or 10m (streaming) → close
+- after the first EOF, no bytes for 60s while general (including connections
+  that half-closed before promotion) or 10m after promotion → close
   (half-closed);
 - an immediate RST is surfaced by the copy error and closes both sides;
   a FIN-only cancellation is reclaimed by the half-close timer.
@@ -66,11 +69,27 @@ Configuration reload keeps the same process-wide budget, permits and
 counters.
 
 `status.resources` exposes the startup soft/hard FD limits, the global
-connection limit, per-class limits and active counts, promotion success and
-failure counts, relay completion/idle/half-close reap counts, and the
-resource-pressure counters. Active control
+connection limit, per-class limits and active counts, admissions, promotion
+success/failure, relay errors, stalled writes, the current half-closed gauge,
+relay completion/idle/half-close reap counts, and the resource-pressure
+counters (`overload_count` includes general-class rejections). Active control
 connections include the status request itself. These are connection counts,
 not a live enumeration of all process descriptors.
+
+## Diagnostics
+
+- ERROR `all proxies failed` carries target, group, candidate count, last
+  proxy and the full error chain.
+- WARN `proxy resource pressure` carries the reason and current occupancy;
+  global and general-class pressure use independent 5-second throttles.
+- WARN `streaming pool saturated` is emitted at most once per 10 minutes with
+  occupancy; `promotion_failure_count` carries the exact rate.
+- WARN `upstream stopped reading` is emitted at most once per 30 seconds per
+  proxy; `stalled_count` carries the exact rate.
+- INFO `hourly connection summary` reports per-hour deltas plus current pool
+  occupancy, so a headless daemon has a heartbeat without per-connection logs.
+- Per-connection routing and relay-end lines are DEBUG and include peer,
+  target, proxy, duration and bytes read.
 
 Local deployment and package installation set the LaunchAgent soft limit to
 8192, preserve higher existing values and respect lower explicit hard limits.

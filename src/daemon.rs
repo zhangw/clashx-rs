@@ -737,6 +737,39 @@ async fn run_daemon(
         }
     });
 
+    // Headless daemons have no dashboard; a once-an-hour INFO line proves the
+    // reclamation policy is working and gives rate deltas without enabling
+    // per-connection debug logging.
+    tokio::spawn(async move {
+        let mut previous = crate::resources::counters();
+        loop {
+            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            let current = crate::resources::counters();
+            let delta = current.since(&previous);
+            let occupancy = crate::resources::occupancy();
+            tracing::info!(
+                global_active = occupancy.global_active,
+                global_limit = occupancy.global_limit,
+                general_active = occupancy.general_active,
+                general_limit = occupancy.general_limit,
+                streaming_active = occupancy.streaming_active,
+                streaming_limit = occupancy.streaming_limit,
+                admitted = delta.admitted,
+                completed = delta.completed,
+                idle_reaped = delta.idle_reaped,
+                half_closed_reaped = delta.half_closed_reaped,
+                relay_errors = delta.relay_errors,
+                stalled = delta.stalled,
+                overloads = delta.overloads,
+                general_overloads = delta.general_overloads,
+                promotions = delta.promotions,
+                promotion_failures = delta.promotion_failures,
+                "hourly connection summary"
+            );
+            previous = current;
+        }
+    });
+
     let sub_state = Arc::clone(&state);
     tokio::spawn(async move {
         subscription_auto_update(sub_state).await;
@@ -776,7 +809,7 @@ async fn handle_connection(
         target,
         stream: mut inbound_stream,
         initial_data,
-        source_addr: _,
+        source_addr,
     } = inbound::detect_and_handle(stream, source_addr).await?;
 
     let target_host = target.host_string();
@@ -888,9 +921,13 @@ async fn handle_connection(
         group_name = grp;
         proxy_name = resolved;
 
-        tracing::info!(
+        // Per-connection: DEBUG, not INFO. The production log grew to hundreds
+        // of MB per month from this line. Include peer so a routing decision
+        // can be joined to the handler's error line.
+        tracing::debug!(
             target = %target_host,
             port = target_port,
+            peer = %source_addr,
             mode = ?mode,
             rule = ?MatchedRuleDebug(matched_rule),
             proxy = %proxy_name,
@@ -940,7 +977,11 @@ async fn handle_connection(
                 initial_data,
                 None,
                 &mut slot,
-                started_at,
+                RelayContext {
+                    target: target_host.as_str(),
+                    proxy: "DIRECT",
+                    started_at,
+                },
             )
             .await?;
             Ok(())
@@ -951,6 +992,7 @@ async fn handle_connection(
             }
 
             let mut last_err = None;
+            let mut last_attempted = String::new();
             // Client bytes buffered during the first-byte window, replayed to
             // the next candidate on failover. Starts as the HTTP plain-proxy
             // initial data (if any); grows with the client's first chunk(s).
@@ -960,6 +1002,7 @@ async fn handle_connection(
             let mut replay_truncated = false;
 
             for (i, (cand_name, cand_proxy)) in candidates.iter().enumerate() {
+                last_attempted = cand_name.clone();
                 if i > 0 {
                     tracing::info!(
                         from = %candidates[i - 1].0,
@@ -1010,7 +1053,11 @@ async fn handle_connection(
                             None,
                             Some(prefix),
                             &mut slot,
-                            started_at,
+                            RelayContext {
+                                target: target_host.as_str(),
+                                proxy: cand_name,
+                                started_at,
+                            },
                         )
                         .await?;
                         return Ok(());
@@ -1051,7 +1098,11 @@ async fn handle_connection(
                                     None,
                                     None,
                                     &mut slot,
-                                    started_at,
+                                    RelayContext {
+                                        target: target_host.as_str(),
+                                        proxy: cand_name,
+                                        started_at,
+                                    },
                                 )
                                 .await?;
                                 return Ok(());
@@ -1082,7 +1133,11 @@ async fn handle_connection(
                                 None,
                                 None,
                                 &mut slot,
-                                started_at,
+                                RelayContext {
+                                    target: target_host.as_str(),
+                                    proxy: cand_name,
+                                    started_at,
+                                },
                             )
                             .await?;
                             return Ok(());
@@ -1118,12 +1173,15 @@ async fn handle_connection(
                         // have interrupted a partial write, so failing over
                         // would send a truncated request: close and let the
                         // client retry from scratch.
+                        crate::resources::record_stalled();
                         cooldown.record_failure(cand_name);
-                        tracing::warn!(
-                            proxy = %cand_name,
-                            target = %target_host,
-                            "upstream stopped reading; closing stalled tunnel"
-                        );
+                        if cooldown.should_warn_stalled(cand_name) {
+                            tracing::warn!(
+                                proxy = %cand_name,
+                                target = %target_host,
+                                "upstream stopped reading; closing stalled tunnel"
+                            );
+                        }
                         return Err(anyhow::anyhow!(
                             "upstream stalled while receiving the request via {cand_name}"
                         ));
@@ -1145,9 +1203,16 @@ async fn handle_connection(
             }
 
             let group_label = group_name.as_deref().unwrap_or(&proxy_name);
+            let error_text = last_err
+                .as_ref()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| "unknown".to_string());
             tracing::error!(
                 target = %target_host,
                 group = %group_label,
+                candidates = candidates.len(),
+                last_proxy = %last_attempted,
+                error = %error_text,
                 "all proxies failed"
             );
             Err(last_err.unwrap())
@@ -1495,20 +1560,30 @@ where
     Ok(())
 }
 
+/// Labels captured at routing time so relay-end diagnostics can be joined to
+/// the routing decision without another argument list.
+struct RelayContext<'a> {
+    target: &'a str,
+    proxy: &'a str,
+    started_at: Instant,
+}
+
 async fn relay_streams(
     mut inbound: TcpStream,
     outbound: OutboundStream,
     initial_data: Option<Vec<u8>>,
     remote_prefix: Option<Vec<u8>>,
     slot: &mut crate::resources::ConnectionSlot,
-    started_at: Instant,
+    context: RelayContext<'_>,
 ) -> Result<()> {
     let policy = RelayPolicy {
         idle: crate::retry::RELAY_IDLE,
         half_close_idle: crate::retry::HALF_CLOSE_GENERAL,
         // The connection may already be older than the promotion age (slow
         // first-byte window); promote on the first relay tick in that case.
-        promote_after: Some(crate::retry::PROMOTE_AFTER.saturating_sub(started_at.elapsed())),
+        promote_after: Some(
+            crate::retry::PROMOTE_AFTER.saturating_sub(context.started_at.elapsed()),
+        ),
     };
     match outbound {
         OutboundStream::Tcp(mut tcp) => {
@@ -1518,8 +1593,14 @@ async fn relay_streams(
             if let Some(prefix) = remote_prefix {
                 write_initial(&mut inbound, &prefix).await?;
             }
-            let stats = relay_with_policy(inbound, tcp, policy, slot).await?;
-            log_relay(&stats, slot.class());
+            let stats = match relay_with_policy(inbound, tcp, policy, slot).await {
+                Ok(stats) => stats,
+                Err(error) => {
+                    crate::resources::record_relay_error();
+                    return Err(error);
+                }
+            };
+            log_relay(&stats, slot.class(), &context);
         }
         OutboundStream::Tls(mut tls) => {
             if let Some(data) = initial_data {
@@ -1528,8 +1609,14 @@ async fn relay_streams(
             if let Some(prefix) = remote_prefix {
                 write_initial(&mut inbound, &prefix).await?;
             }
-            let stats = relay_with_policy(&mut inbound, &mut *tls, policy, slot).await?;
-            log_relay(&stats, slot.class());
+            let stats = match relay_with_policy(&mut inbound, &mut *tls, policy, slot).await {
+                Ok(stats) => stats,
+                Err(error) => {
+                    crate::resources::record_relay_error();
+                    return Err(error);
+                }
+            };
+            log_relay(&stats, slot.class(), &context);
         }
         OutboundStream::Rejected => {
             drop(inbound);
@@ -1538,12 +1625,19 @@ async fn relay_streams(
     Ok(())
 }
 
-fn log_relay(stats: &clashx_rs_proxy::relay::RelayStats, class: crate::resources::ConnectionClass) {
+fn log_relay(
+    stats: &clashx_rs_proxy::relay::RelayStats,
+    class: crate::resources::ConnectionClass,
+    context: &RelayContext<'_>,
+) {
     crate::resources::record_relay_end(stats.end);
     tracing::debug!(
         ?class,
-        bytes_in = stats.a_to_b,
-        bytes_out = stats.b_to_a,
+        target = context.target,
+        proxy = context.proxy,
+        duration_ms = context.started_at.elapsed().as_millis() as u64,
+        bytes_read_in = stats.a_to_b,
+        bytes_read_out = stats.b_to_a,
         end = ?stats.end,
         promotion_attempted = stats.promoted,
         "relay finished"

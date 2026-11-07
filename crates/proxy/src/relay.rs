@@ -60,10 +60,15 @@ pub struct RelayStats {
 
 /// Callback used to promote a connection after it has proven long-lived.
 pub trait RelayPromotion {
-    /// Called at most once. Returning `Some(timeout)` switches the relay to
-    /// the streaming half-close timeout; the caller may also upgrade its
-    /// resource pool here.
+    /// Called at most once, and only while both directions are still open.
+    /// Returning `Some(timeout)` switches the relay to the streaming
+    /// half-close timeout; the caller may also upgrade its resource pool here.
     fn promote(&mut self) -> Option<Duration>;
+
+    /// Called when the connection enters (`true`) or leaves (`false`) the
+    /// half-closed state (exactly one direction reached EOF). Lets the caller
+    /// maintain a live gauge without parsing relay stats.
+    fn on_half_closed(&mut self, _half_closed: bool) {}
 }
 
 /// No-op promotion for callers that do not need lifetime classification.
@@ -175,6 +180,7 @@ where
 
     let mut a_to_b_done = false;
     let mut b_to_a_done = false;
+    let mut half_closed_reported = false;
     // Incremented on every read, so the counters are meaningful even when a
     // connection is reaped before either copy future completes.
     let a_to_b_count = Arc::new(AtomicU64::new(0));
@@ -207,12 +213,21 @@ where
                 a_to_b = Box::pin(std::future::pending());
                 match result {
                     Ok(_) => {
+                        if !half_closed_reported {
+                            half_closed_reported = true;
+                            promotion.on_half_closed(true);
+                        }
                         // The remaining direction starts its half-close clock
                         // now, not at the last data byte.
                         activity.touch();
                         let _ = time::timeout(SHUTDOWN_TIMEOUT, b_writer.shutdown()).await;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        if half_closed_reported {
+                            promotion.on_half_closed(false);
+                        }
+                        return Err(error.into());
+                    }
                 }
             }
             result = &mut b_to_a, if !b_to_a_done => {
@@ -220,14 +235,28 @@ where
                 b_to_a = Box::pin(std::future::pending());
                 match result {
                     Ok(_) => {
+                        if !half_closed_reported {
+                            half_closed_reported = true;
+                            promotion.on_half_closed(true);
+                        }
                         activity.touch();
                         let _ = time::timeout(SHUTDOWN_TIMEOUT, a_writer.shutdown()).await;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        if half_closed_reported {
+                            promotion.on_half_closed(false);
+                        }
+                        return Err(error.into());
+                    }
                 }
             }
             _ = ticker.tick() => {
-                if !promoted {
+                // Promotion applies only to connections that are still open
+                // in both directions: a connection that has already
+                // half-closed keeps the general drain so cancelled tunnels are
+                // reclaimed quickly instead of squatting in the streaming
+                // class.
+                if !promoted && !a_to_b_done && !b_to_a_done {
                     if let Some(at) = promote_at {
                         if Instant::now() >= at {
                             promoted = true;
@@ -240,6 +269,9 @@ where
 
                 let idle_for = activity.elapsed().saturating_sub(activity.last());
                 if !policy.idle.is_zero() && idle_for >= policy.idle {
+                    if half_closed_reported {
+                        promotion.on_half_closed(false);
+                    }
                     return Ok(RelayStats {
                         a_to_b: a_to_b_count.load(Ordering::Relaxed),
                         b_to_a: b_to_a_count.load(Ordering::Relaxed),
@@ -251,6 +283,9 @@ where
                     && !half_close_idle.is_zero()
                     && idle_for >= half_close_idle
                 {
+                    if half_closed_reported {
+                        promotion.on_half_closed(false);
+                    }
                     return Ok(RelayStats {
                         a_to_b: a_to_b_count.load(Ordering::Relaxed),
                         b_to_a: b_to_a_count.load(Ordering::Relaxed),
@@ -262,6 +297,9 @@ where
         }
 
         if a_to_b_done && b_to_a_done {
+            if half_closed_reported {
+                promotion.on_half_closed(false);
+            }
             return Ok(RelayStats {
                 a_to_b: a_to_b_count.load(Ordering::Relaxed),
                 b_to_a: b_to_a_count.load(Ordering::Relaxed),
@@ -479,14 +517,17 @@ mod tests {
             .await
         });
 
+        // Keep both directions open past promotion; a half-closed connection
+        // is deliberately not promoted.
         client.write_all(b"x").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
         client.shutdown().await.unwrap();
         let mut buf = [0u8; 1];
         server.read_exact(&mut buf).await.unwrap();
 
-        // Without promotion the 150ms half-close would fire; a zero-age
-        // promotion must extend it immediately.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Without promotion the 150ms half-close would fire; the zero-age
+        // promotion must have extended it to 10s.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             !handle.is_finished(),
             "zero-age promotion must extend half-close"
@@ -529,6 +570,7 @@ mod tests {
         });
 
         client.write_all(b"x").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
         client.shutdown().await.unwrap();
         let mut buf = [0u8; 1];
         server.read_exact(&mut buf).await.unwrap();
@@ -546,5 +588,47 @@ mod tests {
         assert!(stats.promoted);
         assert_eq!(stats.end, RelayEnd::Completed);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn half_closed_before_promotion_stays_general() {
+        let (mut client, relay_a) = duplex(1024);
+        let (relay_b, mut server) = duplex(1024);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let promotion = TestPromotion {
+            calls: calls.clone(),
+            next: Duration::from_secs(10),
+        };
+        let handle = tokio::spawn(async move {
+            let mut promotion = promotion;
+            relay_with_policy(
+                relay_a,
+                relay_b,
+                RelayPolicy {
+                    idle: Duration::from_secs(30),
+                    half_close_idle: Duration::from_millis(150),
+                    promote_after: Some(Duration::from_millis(50)),
+                },
+                &mut promotion,
+            )
+            .await
+        });
+
+        client.write_all(b"x").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut buf = [0u8; 1];
+        server.read_exact(&mut buf).await.unwrap();
+
+        // Promotion is skipped once a direction has reached EOF, so the
+        // general 150ms drain applies instead of the 10s streaming budget.
+        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("general half-close must fire")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.end, RelayEnd::HalfClosed);
+        assert!(!stats.promoted);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 }
