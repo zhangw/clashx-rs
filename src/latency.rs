@@ -1,3 +1,9 @@
+//! Latency probes and table rendering for `clashx-rs latency`.
+//!
+//! Measures either TCP reachability or a full HTTP round trip through each
+//! proxy, then renders the result as a table or JSON. Probe failures are
+//! reported per node rather than aborting the whole run.
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};

@@ -1,3 +1,8 @@
+//! Runtime filesystem paths and defaults.
+//!
+//! Keeps the config, PID, control socket, log, and GeoIP locations in one
+//! place so the daemon, CLI, and LaunchAgent agree on the same files.
+
 use std::path::PathBuf;
 
 pub const DEFAULT_MIXED_PORT: u16 = 7890;

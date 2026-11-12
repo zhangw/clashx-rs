@@ -144,7 +144,9 @@ pub fn initialize() -> anyhow::Result<&'static Budget> {
         reserved = RESERVED,
         "file descriptor budget"
     );
-    Ok(BUDGET.get().expect("budget initialized"))
+    BUDGET
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("connection budget was not initialized"))
 }
 
 fn last_relay_error(budget: &Budget) -> serde_json::Value {

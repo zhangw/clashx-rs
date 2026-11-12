@@ -1,3 +1,11 @@
+//! Daemon runtime and data plane.
+//!
+//! Owns startup, the mixed HTTP/SOCKS5 listener, rule evaluation and proxy
+//! selection, first-byte failover, relay lifecycle, the control socket,
+//! config reload, and subscription scheduling. Transport and protocol details
+//! live in the `clashx-rs-*` crates; this module wires them together and
+//! enforces the connection budgets from [`crate::resources`].
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
@@ -1216,7 +1224,12 @@ async fn handle_connection(
                 error = %error_text,
                 "all proxies failed"
             );
-            Err(last_err.unwrap())
+            match last_err {
+                Some(err) => Err(err),
+                None => Err(anyhow::anyhow!(
+                    "no usable proxy candidate for {target_host}"
+                )),
+            }
         }
     }
 }
@@ -1340,7 +1353,7 @@ where
         }
     }
 
-    Err(last_err.unwrap())
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no connection attempt was made for {label}")))
 }
 
 /// Failure modes of the post-connect first-byte window.
@@ -1696,156 +1709,171 @@ async fn dispatch_control(
     state: &Arc<RwLock<DaemonState>>,
 ) -> ControlResponse {
     match request {
-        ControlRequest::Status => {
-            let st = state.read().await;
-            let port = st.config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT);
-            let mode = format!("{:?}", st.config.mode);
-            let allow_lan = st.config.allow_lan.unwrap_or(false);
-            let proxy_count = st.proxies.len();
-            let rule_count = st.config.rules.len();
-            let group_count = st.config.proxy_groups.len();
-            let selections: serde_json::Map<String, serde_json::Value> = st
-                .config
-                .proxy_groups
-                .iter()
-                .filter_map(|g| {
-                    st.selections
-                        .get(&g.name)
-                        .map(|sel| (g.name.clone(), json!(sel)))
-                })
-                .collect();
-            ControlResponse::success(json!({
-                "port": port,
-                "mode": mode,
-                "allow_lan": allow_lan,
-                "config_path": st.config_path.display().to_string(),
-                "proxy_count": proxy_count,
-                "rule_count": rule_count,
-                "group_count": group_count,
-                "selections": selections,
-                "resources": crate::resources::status(),
-            }))
-        }
-
-        ControlRequest::Stop => {
-            let resp = ControlResponse::ok();
-            let (port, sysproxy_enabled) = {
-                let st = state.read().await;
-                (
-                    st.config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT),
-                    st.sysproxy_enabled,
-                )
-            };
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if sysproxy_enabled {
-                    let sysproxy =
-                        clashx_rs_sysproxy::SysProxy::new(port, paths::sysproxy_snapshot_path());
-                    if let Err(e) = sysproxy.disable() {
-                        eprintln!("error: {e}");
-                    }
-                }
-                let _ = std::fs::remove_file(paths::socket_path(port));
-                let _ = std::fs::remove_file(paths::pid_path(port));
-                tracing::info!("cleanup complete");
-                std::process::exit(0);
-            });
-            resp
-        }
-
+        ControlRequest::Status => control_status(state).await,
+        ControlRequest::Stop => control_stop(state).await,
         ControlRequest::Reload => match reload_state(state).await {
             Ok(()) => ControlResponse::ok(),
             Err(e) => ControlResponse::error(format!("reload failed: {e}")),
         },
+        ControlRequest::Switch { group, proxy } => control_switch(state, group, proxy).await,
+        ControlRequest::Proxies => control_proxies(state).await,
+        ControlRequest::Groups => control_groups(state).await,
+        ControlRequest::Rules => control_rules(state).await,
+        ControlRequest::Test { domain } => control_test(state, domain).await,
+        ControlRequest::Latency { full } => control_latency(state, full).await,
+        ControlRequest::DnsFlush { host } => control_dns_flush(state, host).await,
+    }
+}
 
-        ControlRequest::Switch { group, proxy } => {
-            let mut st = state.write().await;
-            match st.validate_and_set_selection(&group, &proxy) {
-                Ok(()) => ControlResponse::success(json!({
-                    "group": group,
-                    "selected": proxy,
-                })),
-                Err(e) => ControlResponse::error(e),
+async fn control_status(state: &Arc<RwLock<DaemonState>>) -> ControlResponse {
+    let st = state.read().await;
+    let port = st.config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT);
+    let mode = format!("{:?}", st.config.mode);
+    let allow_lan = st.config.allow_lan.unwrap_or(false);
+    let selections: serde_json::Map<String, serde_json::Value> = st
+        .config
+        .proxy_groups
+        .iter()
+        .filter_map(|g| {
+            st.selections
+                .get(&g.name)
+                .map(|sel| (g.name.clone(), json!(sel)))
+        })
+        .collect();
+    ControlResponse::success(json!({
+        "port": port,
+        "mode": mode,
+        "allow_lan": allow_lan,
+        "config_path": st.config_path.display().to_string(),
+        "proxy_count": st.proxies.len(),
+        "rule_count": st.config.rules.len(),
+        "group_count": st.config.proxy_groups.len(),
+        "selections": selections,
+        "resources": crate::resources::status(),
+    }))
+}
+
+async fn control_stop(state: &Arc<RwLock<DaemonState>>) -> ControlResponse {
+    let (port, sysproxy_enabled) = {
+        let st = state.read().await;
+        (
+            st.config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT),
+            st.sysproxy_enabled,
+        )
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if sysproxy_enabled {
+            let sysproxy = clashx_rs_sysproxy::SysProxy::new(port, paths::sysproxy_snapshot_path());
+            if let Err(e) = sysproxy.disable() {
+                tracing::error!(error = %e, "failed to disable system proxy during shutdown");
             }
         }
+        // Best-effort cleanup: the process is about to exit.
+        let _ = std::fs::remove_file(paths::socket_path(port));
+        let _ = std::fs::remove_file(paths::pid_path(port));
+        tracing::info!("cleanup complete");
+        std::process::exit(0);
+    });
+    ControlResponse::ok()
+}
 
-        ControlRequest::Proxies => {
-            let st = state.read().await;
-            let names: Vec<&str> = st.proxies.keys().map(|s| s.as_str()).collect();
-            ControlResponse::success(json!(names))
-        }
+async fn control_switch(
+    state: &Arc<RwLock<DaemonState>>,
+    group: String,
+    proxy: String,
+) -> ControlResponse {
+    let mut st = state.write().await;
+    match st.validate_and_set_selection(&group, &proxy) {
+        Ok(()) => ControlResponse::success(json!({
+            "group": group,
+            "selected": proxy,
+        })),
+        Err(e) => ControlResponse::error(e),
+    }
+}
 
-        ControlRequest::Groups => {
-            let st = state.read().await;
-            let groups: Vec<serde_json::Value> = st
-                .config
-                .proxy_groups
-                .iter()
-                .map(|g| {
-                    let selected = st.selections.get(&g.name).cloned().unwrap_or_default();
-                    json!({
-                        "name": g.name,
-                        "type": format!("{:?}", g.group_type),
-                        "proxies": g.proxies,
-                        "selected": selected,
-                    })
-                })
-                .collect();
-            ControlResponse::success(json!(groups))
-        }
+async fn control_proxies(state: &Arc<RwLock<DaemonState>>) -> ControlResponse {
+    let st = state.read().await;
+    let names: Vec<&str> = st.proxies.keys().map(|s| s.as_str()).collect();
+    ControlResponse::success(json!(names))
+}
 
-        ControlRequest::Rules => {
-            let st = state.read().await;
-            ControlResponse::success(json!(st.config.rules))
-        }
+async fn control_groups(state: &Arc<RwLock<DaemonState>>) -> ControlResponse {
+    let st = state.read().await;
+    let groups: Vec<serde_json::Value> = st
+        .config
+        .proxy_groups
+        .iter()
+        .map(|g| {
+            let selected = st.selections.get(&g.name).cloned().unwrap_or_default();
+            json!({
+                "name": g.name,
+                "type": format!("{:?}", g.group_type),
+                "proxies": g.proxies,
+                "selected": selected,
+            })
+        })
+        .collect();
+    ControlResponse::success(json!(groups))
+}
 
-        ControlRequest::Test { domain } => {
-            let st = state.read().await;
-            let input = match_input_from_host(&domain);
-            let (group, resolved_name, matched_rule) = st.resolve_routing_with_group(&input);
+async fn control_rules(state: &Arc<RwLock<DaemonState>>) -> ControlResponse {
+    let st = state.read().await;
+    ControlResponse::success(json!(st.config.rules))
+}
+
+async fn control_test(state: &Arc<RwLock<DaemonState>>, domain: String) -> ControlResponse {
+    let st = state.read().await;
+    let input = match_input_from_host(&domain);
+    let (group, resolved_name, matched_rule) = st.resolve_routing_with_group(&input);
+    ControlResponse::success(json!({
+        "domain": domain,
+        "mode": format!("{:?}", st.config.mode),
+        "matched_rule": matched_rule,
+        "resolved_proxy": resolved_name,
+        "group": group,
+    }))
+}
+
+async fn control_latency(state: &Arc<RwLock<DaemonState>>, full: bool) -> ControlResponse {
+    let (proxies, proxy_resolver) = {
+        let st = state.read().await;
+        (
+            st.proxies.values().cloned().collect::<Vec<Proxy>>(),
+            st.proxy_resolver_handle(),
+        )
+    };
+    let results = if full {
+        crate::latency::measure_full(proxies, proxy_resolver).await
+    } else {
+        crate::latency::measure_tcp(&proxies).await
+    };
+    match serde_json::to_value(&results) {
+        Ok(data) => ControlResponse::success(data),
+        Err(e) => ControlResponse::error(format!("failed to serialize latency results: {e}")),
+    }
+}
+
+async fn control_dns_flush(
+    state: &Arc<RwLock<DaemonState>>,
+    host: Option<String>,
+) -> ControlResponse {
+    let st = state.read().await;
+    // Flush both resolvers (target + proxy-server). The bootstrap cache is
+    // intentionally not exposed — a reload clears it.
+    match host {
+        Some(host) => {
+            let hit_target = st.resolver.invalidate(&host).await;
+            let hit_proxy = st.proxy_resolver.invalidate(&host).await;
             ControlResponse::success(json!({
-                "domain": domain,
-                "mode": format!("{:?}", st.config.mode),
-                "matched_rule": matched_rule,
-                "resolved_proxy": resolved_name,
-                "group": group,
+                "host": host,
+                "hit": hit_target || hit_proxy,
             }))
         }
-
-        ControlRequest::Latency { full } => {
-            let (proxies, proxy_resolver) = {
-                let st = state.read().await;
-                (
-                    st.proxies.values().cloned().collect::<Vec<Proxy>>(),
-                    st.proxy_resolver_handle(),
-                )
-            };
-            let results = if full {
-                crate::latency::measure_full(proxies, proxy_resolver).await
-            } else {
-                crate::latency::measure_tcp(&proxies).await
-            };
-            ControlResponse::success(serde_json::to_value(&results).unwrap_or_default())
-        }
-
-        ControlRequest::DnsFlush { host } => {
-            let st = state.read().await;
-            // Flush both resolvers (target + proxy-server). The bootstrap
-            // cache is intentionally not exposed — a reload clears it.
-            match host {
-                Some(host) => {
-                    let hit_target = st.resolver.invalidate(&host).await;
-                    let hit_proxy = st.proxy_resolver.invalidate(&host).await;
-                    ControlResponse::success(json!({
-                        "host": host,
-                        "hit": hit_target || hit_proxy,
-                    }))
-                }
-                None => {
-                    let flushed = st.resolver.clear().await + st.proxy_resolver.clear().await;
-                    ControlResponse::success(json!({ "flushed": flushed }))
-                }
-            }
+        None => {
+            let flushed = st.resolver.clear().await + st.proxy_resolver.clear().await;
+            ControlResponse::success(json!({ "flushed": flushed }))
         }
     }
 }

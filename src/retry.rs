@@ -1,5 +1,26 @@
+//! Retry, failover, cooldown, and connection-lifetime policy.
+//!
+//! This module owns the numbers that define data-plane behavior: retry
+//! backoff, passive cooldown, node degradation, the first-byte budget, and the
+//! idle/half-close/promotion lifetimes used by the relay. [`CooldownTracker`]
+//! records passive failures and probe-driven sidelines; the daemon consults it
+//! when building candidate lists.
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+/// Read a tracker lock, recovering the guard if another task panicked while
+/// holding it. A poisoned diagnostic lock must not take the data plane down.
+fn read_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Write counterpart of [`read_lock`].
+fn write_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 pub const MAX_RETRIES: u32 = 2;
 pub const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
@@ -105,7 +126,7 @@ impl CooldownTracker {
     /// The counter carries the full rate; the log only carries the story.
     pub fn should_warn_stalled(&self, proxy: &str) -> bool {
         let now = Instant::now();
-        let mut warns = self.stalled_warns.write().unwrap();
+        let mut warns = write_lock(&self.stalled_warns);
         match warns.get(proxy) {
             Some(last) if now.duration_since(*last) < STALLED_WARN_INTERVAL => false,
             _ => {
@@ -116,10 +137,10 @@ impl CooldownTracker {
     }
 
     pub fn is_cooled_down(&self, proxy: &str) -> bool {
-        if self.sidelined.read().unwrap().contains(proxy) {
+        if read_lock(&self.sidelined).contains(proxy) {
             return true;
         }
-        let failures = self.failures.read().unwrap();
+        let failures = read_lock(&self.failures);
         match failures.get(proxy) {
             Some(&(count, last_failure)) => {
                 count >= COOLDOWN_FAILURE_THRESHOLD && last_failure.elapsed() < COOLDOWN_DURATION
@@ -132,17 +153,17 @@ impl CooldownTracker {
     /// only by record_success). Used by the probe scheduler to re-check
     /// unhealthy nodes at a faster cadence.
     pub fn is_sidelined(&self, proxy: &str) -> bool {
-        self.sidelined.read().unwrap().contains(proxy)
+        read_lock(&self.sidelined).contains(proxy)
     }
 
     /// Sideline a proxy until a health probe passes. Used on confirmed probe
     /// failures; data-plane code treats it exactly like a cooldown.
     pub fn sideline(&self, proxy: &str) {
-        self.sidelined.write().unwrap().insert(proxy.to_string());
+        write_lock(&self.sidelined).insert(proxy.to_string());
     }
 
     pub fn record_failure(&self, proxy: &str) {
-        let mut failures = self.failures.write().unwrap();
+        let mut failures = write_lock(&self.failures);
         let entry = failures
             .entry(proxy.to_string())
             .or_insert((0, Instant::now()));
@@ -154,14 +175,11 @@ impl CooldownTracker {
     /// Used for first-byte timeouts/closes, which are probably (not
     /// certainly) node failures.
     pub fn degrade(&self, proxy: &str) {
-        self.degraded
-            .write()
-            .unwrap()
-            .insert(proxy.to_string(), Instant::now());
+        write_lock(&self.degraded).insert(proxy.to_string(), Instant::now());
     }
 
     pub fn is_degraded(&self, proxy: &str) -> bool {
-        let degraded = self.degraded.read().unwrap();
+        let degraded = read_lock(&self.degraded);
         match degraded.get(proxy) {
             Some(t) => t.elapsed() < DEGRADE_DURATION,
             None => false,
@@ -169,9 +187,9 @@ impl CooldownTracker {
     }
 
     pub fn record_success(&self, proxy: &str) {
-        self.failures.write().unwrap().remove(proxy);
-        self.sidelined.write().unwrap().remove(proxy);
-        self.degraded.write().unwrap().remove(proxy);
+        write_lock(&self.failures).remove(proxy);
+        write_lock(&self.sidelined).remove(proxy);
+        write_lock(&self.degraded).remove(proxy);
     }
 }
 
