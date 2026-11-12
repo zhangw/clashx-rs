@@ -118,18 +118,20 @@ daemon/relay tests and are landed in commit 4.
 
 ### F-05 — Undocumented `unsafe` blocks (Major, `UNS-2`)
 
-Six production blocks without a `// SAFETY:` note:
-`src/resources.rs:85,95,99` (`getrlimit`/`setrlimit`),
-`crates/proxy/src/socket.rs:55` (`setsockopt` keepalive),
-`crates/rule/src/process.rs:207-208` (union field access after checking
-`soi_kind`). Four more are in tests.
+The `libproc` union field accesses at `crates/rule/src/process.rs:207-208`
+had no `// SAFETY:` note, even though the discriminant check is what makes
+them sound. The `getrlimit`/`setrlimit` blocks in `src/resources.rs` and the
+`setsockopt` block in `crates/proxy/src/socket.rs` already carried notes, but
+`unsafe_code` was not enforced, so nothing prevented the next unannotated
+block from landing.
 
 Impact: the `libproc` union access is the highest-risk code in the workspace;
-the discriminant check that makes it sound is not written down.
+the invariant that makes it sound must be written down next to the block.
 
-Fix: `// SAFETY:` comments stating invariants and platform assumptions;
-`unsafe_code` denied at workspace level with local `#[allow(unsafe_code)]` on
-those functions, and `clippy::undocumented_unsafe_blocks` denied. Commit 2/3.
+Fix: add the missing `// SAFETY:` notes, deny `unsafe_code` at workspace level,
+and add a local `#[expect(unsafe_code, reason = "...")]` on the four functions
+that need `libc`/`libproc`; deny `clippy::undocumented_unsafe_blocks` so new
+blocks require a note. Commit 2/3.
 
 ### F-06 — `mod.rs` layout (Minor, `ORG-2`)
 
@@ -249,3 +251,37 @@ cargo clippy --all-targets --message-format=short -- \
   -W clippy::pedantic -W missing_docs -W missing_debug_implementations \
   -W unsafe_code -W rust_2018_idioms -W unused_qualifications
 ```
+
+## Remediation status (2026-11-12)
+
+All findings were addressed on `feat/rust-style-guide`:
+
+| Finding | Status | Where |
+| --- | --- | --- |
+| F-01 public API docs | resolved | `4c3979f` (crates), `0d1f445` (binary modules) |
+| F-02 panic-prone locks | resolved | `2f5d4cd` (poison recovery, budget error) |
+| F-03 silent fallbacks / `Option` unwraps | resolved | `0d1f445`, `2f5d4cd`, `06e124d` |
+| F-04 oversized functions | mostly resolved | `0d1f445` (CLI/control splits), `06e124d` (SOCKS5 auth helper); `handle_connection`, `run_daemon`, `probe::run`, `relay_with_policy` keep a documented `#[expect(clippy::too_many_lines)]` |
+| F-05 unsafe documentation | resolved | `2f5d4cd` (SAFETY notes), `06e124d` (`unsafe_code` deny + expectations) |
+| F-06 `mod.rs` layout | resolved | `a42db57` |
+| F-07 naming / flags / three-state lookup | resolved | `a42db57`, `06e124d` (`unused_self`, `option_option` expectation) |
+| F-08 stale suppressions | resolved | `0d1f445` |
+| F-09 lint sweep | resolved | `06e124d` |
+| F-10 missing `Debug` | resolved | `06e124d` |
+| F-11 items after statements | resolved | `06e124d` |
+| F-12 test opt-outs | resolved | `06e124d` |
+| F-13 protocol casts | accepted | allowed in `Cargo.toml`, reviewed per `API-9` |
+| F-14 Linux sysproxy stdout | accepted | documented in `LOG-1` |
+| F-15 `start_background` stub | accepted | `#[expect(clippy::unnecessary_wraps, reason = "...")]` |
+
+The enforcement baseline is now green:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace --all-targets   # 335 tests
+```
+
+Known follow-up: the four long functions kept under `#[expect]` are cohesive
+data-plane/startup state machines. Splitting them further is a separate,
+behavior-focused refactor, not a style sweep.
