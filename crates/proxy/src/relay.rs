@@ -1,3 +1,22 @@
+//! Bidirectional relay with activity-based lifetime limits.
+//!
+//! [`relay_with_policy`] copies bytes in both directions and refreshes one
+//! shared activity clock on every successful read. [`RelayPolicy::idle`]
+//! reclaims a connection with no bytes in either direction, while
+//! [`RelayPolicy::half_close_idle`] reclaims a connection whose remaining
+//! direction stays silent after the other reached EOF. There is deliberately
+//! no total-duration cap, so slow but live streams survive.
+//!
+//! A [`RelayPromotion`] callback may run once while both directions are still
+//! open, extending the half-close budget for connections that have proven
+//! long-lived. That is the relay half of the general/streaming connection
+//! classes described in
+//! [`docs/resource-budget.md`](../../../docs/resource-budget.md); the pool
+//! upgrade itself belongs to the caller.
+//!
+//! Peer resets and abortive closes are normal termination
+//! ([`RelayEnd::PeerClosed`]), not relay errors.
+
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -37,6 +56,7 @@ pub struct RelayPolicy {
     pub promote_after: Option<Duration>,
 }
 
+/// How a relayed connection ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayEnd {
     /// Both directions reached EOF.
@@ -51,10 +71,18 @@ pub enum RelayEnd {
     PeerClosed,
 }
 
+/// Byte counts and termination reason for one relayed connection.
 #[derive(Debug)]
 pub struct RelayStats {
+    /// Bytes read from `a` and written to `b`.
+    ///
+    /// The counter advances on reads, so a failed write can leave it slightly
+    /// ahead of what the peer actually received.
     pub a_to_b: u64,
+    /// Bytes read from `b` and written to `a`, with the same read-side
+    /// accounting as [`RelayStats::a_to_b`].
     pub b_to_a: u64,
+    /// Why the relay returned; see [`RelayEnd`].
     pub end: RelayEnd,
     /// The promotion callback was invoked. The resource-pool upgrade may
     /// still have been denied; use the connection class for the actual state.
@@ -174,6 +202,14 @@ fn tick_interval(policy: &RelayPolicy) -> Duration {
 /// direction has been idle for `half_close_idle` instead of waiting for a peer
 /// that may never send FIN. Every successful read refreshes both deadlines;
 /// actively streaming connections are never cut by a timer.
+///
+/// # Errors
+///
+/// Returns an error when a copy fails with an I/O error other than the
+/// peer-close kinds (connection reset, aborted, broken pipe, unexpected EOF,
+/// not connected); those terminate normally as [`RelayEnd::PeerClosed`].
+/// Errors from shutting down the opposite direction after EOF are ignored, and
+/// neither a shutdown timeout nor a promotion callback is an error.
 pub async fn relay_with_policy<A, B, P>(
     a: A,
     b: B,
@@ -352,6 +388,12 @@ where
 ///
 /// Kept for callers that only need byte forwarding; daemon traffic uses
 /// [`relay_with_policy`].
+///
+/// # Errors
+///
+/// Returns an error when a copy fails with an I/O error other than a
+/// peer-driven close; peer resets and aborts end the relay normally and yield
+/// the byte counts recorded so far.
 pub async fn relay<A, B>(a: A, b: B) -> Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin + Send,

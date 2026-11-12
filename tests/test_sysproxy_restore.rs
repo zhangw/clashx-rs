@@ -1,3 +1,6 @@
+//! macOS system-proxy snapshot/restore integration test. Exercises a real
+//! `networksetup` call path and restores the original settings afterwards.
+
 #![cfg(target_os = "macos")]
 
 use std::fs;

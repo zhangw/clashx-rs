@@ -1,3 +1,11 @@
+//! Linux system proxy management.
+//!
+//! Linux has no portable, user-scoped system proxy store, so this module does
+//! not mutate anything: [`enable`] prints shell `export` lines and [`disable`]
+//! prints `unset` lines on stdout. That is the documented contract — the caller
+//! evaluates or sources the output. [`status`] only inspects the environment it
+//! inherited and compares it with the values [`enable`] would print for a port.
+
 use anyhow::Result;
 
 pub fn enable(port: u16) -> Result<()> {

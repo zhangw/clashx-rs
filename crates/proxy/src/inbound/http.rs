@@ -1,3 +1,16 @@
+//! The HTTP proxy inbound handshake.
+//!
+//! Handles both `CONNECT host:port` and plain absolute-form proxy requests.
+//! Plain requests are rebuilt for the origin: the request line is rewritten to
+//! origin-form, hop-by-hop headers (including those nominated by `Connection`)
+//! are stripped, and `Connection: close` is added so a connection cannot carry
+//! a second request that bypassed rule matching. Upgrade requests keep their
+//! `Connection`/`Upgrade` pair instead.
+//!
+//! Request lines are limited to 8 KiB and requests to 128 header lines. Bytes
+//! read past the header block are returned as initial data so pipelined bodies
+//! and early TLS handshakes are not lost.
+
 use anyhow::{bail, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -147,6 +160,16 @@ fn parse_host_port_default(s: &str, default_port: u16) -> Result<TargetAddr> {
 /// Supports:
 /// - `CONNECT host:port HTTP/1.x` — returns `(target, None)` after sending 200.
 /// - Plain HTTP methods (`GET`, `POST`, etc.) — returns `(target, Some(raw_request_bytes))`.
+///
+/// # Errors
+///
+/// Returns an error when the request line or a header is not valid UTF-8,
+/// exceeds the 8 KiB line limit, or the request carries more than 128 headers;
+/// when the request line is empty; when a CONNECT target is missing a port or
+/// has an invalid port or IPv6 address; when a plain request has neither an
+/// absolute-form request target nor a `Host` header to route by; or when the
+/// underlying socket fails while reading the request or writing the CONNECT
+/// response.
 pub async fn handshake(stream: &mut TcpStream) -> Result<(TargetAddr, Option<Vec<u8>>)> {
     let mut reader = BufReader::new(stream);
 

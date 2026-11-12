@@ -1,3 +1,12 @@
+//! The SOCKS5 outbound connector.
+//!
+//! Establishes a TCP tunnel through a SOCKS5 proxy using the CONNECT command.
+//! NO_AUTH and RFC 1929 username/password authentication are both supported;
+//! the client offers only NO_AUTH when no credentials are configured. Domain
+//! targets are sent to the proxy unresolved so the proxy's resolver, not the
+//! local one, resolves them; the proxy server itself is dialed by its
+//! pre-resolved IP when the daemon supplies one.
+
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -29,6 +38,16 @@ const REP_SUCCESS: u8 = 0x00;
 ///
 /// The full SOCKS5 setup (TCP connect, method negotiation, optional auth, and
 /// CONNECT reply) must complete within [`PROXY_CONNECT_TIMEOUT`].
+///
+/// # Errors
+///
+/// Returns an error when the proxy server cannot be dialed or the setup does
+/// not finish within [`PROXY_CONNECT_TIMEOUT`], when the server speaks an
+/// unexpected SOCKS version, selects an auth method the client did not offer
+/// or cannot use, or rejects the username/password, when the CONNECT reply
+/// carries a non-zero status or an unknown address type, when a credential
+/// exceeds the 255-byte protocol limit, or when reading or writing the
+/// handshake fails.
 pub async fn connect(
     server: &str,
     port: u16,

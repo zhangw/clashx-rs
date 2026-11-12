@@ -12,6 +12,17 @@ use tokio::net::TcpStream;
 /// network change). It does not replace the relay's activity-based idle and
 /// half-close timers: keepalive only detects a dead peer, not a live peer who
 /// simply never closes.
+///
+/// Idle and interval are truncated to whole seconds with a minimum of 1, and
+/// `count` is clamped to the platform's `c_int` range. On platforms other than
+/// macOS and Linux only `SO_KEEPALIVE` is enabled, with the system default
+/// profile; the other three arguments are ignored there.
+///
+/// # Errors
+///
+/// Returns the OS error from `setsockopt` when the option is unsupported or
+/// the socket is no longer valid. Callers usually treat failure as a
+/// best-effort degradation rather than a connection failure.
 pub fn set_keepalive(
     stream: &TcpStream,
     idle: Duration,

@@ -1,3 +1,6 @@
+//! Integration tests for rule parsing and evaluation across DOMAIN-SUFFIX,
+//! IP-CIDR, PROCESS-NAME, GEOIP, and MATCH rules.
+
 use std::net::IpAddr;
 
 use clashx_rs_rule::{MatchInput, RuleEngine};

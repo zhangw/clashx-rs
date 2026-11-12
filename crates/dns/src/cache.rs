@@ -1,4 +1,7 @@
 //! TTL-based DNS cache with negative caching and in-flight coalescing.
+//!
+//! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
+//! TTL clamp and negative-cache rules this implements.
 
 use std::collections::HashMap;
 use std::net::IpAddr;

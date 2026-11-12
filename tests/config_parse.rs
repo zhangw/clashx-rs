@@ -1,3 +1,6 @@
+//! Integration tests for Clash-compatible YAML parsing: defaults, proxies,
+//! groups, rules, DNS keys, and unknown-field tolerance.
+
 use std::io::Write;
 
 use clashx_rs_config::load_config;

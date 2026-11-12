@@ -1,3 +1,9 @@
+//! Downloading subscription configs over HTTP.
+//!
+//! Responses are size-capped (8 MiB) and written to a sibling `.yaml.tmp` file
+//! that is renamed into place, so readers never see a partial config. On Unix
+//! the temp and final files are `0600`.
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -15,6 +21,11 @@ const MAX_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
 
 /// Build a reqwest client configured with the Clash User-Agent. Clients own a
 /// connection pool, so callers should build once and reuse across downloads.
+///
+/// # Errors
+///
+/// Returns an error when the underlying TLS backend or client configuration
+/// cannot be initialized.
 pub fn build_client() -> Result<Client> {
     Client::builder()
         .user_agent(CLASH_USER_AGENT)
@@ -24,6 +35,15 @@ pub fn build_client() -> Result<Client> {
 }
 
 /// Download a subscription's config and write it atomically to the output path.
+///
+/// The output path comes from `sub.output`, with a leading `~/` expanded to the
+/// user's home directory. The error context names the subscription.
+///
+/// # Errors
+///
+/// Returns an error when the request or body read fails, the endpoint returns
+/// a non-success status or an oversized response, or the output file cannot be
+/// created, written, or atomically renamed into place.
 pub async fn download_subscription(client: &Client, sub: &Subscription) -> Result<()> {
     let output_path = expand_tilde(&sub.output);
     tracing::info!(name = %sub.name, "downloading subscription");
@@ -32,6 +52,18 @@ pub async fn download_subscription(client: &Client, sub: &Subscription) -> Resul
         .with_context(|| format!("subscription '{}' download failed", sub.name))
 }
 
+/// Download `url` and write the response body atomically to `output_path`.
+///
+/// The parent directory is created if needed. Responses larger than 8 MiB are
+/// rejected, whether declared by `Content-Length` or discovered while
+/// streaming. On Unix both the temp file and the final file are restricted to
+/// `0600`.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP request fails, the endpoint returns a
+/// non-success status, the declared or streamed body exceeds 8 MiB, or the
+/// parent directory, temp file, rename, or permission change fails.
 pub async fn download_to(client: &Client, url: &str, output_path: &Path) -> Result<()> {
     let mut response = client
         .get(url)

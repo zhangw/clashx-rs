@@ -7,8 +7,9 @@
 //!   plain-UDP `default-nameserver` list (never the main group).
 //! - `wire`/`upstream`/`cache` are the building blocks.
 //!
-//! Only A records are queried; `dns.ipv6` currently behaves as `false`
-//! (see docs/dns-resolver-design.md).
+//! Only A records are queried; `dns.ipv6` currently behaves as `false`.
+//! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
+//! as-built semantics, config keys, and layout.
 
 mod bootstrap;
 mod cache;
@@ -45,7 +46,14 @@ pub(crate) use warn_once;
 ///
 /// `dns.ipv6` is effectively `false` in this build: results that are
 /// exclusively IPv6 are treated as resolution failure (callers negative-cache
-/// the outcome).
+/// the outcome). The blocking `getaddrinfo` call runs on the Tokio blocking
+/// pool, so this never stalls the async runtime.
+///
+/// # Errors
+///
+/// Returns an error when `getaddrinfo` fails for `host` (unknown host or name
+/// service failure), when it yields no IPv4 address (including IPv6-only
+/// results), or when the blocking resolver task cannot be joined.
 pub async fn system_resolve(host: &str) -> Result<IpAddr> {
     let host = host.to_string();
     task::spawn_blocking(move || -> Result<IpAddr> {

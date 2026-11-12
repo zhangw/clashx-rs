@@ -1,3 +1,16 @@
+//! The Trojan outbound connector.
+//!
+//! Opens a TLS connection to a Trojan server and sends a request header made
+//! of the hex-encoded SHA-224 of the password followed by the CONNECT command
+//! and the target address. Certificates are verified against the bundled
+//! webpki roots unless `skip_cert_verify` is enabled, which disables all
+//! validation and logs a warning once per TLS configuration. TLS connectors
+//! are cached per verification mode and shared for the process lifetime.
+//!
+//! The server is dialed by its pre-resolved IP when the daemon supplies one,
+//! but SNI always uses the configured server domain or `sni` override so
+//! certificate verification still matches the configured identity.
+
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
@@ -171,6 +184,14 @@ fn build_trojan_header(password: &str, target: &TargetAddr) -> Result<Vec<u8>> {
 /// unaffected.
 ///
 /// Both the TCP connect and the TLS handshake must complete within [`PROXY_CONNECT_TIMEOUT`].
+///
+/// # Errors
+///
+/// Returns an error when the SNI host is not a valid TLS server name, when the
+/// TCP dial or TLS handshake fails (certificate validation, protocol mismatch,
+/// reset), when either does not complete within [`PROXY_CONNECT_TIMEOUT`],
+/// when a domain target exceeds the 255-byte Trojan address limit, or when
+/// writing the request header fails.
 pub async fn connect(
     server: &str,
     port: u16,

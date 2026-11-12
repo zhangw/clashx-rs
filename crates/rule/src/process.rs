@@ -1,3 +1,18 @@
+//! Best-effort port-to-process-name lookup for PROCESS-NAME rules.
+//!
+//! [`ProcessLookup::lookup`] builds a port → process-name table from the OS
+//! (libproc on macOS, `/proc` on Linux) and caches it for two seconds. Only
+//! processes named by a PROCESS-NAME rule are scanned, so unrelated processes
+//! do not pay the file-descriptor walk. Cache hits are synchronous hash-map
+//! lookups; concurrent misses coalesce into one blocking scan.
+//!
+//! The snapshot is deliberately stale-tolerant: a port absent from a fresh
+//! snapshot is a definitive miss until the TTL expires, and a reused port can
+//! name its previous owner for the same window. PROCESS-NAME rules are
+//! therefore best-effort — prefer DOMAIN, IP-CIDR, or GEOIP rules when routing
+//! must be exact. On platforms other than macOS and Linux the scan returns an
+//! empty table and every lookup misses.
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,6 +55,11 @@ pub struct ProcessLookup {
 }
 
 impl ProcessLookup {
+    /// Create an empty lookup with no snapshot and no process-name filter.
+    ///
+    /// Until [`ProcessLookup::set_targets`] is called, the first scan considers
+    /// every process. [`crate::RuleEngine::new`] sets the targets derived from
+    /// the configured PROCESS-NAME rules immediately after construction.
     pub fn new() -> Self {
         Self {
             snapshot: Mutex::new(None),

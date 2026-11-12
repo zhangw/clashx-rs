@@ -1,3 +1,13 @@
+//! The SOCKS5 inbound handshake.
+//!
+//! Implements just enough of RFC 1928 for a local mixed-port listener: version
+//! 5, the CONNECT command, and NO_AUTH only. IPv4, IPv6, and domain address
+//! types are accepted; the reply advertises `0.0.0.0:0` because the real
+//! connection is established after the handshake, not here.
+//!
+//! Any other auth method is refused with the SOCKS "no acceptable methods"
+//! reply before the handshake fails.
+
 use anyhow::{bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -12,6 +22,17 @@ const ATYP_IPV6: u8 = 0x04;
 const REP_SUCCESS: u8 = 0x00;
 
 /// Perform a SOCKS5 handshake on the given stream and return the target address.
+///
+/// The success reply is written before this function returns, so the stream is
+/// then positioned for raw data relay.
+///
+/// # Errors
+///
+/// Returns an error when the client sends a version other than 5, offers no
+/// NO_AUTH method (the no-acceptable-methods reply is sent first), uses a
+/// command other than CONNECT, uses an unknown address type, supplies a domain
+/// that is not valid UTF-8, or when reading or writing the handshake fails or
+/// the peer disconnects early.
 pub async fn handshake<S>(stream: &mut S) -> Result<TargetAddr>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,

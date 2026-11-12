@@ -1,3 +1,24 @@
+//! Rule compilation and evaluation.
+//!
+//! [`RuleEngine::new`] parses Clash rule strings (for example
+//! `DOMAIN-SUFFIX,example.com,Proxy`) into an ordered list, skipping rule
+//! types the project does not implement with a warning. Matching is
+//! top-to-bottom and first-match-wins; the built-in types are `DOMAIN`,
+//! `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`/`IP-CIDR6`, `PROCESS-NAME`,
+//! `GEOIP`, and `MATCH`.
+//!
+//! [`RuleEngine::evaluate`] is the eager entry point: it only uses data already
+//! present in [`MatchInput`]. [`RuleEngine::evaluate_from`] is the lazy entry
+//! point used by the daemon, which pauses at the first rule that needs a
+//! resolved IP or process name so those lookups happen at most once per
+//! connection and only when a rule actually needs them.
+//!
+//! Invariant for lazy callers: when a lookup has been attempted and produced
+//! nothing, set [`MatchInput::ip_attempted`] /
+//! [`MatchInput::process_attempted`] before resuming, otherwise the same rule
+//! keeps requesting data. PROCESS-NAME matching is best-effort; see [`process`]
+//! for the snapshot window.
+
 pub mod process;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -8,10 +29,28 @@ use clashx_rs_geoip::GeoIpDb;
 
 use crate::process::ProcessLookup;
 
+/// Data available to the evaluator for one connection, plus lookup state.
+///
+/// The `*_attempted` flags are what keep the lazy evaluator terminating: a rule
+/// whose data was already requested and not found is skipped rather than
+/// requested again.
 #[derive(Default)]
 pub struct MatchInput<'a> {
+    /// Hostname to match, if the connection has one.
+    ///
+    /// Matching is ASCII case-insensitive: the engine lowercases uppercase
+    /// hosts once per pass, and parsed domain rules are already lowercase.
+    /// `None` for connections addressed by IP literal.
     pub host: Option<&'a str>,
+    /// Address to evaluate IP-CIDR and GEOIP rules against.
+    ///
+    /// `None` means not resolved (or no lookup is possible); those rules
+    /// simply do not match.
     pub ip: Option<IpAddr>,
+    /// Name of the process that owns the inbound connection.
+    ///
+    /// Compared exactly (case-sensitive) against `PROCESS-NAME` rules. `None`
+    /// when unknown; see [`MatchInput::process_attempted`].
     pub process_name: Option<&'a str>,
     /// DNS resolution was already attempted. If true and `ip` is None, the
     /// resolve failed — IP/GEOIP rules should be treated as non-matching and
@@ -22,6 +61,12 @@ pub struct MatchInput<'a> {
     pub process_attempted: bool,
 }
 
+/// A compiled, ordered rule set.
+///
+/// The engine owns parsed rules and its own [`ProcessLookup`] cache, so
+/// separate engines (for example in tests or after a config reload) never
+/// share process state. Rule targets are plain strings naming a proxy, group,
+/// `DIRECT`, or `REJECT`.
 pub struct RuleEngine {
     rules: Vec<RuleEntry>,
     geoip_db: Option<Arc<GeoIpDb>>,
@@ -31,6 +76,13 @@ pub struct RuleEngine {
 }
 
 impl RuleEngine {
+    /// Parse `raw_rules` into an engine, preserving config order.
+    ///
+    /// Unrecognized or malformed entries are logged and skipped rather than
+    /// failing the whole config. GEOIP rules only count as needing a resolved
+    /// IP when `geoip_db` is `Some`, so a missing database never triggers
+    /// wasted DNS work. Process names referenced by PROCESS-NAME rules are
+    /// installed as the lookup cache's scan filter.
     pub fn new(raw_rules: &[String], geoip_db: Option<Arc<GeoIpDb>>) -> Self {
         let rules: Vec<RuleEntry> = raw_rules
             .iter()
@@ -100,6 +152,12 @@ impl RuleEngine {
         self.geoip_db.is_some()
     }
 
+    /// Return the target of the first rule that matches `input`.
+    ///
+    /// This pass performs no DNS or process lookups: rules that need data
+    /// absent from `input` cannot match. Use [`RuleEngine::evaluate_from`] when
+    /// a PROCESS-NAME or IP rule may require a lookup. The returned target
+    /// borrows from the engine.
     pub fn evaluate<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a str> {
         self.find_match(input).map(|r| r.target())
     }
@@ -189,8 +247,16 @@ pub enum EvalStep<'a> {
     /// Reached a rule whose required input is not yet available. The caller
     /// should populate the requested fields and call `resume_from`.
     NeedsData {
+        /// Index of the rule that needs data.
+        ///
+        /// Resume at this index so that rule is re-examined once the value is
+        /// available; earlier rules are not walked again.
         resume_from: usize,
+        /// `ip` is missing and no lookup has been attempted yet; the caller
+        /// should resolve it and resume.
         need_ip: bool,
+        /// `process_name` is missing and no lookup has been attempted yet;
+        /// the caller should look it up and resume.
         need_process: bool,
     },
     /// Walked all rules without matching.

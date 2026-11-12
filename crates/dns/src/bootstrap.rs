@@ -5,6 +5,9 @@
 //! upstreams themselves; routing bootstrap through them would be circular).
 //! With no usable default-nameserver, bootstrap falls back to the system
 //! resolver (fail-open) with a one-time warning.
+//!
+//! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
+//! bootstrap and `default-nameserver` rules.
 
 use std::net::{IpAddr, SocketAddr};
 

@@ -1,3 +1,9 @@
+//! Loading configuration files from disk.
+//!
+//! [`load_config`] is the full parser; [`load_log_level`] is a cheap
+//! single-field read used before tracing is initialized. Both treat the file
+//! as read-only and never create or modify it.
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -9,7 +15,8 @@ use crate::types::{Config, LogLevel};
 /// Logging has to be configured before [`load_config`] runs, because that
 /// function reports problems through `tracing` itself. Deserialising into a
 /// one-field struct skips building the proxy and rule lists, which is the
-/// expensive part of a real config.
+/// expensive part of a real config. An unreadable or unparseable file falls
+/// back to [`LogLevel::Info`] so a bad config never silences the daemon.
 pub fn load_log_level(path: &Path) -> LogLevel {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "kebab-case")]
@@ -25,6 +32,18 @@ pub fn load_log_level(path: &Path) -> LogLevel {
         .unwrap_or_default()
 }
 
+/// Read and deserialize the full configuration file.
+///
+/// On Unix, a file that is group- or world-readable triggers a warning,
+/// because configs commonly embed proxy passwords. Unknown keys are preserved
+/// rather than rejected, so subscription-style configs load unmodified.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read (missing, unreadable, or not
+/// UTF-8) or when its YAML does not deserialize into [`Config`] (malformed
+/// syntax, or a known key with an invalid value). Both errors include the
+/// path.
 pub fn load_config(path: &Path) -> Result<Config> {
     // Warn if config file is world/group-readable. It typically contains
     // proxy passwords, so recommend 0600 or 0400.

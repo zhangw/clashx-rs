@@ -1,3 +1,10 @@
+//! The DIRECT outbound connector.
+//!
+//! [`connect`] dials the target itself, preferring a caller-supplied
+//! pre-resolved IP over the system resolver. Resolution policy lives in the
+//! daemon and `crates/dns`; this module only opens the TCP connection and
+//! applies the shared socket options.
+
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context, Result};
@@ -14,6 +21,15 @@ use crate::timeout::CONNECT_TIMEOUT;
 /// `TcpStream::connect((host, port))` invokes getaddrinfo which on systems
 /// with the proxy set as system proxy can route DNS queries back through
 /// clashx-rs itself, creating recursive lookups and significant latency.
+///
+/// TCP_NODELAY and keepalive use the same settings as the proxy dials. The
+/// returned stream is owned by the caller.
+///
+/// # Errors
+///
+/// Returns an error when the connection is refused, unreachable, or reset, when
+/// hostname resolution fails in the fallback path, or when the attempt does not
+/// complete within [`CONNECT_TIMEOUT`].
 pub async fn connect(target: &TargetAddr, resolved_ip: Option<IpAddr>) -> Result<OutboundStream> {
     let connect = async {
         match (resolved_ip, target) {

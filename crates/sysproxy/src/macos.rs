@@ -1,3 +1,12 @@
+//! macOS system proxy management via `networksetup`.
+//!
+//! Every active network service is switched to the local listener. Before the
+//! first change the previous settings are written to a JSON snapshot; `disable`
+//! restores that snapshot only when the snapshot belongs to the requesting port
+//! and the service still points at it, so one instance never undoes another's
+//! configuration. `turn_off` is the explicit "no proxy" request and disables the
+//! proxies outright.
+
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;

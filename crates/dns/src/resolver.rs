@@ -1,5 +1,8 @@
 //! Top-level resolver: hosts mappings, cache/singleflight, upstream race,
 //! system fallback — the mihomo-compatible DNS semantics entry point.
+//!
+//! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
+//! resolution order and the fail-open rules.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -93,6 +96,11 @@ pub struct Resolver {
 }
 
 impl Resolver {
+    /// Create a resolver that delegates every lookup to the system resolver.
+    ///
+    /// This is the mode used when `dns.enable` is `false` or no `dns:` block
+    /// is configured. Hosts mappings do not apply, and results are cached with
+    /// `SYSTEM_RESOLVE_TTL_SECS`.
     pub fn system() -> Self {
         Self {
             mode: ResolverMode::System,
@@ -120,6 +128,13 @@ impl Resolver {
     /// Custom-mode flow: IP-literal short-circuit → hosts hit (never cached)
     /// → cache/singleflight → upstream race (first success wins) → system
     /// fallback (fail-open, warn) → cache write (TTL clamp / negative cache).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `host` is not an IP literal and cannot be
+    /// resolved: every configured nameserver failed or timed out *and* the
+    /// fail-open system fallback also failed, or a recent negative cache entry
+    /// for `host` is still suppressing lookups. IP literals always succeed.
     pub async fn resolve(&self, host: &str) -> Result<IpAddr> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(ip);

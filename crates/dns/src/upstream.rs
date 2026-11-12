@@ -3,6 +3,9 @@
 //! Classification of config strings lives here (the config crate stays pure
 //! data). Unknown/unsupported entries are warned about and skipped, matching
 //! the repo's "ignore, don't reject" config style.
+//!
+//! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
+//! per-upstream semantics, TLS pinning, and timeout budgets.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};

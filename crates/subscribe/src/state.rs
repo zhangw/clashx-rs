@@ -1,3 +1,12 @@
+//! Loading and saving the on-disk subscription list.
+//!
+//! The state file is `~/.config/clashx-rs/subscriptions.yaml`. Writes go
+//! through a sibling `.yaml.tmp` file that is renamed into place, and on Unix
+//! the file is restricted to `0600` because subscription URLs may embed tokens.
+//! A missing file is not an error: it loads as an empty configuration. Older
+//! files that omit `interval`, `last_updated`, or `enabled` keep their
+//! documented defaults.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -11,10 +20,25 @@ pub fn subscriptions_path() -> PathBuf {
 }
 
 /// Load subscriptions from disk. Returns an empty config if the file doesn't exist.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read, or when its
+/// contents are not valid YAML for [`SubscriptionConfig`].
 pub fn load_subscriptions() -> Result<SubscriptionConfig> {
     load_subscriptions_from(&subscriptions_path())
 }
 
+/// Load subscriptions from an explicit path.
+///
+/// A missing file yields [`SubscriptionConfig::default`]. On Unix a warning is
+/// logged when the file is readable by group or others, since it may contain
+/// subscription tokens.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read, or when its
+/// contents are not valid YAML for [`SubscriptionConfig`].
 pub fn load_subscriptions_from(path: &Path) -> Result<SubscriptionConfig> {
     #[cfg(unix)]
     {
@@ -47,10 +71,26 @@ pub fn load_subscriptions_from(path: &Path) -> Result<SubscriptionConfig> {
 }
 
 /// Save subscriptions to disk atomically (.tmp + rename).
+///
+/// # Errors
+///
+/// Returns an error when the parent directory cannot be created, the config
+/// cannot be serialized, the temp file cannot be written, the rename fails, or
+/// the final permissions cannot be set.
 pub fn save_subscriptions(config: &SubscriptionConfig) -> Result<()> {
     save_subscriptions_to(&subscriptions_path(), config)
 }
 
+/// Save subscriptions to an explicit path, atomically.
+///
+/// The parent directory is created if needed; on Unix the resulting file is
+/// restricted to `0600`.
+///
+/// # Errors
+///
+/// Returns an error when the parent directory cannot be created, the config
+/// cannot be serialized, the temp file cannot be written, the rename fails, or
+/// the final permissions cannot be set.
 pub fn save_subscriptions_to(path: &Path, config: &SubscriptionConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
