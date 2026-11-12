@@ -39,6 +39,7 @@ impl TargetAddr {
     ///
     /// Domains are returned verbatim (no case folding) and IP literals use
     /// their canonical formatting.
+    #[must_use]
     pub fn host_string(&self) -> String {
         match self {
             TargetAddr::Domain(d, _) => d.clone(),
@@ -47,15 +48,16 @@ impl TargetAddr {
     }
 
     /// The target port.
+    #[must_use]
     pub fn port(&self) -> u16 {
         match self {
-            TargetAddr::Domain(_, p) => *p,
-            TargetAddr::Ip(_, p) => *p,
+            TargetAddr::Domain(_, p) | TargetAddr::Ip(_, p) => *p,
         }
     }
 }
 
 /// The result of an inbound protocol handshake.
+#[derive(Debug)]
 pub struct InboundResult {
     /// Where the client wants to connect.
     pub target: TargetAddr,
@@ -129,6 +131,13 @@ pub async fn detect_and_handle(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use std::time::Duration;
 
     use tokio::net::TcpListener;
@@ -146,7 +155,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         // Connect but never write anything.
-        let _silent_client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _silent_client = TcpStream::connect(addr).await.unwrap();
 
         let (server_side, peer_addr) = listener.accept().await.unwrap();
 

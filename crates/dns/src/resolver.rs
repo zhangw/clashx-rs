@@ -35,12 +35,9 @@ impl Hosts {
         let mut exact = HashMap::new();
         let mut wildcard = Vec::new();
         for (key, value) in map {
-            let ip = match value.trim().parse::<IpAddr>() {
-                Ok(ip) => ip,
-                Err(_) => {
-                    tracing::warn!(key = %key, value = %value, "hosts value is not an IP literal; skipping entry");
-                    continue;
-                }
+            let Ok(ip) = value.trim().parse::<IpAddr>() else {
+                tracing::warn!(key = %key, value = %value, "hosts value is not an IP literal; skipping entry");
+                continue;
             };
             let key = key.to_ascii_lowercase();
             if let Some(suffix) = key.strip_prefix("*.") {
@@ -87,6 +84,19 @@ enum ResolverMode {
     },
 }
 
+/// Clears the singleflight in-flight slot when the leader finishes, returns
+/// early, or is cancelled, so waiters can proceed.
+struct LeaderGuard<'a> {
+    cache: &'a DnsCache,
+    host: &'a str,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        self.cache.complete_inflight(self.host);
+    }
+}
+
 /// The daemon-facing DNS resolver. One instance resolves target hostnames
 /// (rules + DIRECT), a second instance resolves proxy server addresses via
 /// `proxy-server-nameserver`.
@@ -95,12 +105,25 @@ pub struct Resolver {
     cache: DnsCache,
 }
 
+impl std::fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mode = match &self.mode {
+            ResolverMode::System => "system",
+            ResolverMode::Custom { .. } => "custom",
+        };
+        f.debug_struct("Resolver")
+            .field("mode", &mode)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Resolver {
     /// Create a resolver that delegates every lookup to the system resolver.
     ///
     /// This is the mode used when `dns.enable` is `false` or no `dns:` block
     /// is configured. Hosts mappings do not apply, and results are cached with
     /// `SYSTEM_RESOLVE_TTL_SECS`.
+    #[must_use]
     pub fn system() -> Self {
         Self {
             mode: ResolverMode::System,
@@ -223,15 +246,6 @@ impl Resolver {
 
         // We're the leader. Ensure the in-flight slot is cleared even on
         // panic/early-return so waiters can proceed.
-        struct LeaderGuard<'a> {
-            cache: &'a DnsCache,
-            host: &'a str,
-        }
-        impl Drop for LeaderGuard<'_> {
-            fn drop(&mut self) {
-                self.cache.complete_inflight(self.host);
-            }
-        }
         let _leader = LeaderGuard {
             cache: &self.cache,
             host,
@@ -275,7 +289,7 @@ async fn race_group(
 
     let window = group
         .iter()
-        .map(|u| u.participant_timeout())
+        .map(Upstream::participant_timeout)
         .max()
         .ok_or_else(|| anyhow::anyhow!("nameserver group is empty"))?
         + Duration::from_millis(100);
@@ -381,6 +395,13 @@ fn build_group(entries: &[String]) -> Vec<Upstream> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
     use crate::bootstrap::spawn_mock_dns_server;
     use std::sync::atomic::Ordering;

@@ -9,3 +9,6 @@ reqwest.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+
+[lints]
+workspace = true

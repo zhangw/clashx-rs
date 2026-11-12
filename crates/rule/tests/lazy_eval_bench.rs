@@ -7,6 +7,13 @@
 //! magnitude regression (e.g., an infinite loop reappearing), not to gate
 //! microbenchmark noise.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unchecked_time_subtraction
+)]
+
 use std::net::IpAddr;
 use std::time::Instant;
 
@@ -81,7 +88,7 @@ fn lazy_eval_once(
 }
 
 fn small_engine(rules: &[&str]) -> RuleEngine {
-    let raw: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
+    let raw: Vec<String> = rules.iter().map(ToString::to_string).collect();
     RuleEngine::new(&raw, None)
 }
 
@@ -157,8 +164,8 @@ fn lazy_eval_terminates_on_missing_process_big() {
 
 #[test]
 fn lazy_eval_bench_domain_match_hot_path() {
-    let engine = RuleEngine::new(&big_ruleset(), None);
     const ITERS: usize = 10_000;
+    let engine = RuleEngine::new(&big_ruleset(), None);
 
     let mut total_inner_iters = 0usize;
     let start = Instant::now();
@@ -182,9 +189,9 @@ fn lazy_eval_bench_domain_match_hot_path() {
 
 #[test]
 fn lazy_eval_bench_dns_fail_fallthrough() {
+    const ITERS: usize = 1_000;
     // Formerly an infinite loop; now one walk with attempted flags set.
     let engine = RuleEngine::new(&big_ruleset(), None);
-    const ITERS: usize = 1_000;
 
     let start = Instant::now();
     for _ in 0..ITERS {

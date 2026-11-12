@@ -37,7 +37,7 @@ fn active_services() -> Result<Vec<String>> {
         .lines()
         .skip(1) // skip the header line
         .filter(|line| !line.starts_with('*')) // skip disabled services
-        .map(|line| line.to_string())
+        .map(ToString::to_string)
         .collect();
 
     Ok(services)
@@ -212,7 +212,7 @@ pub fn enable(port: u16, bypass: &[String], snapshot_path: &Path) -> Result<()> 
     let bypass_list: Vec<&str> = if bypass.is_empty() {
         DEFAULT_BYPASS.to_vec()
     } else {
-        bypass.iter().map(|s| s.as_str()).collect()
+        bypass.iter().map(String::as_str).collect()
     };
 
     // Record what was there first. A second enable must not overwrite the
@@ -338,7 +338,11 @@ pub fn status() -> Result<String> {
         let info = run_networksetup(&["-getwebproxy", service])
             .with_context(|| format!("failed to get web proxy status for {service}"))?;
 
-        result.push_str(&format!("[{service}]\n{info}\n"));
+        result.push('[');
+        result.push_str(service);
+        result.push_str("]\n");
+        result.push_str(&info);
+        result.push('\n');
     }
 
     Ok(result)
@@ -346,6 +350,13 @@ pub fn status() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
 
     /// Real `networksetup -getwebproxy` output.
@@ -380,7 +391,7 @@ mod tests {
     #[test]
     fn parses_empty_bypass_list() {
         let out = "There aren't any bypass domains set on this network service.\n";
-        assert!(parse_bypass(out).is_empty());
+        assert_eq!(parse_bypass(out), Vec::<String>::new());
     }
 
     #[test]

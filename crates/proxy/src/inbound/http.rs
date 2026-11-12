@@ -23,11 +23,11 @@ use super::TargetAddr;
 const MAX_LINE_LEN: usize = 8 * 1024;
 
 /// Max number of header lines in one HTTP request.
-/// Real browsers send 20-40; 128 gives headroom without permitting DoS.
+/// Real browsers send 20-40; 128 gives headroom without permitting `DoS`.
 const MAX_HEADERS: usize = 128;
 
-/// Read a single line, bailing if it exceeds MAX_LINE_LEN bytes.
-/// Guards against slowloris-style unbounded-line DoS attacks.
+/// Read a single line, bailing if it exceeds `MAX_LINE_LEN` bytes.
+/// Guards against slowloris-style unbounded-line `DoS` attacks.
 async fn read_bounded_line<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     out: &mut String,
@@ -348,6 +348,13 @@ async fn read_plain_request(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
     use std::net::IpAddr;
     use tokio::io::AsyncWriteExt;
@@ -391,7 +398,7 @@ mod tests {
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 80);
             }
-            other => panic!("expected Domain, got {other:?}"),
+            other @ TargetAddr::Ip(..) => panic!("expected Domain, got {other:?}"),
         }
 
         // The request line must have been rewritten to origin-form.
@@ -416,7 +423,7 @@ mod tests {
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 443);
             }
-            other => panic!("expected Domain, got {other:?}"),
+            other @ TargetAddr::Ip(..) => panic!("expected Domain, got {other:?}"),
         }
     }
 
@@ -439,7 +446,7 @@ mod tests {
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 443);
             }
-            other => panic!("expected Domain, got {other:?}"),
+            other @ TargetAddr::Ip(..) => panic!("expected Domain, got {other:?}"),
         }
 
         let data = initial_data.expect("expected initial_data for CONNECT with early data");
@@ -457,7 +464,7 @@ mod tests {
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 443);
             }
-            other => panic!("expected Domain, got {other:?}"),
+            other @ TargetAddr::Ip(..) => panic!("expected Domain, got {other:?}"),
         }
     }
 
@@ -473,7 +480,7 @@ mod tests {
                 assert_eq!(ip, "192.0.2.10".parse::<IpAddr>().unwrap());
                 assert_eq!(port, 9100);
             }
-            other => panic!("expected Ip, got {other:?}"),
+            other @ TargetAddr::Domain(..) => panic!("expected Ip, got {other:?}"),
         }
 
         assert!(
@@ -555,7 +562,7 @@ mod tests {
                 assert_eq!(ip, "192.0.2.10".parse::<IpAddr>().unwrap());
                 assert_eq!(port, 9100);
             }
-            other => panic!("expected the URI authority, got {other:?}"),
+            other @ TargetAddr::Domain(..) => panic!("expected the URI authority, got {other:?}"),
         }
 
         assert!(data.starts_with("GET /health HTTP/1.1\r\n"), "{data:?}");
@@ -601,7 +608,7 @@ mod tests {
                 assert_eq!(ip, "1.2.3.4".parse::<IpAddr>().unwrap());
                 assert_eq!(port, 80);
             }
-            other => panic!("expected Ip, got {other:?}"),
+            other @ TargetAddr::Domain(..) => panic!("expected Ip, got {other:?}"),
         }
     }
 }

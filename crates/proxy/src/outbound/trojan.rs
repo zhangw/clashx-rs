@@ -231,6 +231,13 @@ pub async fn connect(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use std::net::{IpAddr, Ipv4Addr};
 
     use sha2::{Digest, Sha224};
@@ -297,12 +304,12 @@ mod tests {
             .ok();
 
         // Each call must return the same static reference (pointer equality).
-        let a = tls_connector(false) as *const TlsConnector;
-        let b = tls_connector(false) as *const TlsConnector;
+        let a = std::ptr::from_ref(tls_connector(false));
+        let b = std::ptr::from_ref(tls_connector(false));
         assert_eq!(a, b, "normal-verify connector should be the same instance");
 
-        let c = tls_connector(true) as *const TlsConnector;
-        let d = tls_connector(true) as *const TlsConnector;
+        let c = std::ptr::from_ref(tls_connector(true));
+        let d = std::ptr::from_ref(tls_connector(true));
         assert_eq!(c, d, "skip-verify connector should be the same instance");
 
         // The two modes must produce distinct connectors.

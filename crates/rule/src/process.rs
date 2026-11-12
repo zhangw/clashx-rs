@@ -43,7 +43,7 @@ struct Snapshot {
     target_gen: u64,
 }
 
-/// Per-engine cache of port → process_name lookups. Owning this on
+/// Per-engine cache of `port → process_name` lookups. Owning this on
 /// `RuleEngine` (instead of process-globals) means each test or daemon
 /// instance has isolated state — no cross-test pollution.
 pub struct ProcessLookup {
@@ -60,6 +60,7 @@ impl ProcessLookup {
     /// Until [`ProcessLookup::set_targets`] is called, the first scan considers
     /// every process. [`crate::RuleEngine::new`] sets the targets derived from
     /// the configured PROCESS-NAME rules immediately after construction.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             snapshot: Mutex::new(None),
@@ -93,9 +94,10 @@ impl ProcessLookup {
 
     /// Look up the process name that owns the TCP connection from `source_addr`.
     ///
-    /// Uses a 2-second port→process table snapshot restricted to processes whose
-    /// names appear in any PROCESS-NAME rule. Cache hits are O(1) sync HashMap
-    /// lookups. Cache misses trigger a scan offloaded to a blocking thread.
+    /// Uses a 2-second `port→process` table snapshot restricted to processes
+    /// whose names appear in any PROCESS-NAME rule. Cache hits are O(1) sync
+    /// `HashMap` lookups. Cache misses trigger a scan offloaded to a blocking
+    /// thread.
     /// Concurrent misses coalesce — only one scan runs at a time.
     pub async fn lookup(self: &Arc<Self>, source_addr: SocketAddr) -> Option<String> {
         if let Some(hit) = self.fast_path_lookup(&source_addr) {
@@ -150,6 +152,10 @@ impl ProcessLookup {
     /// Returns `Some(Some(name))` for a hit, `Some(None)` for a known miss
     /// within the snapshot, and `None` when the snapshot is stale or absent
     /// (caller should trigger a rebuild).
+    #[expect(
+        clippy::option_option,
+        reason = "documented hit/miss/stale three-state lookup"
+    )]
     fn fast_path_lookup(&self, source_addr: &SocketAddr) -> Option<Option<String>> {
         let port = source_addr.port();
         let guard = self.snapshot.lock().ok()?;
@@ -177,7 +183,19 @@ impl Default for ProcessLookup {
     }
 }
 
+impl std::fmt::Debug for ProcessLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessLookup")
+            .field("target_gen", &self.target_gen.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "libproc socket union fields are read after checking soi_kind; SAFETY inline"
+)]
 fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
     use libproc::bsd_info::BSDInfo;
     use libproc::file_info::{pidfdinfo, ListFDs, ProcFDType};
@@ -186,18 +204,16 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
     use libproc::processes::{pids_by_type, ProcFilter};
 
     let mut map: HashMap<u16, String> = HashMap::new();
-    let pids = match pids_by_type(ProcFilter::All) {
-        Ok(p) => p,
-        Err(_) => return map,
+    let Ok(pids) = pids_by_type(ProcFilter::All) else {
+        return map;
     };
 
     for pid in pids {
         let pid = pid as i32;
 
         // Filter by process name first — skip fd walk for non-matches.
-        let proc_name = match name(pid) {
-            Ok(n) => n,
-            Err(_) => continue,
+        let Ok(proc_name) = name(pid) else {
+            continue;
         };
         if let Some(targets) = targets {
             if !targets.contains(&proc_name) {
@@ -209,9 +225,8 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
             Ok(i) => i,
             Err(_) => continue,
         };
-        let fds = match listpidinfo::<ListFDs>(pid, info.pbi_nfiles as usize) {
-            Ok(f) => f,
-            Err(_) => continue,
+        let Ok(fds) = listpidinfo::<ListFDs>(pid, info.pbi_nfiles as usize) else {
+            continue;
         };
 
         for fd in fds {
@@ -245,6 +260,10 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "libproc socket union fields are read after checking soi_kind; SAFETY inline"
+)]
 fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
     let mut map: HashMap<u16, String> = HashMap::new();
 
@@ -337,6 +356,13 @@ fn scan_tcp_sockets(_targets: Option<&HashSet<String>>) -> HashMap<u16, String> 
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
 
     #[tokio::test]

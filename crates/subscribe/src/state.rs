@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use crate::SubscriptionConfig;
 
 /// Path to the subscriptions.yaml file.
+#[must_use]
 pub fn subscriptions_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     home.join(".config/clashx-rs/subscriptions.yaml")
@@ -146,6 +147,13 @@ fn set_owner_only_permissions(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
     use crate::Subscription;
 
@@ -166,7 +174,7 @@ mod tests {
             name: "wgetcloud".into(),
             url: "https://example.com/sub".into(),
             output: "~/.config/clash/wgetcloud.yaml".into(),
-            interval: 864000,
+            interval: 864_000,
             last_updated: 1_700_000_000,
             enabled: false,
         });
@@ -175,7 +183,7 @@ mod tests {
         let loaded = load_subscriptions_from(&path).unwrap();
         assert_eq!(loaded.subscriptions.len(), 1);
         assert_eq!(loaded.subscriptions[0].name, "wgetcloud");
-        assert_eq!(loaded.subscriptions[0].interval, 864000);
+        assert_eq!(loaded.subscriptions[0].interval, 864_000);
         assert_eq!(loaded.subscriptions[0].last_updated, 1_700_000_000);
         assert!(!loaded.subscriptions[0].enabled);
     }
@@ -186,12 +194,12 @@ mod tests {
         let path = dir.path().join("subs.yaml");
         std::fs::write(
             &path,
-            r#"
+            r"
 subscriptions:
   - name: foo
     url: https://example.com/sub
     output: /tmp/foo.yaml
-"#,
+",
         )
         .unwrap();
         let loaded = load_subscriptions_from(&path).unwrap();

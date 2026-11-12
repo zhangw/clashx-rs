@@ -29,7 +29,13 @@ use tokio::sync::RwLock;
 use crate::control::{ControlRequest, ControlResponse};
 use crate::paths::{self, DEFAULT_MIXED_PORT};
 
-/// Build a MatchInput from a host string.
+/// Maximum proxy-group selection chain depth before the resolver gives up.
+const MAX_SELECTION_DEPTH: usize = 8;
+
+/// HTTP methods whose requests may be replayed after a first-byte timeout.
+const IDEMPOTENT_METHODS: [&[u8]; 5] = [b"GET ", b"HEAD ", b"OPTIONS ", b"PUT ", b"DELETE "];
+
+/// Build a `MatchInput` from a host string.
 /// If the string is a valid IP, set `ip` and leave `host` as None
 /// so that DOMAIN-SUFFIX rules don't try to match an IP string.
 fn match_input_from_host(host: &str) -> MatchInput<'_> {
@@ -145,10 +151,7 @@ impl DaemonState {
         let mut parsed = Vec::with_capacity(raw.len());
         for entry in raw {
             let (group, proxy) = entry.split_once('=').ok_or_else(|| {
-                anyhow::anyhow!(
-                    "invalid --select format: expected GROUP=PROXY, got {:?}",
-                    entry
-                )
+                anyhow::anyhow!("invalid --select format: expected GROUP=PROXY, got {entry:?}")
             })?;
             self.validate_and_set_selection(group, proxy)
                 .map_err(|e| anyhow::anyhow!("--select: {e}"))?;
@@ -205,7 +208,6 @@ impl DaemonState {
 
         // Stack-allocated visited set: chain depth is 1-3 in practice, and
         // this runs under the state read lock on every connection.
-        const MAX_SELECTION_DEPTH: usize = 8;
         let mut visited: [&'a str; MAX_SELECTION_DEPTH] = [""; MAX_SELECTION_DEPTH];
         let mut depth = 0usize;
         let mut cur: &'a str = start;
@@ -234,7 +236,7 @@ impl DaemonState {
         }
     }
 
-    /// Resolve routing for a given input. Returns (group_name, proxy_name, matched_rule).
+    /// Resolve routing for a given input. Returns (`group_name`, `proxy_name`, `matched_rule`).
     fn resolve_routing_with_group<'a>(
         &'a self,
         input: &MatchInput<'_>,
@@ -258,27 +260,22 @@ impl DaemonState {
         }
     }
 
-    /// Build a list of (proxy_name, Proxy) candidates for retry/failover.
+    /// Build a list of (`proxy_name`, Proxy) candidates for retry/failover.
     /// Selected proxy first, remaining in config order. Cooled-down proxies filtered unless all are.
     fn build_candidate_list(
         &self,
         group_name: &str,
         cooldown: &crate::retry::CooldownTracker,
     ) -> Vec<(String, Proxy)> {
-        let group = match self
+        let Some(group) = self
             .config
             .proxy_groups
             .iter()
             .find(|g| g.name == group_name)
-        {
-            Some(g) => g,
-            None => return Vec::new(),
+        else {
+            return Vec::new();
         };
-        let selected = self
-            .selections
-            .get(group_name)
-            .map(|s| s.as_str())
-            .unwrap_or("");
+        let selected = self.selections.get(group_name).map_or("", String::as_str);
 
         let mut ordered: Vec<&str> = Vec::with_capacity(group.proxies.len());
         if group.proxies.iter().any(|p| p == selected) {
@@ -322,7 +319,7 @@ impl DaemonState {
             .collect()
     }
 
-    /// Lightweight probe schedule: (node_name, health-check) pairs for every
+    /// Lightweight probe schedule: (`node_name`, health-check) pairs for every
     /// health-check-enabled group member, *without* cloning Proxy configs.
     /// The scheduler filters due nodes from this cheap snapshot and fetches
     /// Proxy configs on demand via [`Self::proxy_named`], avoiding a full
@@ -360,7 +357,7 @@ impl DaemonState {
         self.config
             .proxy_groups
             .iter()
-            .map(|g| g.effective_health_check())
+            .map(clashx_rs_config::types::ProxyGroup::effective_health_check)
             .filter(|hc| hc.enable)
             .map(|hc| hc.interval)
             .min()
@@ -392,6 +389,10 @@ pub fn start_foreground(
     ))
 }
 
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "signature reserved for background mode"
+)]
 pub fn start_background(
     _config_path: &Path,
     _selections: &[String],
@@ -501,6 +502,10 @@ async fn wait_for_shutdown_signal() -> Result<&'static str> {
 // Core daemon loop
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "startup/shutdown ordering invariant is only visible as one sequence"
+)]
 async fn run_daemon(
     config_path: &Path,
     selections: &[String],
@@ -524,8 +529,7 @@ async fn run_daemon(
         config
             .bind_address
             .as_deref()
-            .map(|b| if b == "*" { "0.0.0.0" } else { b })
-            .unwrap_or("0.0.0.0")
+            .map_or("0.0.0.0", |b| if b == "*" { "0.0.0.0" } else { b })
             .to_string()
     } else {
         "127.0.0.1".to_string()
@@ -610,7 +614,7 @@ async fn run_daemon(
         let dl_port = port;
         tokio::spawn(async move {
             // Wait for proxy to fully start before downloading through it.
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
             let proxy_url = format!("socks5://127.0.0.1:{dl_port}");
             let backoff = [10u64, 30, 90];
@@ -652,7 +656,7 @@ async fn run_daemon(
                             retry_in_secs = delay,
                             "mmdb download failed"
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                        tokio::time::sleep(Duration::from_secs(*delay)).await;
                     }
                 }
             }
@@ -751,7 +755,7 @@ async fn run_daemon(
     tokio::spawn(async move {
         let mut previous = crate::resources::counters();
         loop {
-            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            tokio::time::sleep(Duration::from_hours(1)).await;
             let current = crate::resources::counters();
             let delta = current.since(&previous);
             let occupancy = crate::resources::occupancy();
@@ -807,6 +811,10 @@ async fn run_daemon(
 // Connection handler
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "selection, failover, and first-byte phases share early-return state"
+)]
 async fn handle_connection(
     stream: TcpStream,
     source_addr: std::net::SocketAddr,
@@ -824,7 +832,7 @@ async fn handle_connection(
     let target_host = target.host_string();
     let target_port = target.port();
 
-    let parsed_ip: Option<std::net::IpAddr> = target_host.parse().ok();
+    let parsed_ip: Option<IpAddr> = target_host.parse().ok();
 
     let (resolver, proxy_resolver, rule_engine, mode) = {
         let st = state.read().await;
@@ -918,17 +926,17 @@ async fn handle_connection(
         let chain_start: Option<&str> = match mode {
             Mode::Direct => None,
             Mode::Global => st.config.proxy_groups.first().map(|g| g.name.as_str()),
-            Mode::Rule => matched_rule.map(|r| r.target()),
+            Mode::Rule => matched_rule.map(clashx_rs_config::rule::RuleEntry::target),
         };
-        let (grp, resolved): (Option<String>, String) = match chain_start {
+        let (grp, picked): (Option<String>, String) = match chain_start {
             Some(target) => {
-                let (gg, p) = st.resolve_selection_chain(target);
-                (gg.map(|s| s.to_string()), p.to_string())
+                let (selected_group, leaf) = st.resolve_selection_chain(target);
+                (selected_group.map(ToString::to_string), leaf.to_string())
             }
             None => (None, "DIRECT".to_string()),
         };
         group_name = grp;
-        proxy_name = resolved;
+        proxy_name = picked;
 
         // Per-connection: DEBUG, not INFO. The production log grew to hundreds
         // of MB per month from this line. Include peer so a routing decision
@@ -1214,8 +1222,7 @@ async fn handle_connection(
             let group_label = group_name.as_deref().unwrap_or(&proxy_name);
             let error_text = last_err
                 .as_ref()
-                .map(|error| format!("{error:#}"))
-                .unwrap_or_else(|| "unknown".to_string());
+                .map_or_else(|| "unknown".to_string(), |error| format!("{error:#}"));
             tracing::error!(
                 target = %target_host,
                 group = %group_label,
@@ -1242,7 +1249,7 @@ async fn handle_connection(
 /// back to tokio's getaddrinfo — never fail the connection over DNS.
 pub(crate) async fn connect_outbound(
     proxy: &Proxy,
-    target: &clashx_rs_proxy::inbound::TargetAddr,
+    target: &inbound::TargetAddr,
     proxy_resolver: &clashx_rs_dns::Resolver,
 ) -> Result<OutboundStream> {
     match proxy {
@@ -1281,10 +1288,7 @@ pub(crate) async fn connect_outbound(
 /// None — the connector then falls back to the system resolver rather than
 /// failing the connection over DNS. IP literals short-circuit inside
 /// `Resolver::resolve`.
-async fn resolve_server(
-    resolver: &clashx_rs_dns::Resolver,
-    server: &str,
-) -> Option<std::net::IpAddr> {
+async fn resolve_server(resolver: &clashx_rs_dns::Resolver, server: &str) -> Option<IpAddr> {
     match resolver.resolve(server).await {
         Ok(ip) => Some(ip),
         Err(e) => {
@@ -1385,7 +1389,7 @@ enum FirstByteError {
 /// node duplicates them at the origin, so this is only allowed when the
 /// bytes cannot produce a duplicated side effect:
 ///
-/// - TLS handshake (ClientHello, record type 0x16, version 0x03xx): replaying
+/// - TLS handshake (`ClientHello`, record type 0x16, version 0x03xx): replaying
 ///   starts a fresh handshake on a new TCP connection; no application data is
 ///   duplicated. This covers HTTPS over CONNECT/SOCKS5.
 /// - Plain HTTP via the HTTP-proxy path: an RFC 7231 idempotent method *and*
@@ -1405,8 +1409,7 @@ fn replay_is_safe(replay: &[u8], truncated: bool) -> bool {
     if replay.len() >= 3 && replay[0] == 0x16 && replay[1] == 0x03 {
         return true;
     }
-    const IDEMPOTENT: [&[u8]; 5] = [b"GET ", b"HEAD ", b"OPTIONS ", b"PUT ", b"DELETE "];
-    if !IDEMPOTENT.iter().any(|m| replay.starts_with(m)) {
+    if !IDEMPOTENT_METHODS.iter().any(|m| replay.starts_with(m)) {
         return false;
     }
     match replay.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -1484,8 +1487,7 @@ where
             }
             res = inbound.read(&mut in_buf) => {
                 match res {
-                    Err(_) => return Err(FirstByteError::ClientClosed),
-                    Ok(0) => return Err(FirstByteError::ClientClosed),
+                    Err(_) | Ok(0) => return Err(FirstByteError::ClientClosed),
                     Ok(n) => {
                         replay.extend_from_slice(&in_buf[..n]);
                         // A node that accepts the tunnel but stops reading must
@@ -1500,7 +1502,7 @@ where
                     }
                 }
             }
-            _ = tokio::time::sleep(idle), if !idle.is_zero() => {
+            () = tokio::time::sleep(idle), if !idle.is_zero() => {
                 return Err(FirstByteError::Idle);
             }
         }
@@ -1762,7 +1764,7 @@ async fn control_stop(state: &Arc<RwLock<DaemonState>>) -> ControlResponse {
         )
     };
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         if sysproxy_enabled {
             let sysproxy = clashx_rs_sysproxy::SysProxy::new(port, paths::sysproxy_snapshot_path());
             if let Err(e) = sysproxy.disable() {
@@ -1795,7 +1797,7 @@ async fn control_switch(
 
 async fn control_proxies(state: &Arc<RwLock<DaemonState>>) -> ControlResponse {
     let st = state.read().await;
-    let names: Vec<&str> = st.proxies.keys().map(|s| s.as_str()).collect();
+    let names: Vec<&str> = st.proxies.keys().map(String::as_str).collect();
     ControlResponse::success(json!(names))
 }
 
@@ -1862,19 +1864,16 @@ async fn control_dns_flush(
     let st = state.read().await;
     // Flush both resolvers (target + proxy-server). The bootstrap cache is
     // intentionally not exposed — a reload clears it.
-    match host {
-        Some(host) => {
-            let hit_target = st.resolver.invalidate(&host).await;
-            let hit_proxy = st.proxy_resolver.invalidate(&host).await;
-            ControlResponse::success(json!({
-                "host": host,
-                "hit": hit_target || hit_proxy,
-            }))
-        }
-        None => {
-            let flushed = st.resolver.clear().await + st.proxy_resolver.clear().await;
-            ControlResponse::success(json!({ "flushed": flushed }))
-        }
+    if let Some(host) = host {
+        let hit_target = st.resolver.invalidate(&host).await;
+        let hit_proxy = st.proxy_resolver.invalidate(&host).await;
+        ControlResponse::success(json!({
+            "host": host,
+            "hit": hit_target || hit_proxy,
+        }))
+    } else {
+        let flushed = st.resolver.clear().await + st.proxy_resolver.clear().await;
+        ControlResponse::success(json!({ "flushed": flushed }))
     }
 }
 
@@ -1893,20 +1892,20 @@ async fn subscription_auto_update(state: Arc<RwLock<DaemonState>>) {
     loop {
         let config = run_subscription_cycle(&state).await;
         let sleep_secs = compute_sleep_secs(config.as_ref());
-        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
     }
 }
 
-/// Load config, build new DaemonState, reapply overrides — all outside any
+/// Load config, build new `DaemonState`, reapply overrides — all outside any
 /// lock. Swap under a brief write lock so in-flight connections aren't blocked
 /// by disk I/O or YAML parsing. On failure, live state is untouched.
 ///
 /// The cooldown tracker is intentionally *not* carried over: the fresh state
 /// gets a fresh tracker, so nodes removed or renamed by a subscription update
 /// don't leave stale sideline/failure entries behind. Failure memory rebuilds
-/// within COOLDOWN_FAILURE_THRESHOLD connections, and the probe supervisor
+/// within `COOLDOWN_FAILURE_THRESHOLD` connections, and the probe supervisor
 /// re-reads the new tracker on its next tick.
-async fn reload_state(state: &Arc<RwLock<DaemonState>>) -> anyhow::Result<()> {
+async fn reload_state(state: &Arc<RwLock<DaemonState>>) -> Result<()> {
     let (path, mmdb_path, overrides) = {
         let st = state.read().await;
         (
@@ -1996,7 +1995,7 @@ async fn run_subscription_cycle(
 }
 
 /// Sleep duration for the next subscription check: min remaining time across
-/// subscriptions, clamped to [MIN_CHECK_SECS, MAX_CHECK_SECS].
+/// subscriptions, clamped to [`MIN_CHECK_SECS`, `MAX_CHECK_SECS`].
 fn compute_sleep_secs(config: Option<&clashx_rs_subscribe::SubscriptionConfig>) -> u64 {
     let Some(config) = config else {
         return IDLE_CHECK_SECS;
@@ -2008,8 +2007,7 @@ fn compute_sleep_secs(config: Option<&clashx_rs_subscribe::SubscriptionConfig>) 
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     // `None` => no enabled subscriptions to track; idle until one is added/re-enabled.
     config
@@ -2024,12 +2022,19 @@ fn compute_sleep_secs(config: Option<&clashx_rs_subscribe::SubscriptionConfig>) 
             }
         })
         .min()
-        .map(|remaining| remaining.clamp(MIN_CHECK_SECS, MAX_CHECK_SECS))
-        .unwrap_or(IDLE_CHECK_SECS)
+        .map_or(IDLE_CHECK_SECS, |remaining| {
+            remaining.clamp(MIN_CHECK_SECS, MAX_CHECK_SECS)
+        })
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
 
     #[test]
     fn bypassed_rule_detection() {
@@ -2158,11 +2163,11 @@ mod tests {
             PathBuf::from("/tmp/nonexistent.mmdb"),
         );
         assert_eq!(
-            state.selections.get("🚀 节点选择").map(|s| s.as_str()),
+            state.selections.get("🚀 节点选择").map(String::as_str),
             Some("🇭🇰 香港 01")
         );
         assert_eq!(
-            state.selections.get("@hk").map(|s| s.as_str()),
+            state.selections.get("@hk").map(String::as_str),
             Some("🇭🇰 香港 01")
         );
     }
@@ -2177,12 +2182,12 @@ mod tests {
         let overrides = vec!["🚀 节点选择=🇸🇬 新加坡 01".to_string()];
         state.parse_and_apply_overrides(&overrides).unwrap();
         assert_eq!(
-            state.selections.get("🚀 节点选择").map(|s| s.as_str()),
+            state.selections.get("🚀 节点选择").map(String::as_str),
             Some("🇸🇬 新加坡 01")
         );
         // Other groups unchanged
         assert_eq!(
-            state.selections.get("@hk").map(|s| s.as_str()),
+            state.selections.get("@hk").map(String::as_str),
             Some("🇭🇰 香港 01")
         );
     }
@@ -2200,11 +2205,11 @@ mod tests {
         ];
         state.parse_and_apply_overrides(&overrides).unwrap();
         assert_eq!(
-            state.selections.get("🚀 节点选择").map(|s| s.as_str()),
+            state.selections.get("🚀 节点选择").map(String::as_str),
             Some("🇸🇬 新加坡 02")
         );
         assert_eq!(
-            state.selections.get("@hk").map(|s| s.as_str()),
+            state.selections.get("@hk").map(String::as_str),
             Some("🇭🇰 香港 02")
         );
     }
@@ -2518,7 +2523,7 @@ mod tests {
         assert!(resp.ok);
         let data = resp.data.unwrap();
         let arr = data.as_array().unwrap();
-        assert!(arr.is_empty());
+        assert!(arr.is_empty(), "expected no results, got {arr:?}");
     }
 
     #[tokio::test]
@@ -2533,7 +2538,7 @@ mod tests {
         let data = resp.data.unwrap();
         let arr = data.as_array().unwrap();
         // test_config has 4 proxies, all targeting 127.0.0.1 (should succeed fast)
-        assert!(!arr.is_empty());
+        assert!(!arr.is_empty(), "expected results, got {arr:?}");
         for entry in arr {
             // All local connections should have a latency or an error
             let obj = entry.as_object().unwrap();
@@ -2579,7 +2584,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(prefix, b"SERVER-HELLO");
-        assert!(replay.is_empty());
+        assert!(replay.is_empty(), "unexpected replay bytes: {replay:?}");
         assert!(!truncated);
     }
 

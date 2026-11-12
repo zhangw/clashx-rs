@@ -23,7 +23,7 @@ use crate::daemon::{connect_outbound, DaemonState};
 use crate::retry::CooldownTracker;
 
 /// Budget for one probe attempt (outbound connect + HTTP exchange). Must
-/// exceed PROXY_CONNECT_TIMEOUT (5s) so a slow-but-alive node still has time
+/// exceed `PROXY_CONNECT_TIMEOUT` (5s) so a slow-but-alive node still has time
 /// for the HTTP exchange after a slow handshake.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Delay before the single confirmation re-probe after a failure, so one
@@ -207,9 +207,8 @@ fn probe_due(
 fn jittered_interval(secs: u64) -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let frac = nanos as f64 / 1_000_000_000.0; // [0, 1)
+        .map_or(0, |d| d.subsec_nanos());
+    let frac = f64::from(nanos) / 1_000_000_000.0; // [0, 1)
     let scale = 0.9 + 0.2 * frac; // [0.9, 1.1)
     Duration::from_secs_f64(secs as f64 * scale)
 }
@@ -274,6 +273,10 @@ async fn server_is_probeable(server: &str) -> bool {
 /// groups, then sleep until the next scheduler tick. Reads a fresh config
 /// snapshot each round, so config reloads take effect without task lifecycle
 /// management.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one supervisor round keeps snapshot, probe results, and cooldown updates ordered"
+)]
 pub async fn run(state: Arc<RwLock<DaemonState>>) {
     let mut last_probe: std::collections::HashMap<String, Instant> =
         std::collections::HashMap::new();
@@ -361,20 +364,19 @@ pub async fn run(state: Arc<RwLock<DaemonState>>) {
 
             // Skip intranet relays (servers with only non-public addresses).
             if let Some(server) = proxy_server(&proxy) {
-                let probeable = match server_probeable.get(server) {
-                    Some(&v) => v,
-                    None => {
-                        let v = server_is_probeable(server).await;
-                        if !v {
-                            tracing::info!(
-                                proxy = %name,
-                                server = %server,
-                                "server is not publicly routable; probing disabled for this node"
-                            );
-                        }
-                        server_probeable.insert(server.to_string(), v);
-                        v
+                let probeable = if let Some(&v) = server_probeable.get(server) {
+                    v
+                } else {
+                    let v = server_is_probeable(server).await;
+                    if !v {
+                        tracing::info!(
+                            proxy = %name,
+                            server = %server,
+                            "server is not publicly routable; probing disabled for this node"
+                        );
                     }
+                    server_probeable.insert(server.to_string(), v);
+                    v
                 };
                 if !probeable {
                     continue;
@@ -435,6 +437,13 @@ pub async fn run(state: Arc<RwLock<DaemonState>>) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
 
     #[test]

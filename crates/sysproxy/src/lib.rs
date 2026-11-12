@@ -33,6 +33,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 /// Facade over the platform system-proxy implementation.
+#[derive(Debug)]
 pub struct SysProxy {
     port: u16,
     /// Where the pre-enable settings are recorded so `disable` can restore
@@ -45,6 +46,7 @@ impl SysProxy {
     /// at `snapshot_path`.
     ///
     /// Linux never reads `snapshot_path`; it only prints environment lines.
+    #[must_use]
     pub fn new(port: u16, snapshot_path: PathBuf) -> Self {
         SysProxy {
             port,

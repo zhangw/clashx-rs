@@ -34,7 +34,7 @@ use crate::process::ProcessLookup;
 /// The `*_attempted` flags are what keep the lazy evaluator terminating: a rule
 /// whose data was already requested and not found is skipped rather than
 /// requested again.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct MatchInput<'a> {
     /// Hostname to match, if the connection has one.
     ///
@@ -75,6 +75,18 @@ pub struct RuleEngine {
     process_lookup: Arc<ProcessLookup>,
 }
 
+impl std::fmt::Debug for RuleEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuleEngine")
+            .field("rules", &self.rules.len())
+            .field("geoip_db", &self.geoip_db.as_ref().map(|_| "loaded"))
+            .field("has_ip_rules", &self.has_ip_rules)
+            .field("has_process_rules", &self.has_process_rules)
+            .field("process_lookup", &self.process_lookup)
+            .finish()
+    }
+}
+
 impl RuleEngine {
     /// Parse `raw_rules` into an engine, preserving config order.
     ///
@@ -86,13 +98,13 @@ impl RuleEngine {
     pub fn new(raw_rules: &[String], geoip_db: Option<Arc<GeoIpDb>>) -> Self {
         let rules: Vec<RuleEntry> = raw_rules
             .iter()
-            .filter_map(|s| match RuleEntry::parse(s) {
-                Some(rule) => Some(rule),
-                None => {
+            .filter_map(|s| {
+                let Some(rule) = RuleEntry::parse(s) else {
                     let rule_type = s.split(',').next().unwrap_or("unknown");
                     tracing::warn!(rule_type = %rule_type, raw = %s, "unrecognized rule type, skipping");
-                    None
-                }
+                    return None;
+                };
+                Some(rule)
             })
             .collect();
 
@@ -138,16 +150,19 @@ impl RuleEngine {
 
     /// Handle to the per-engine process-name lookup cache. Daemon uses this
     /// to resolve process names lazily during rule evaluation.
+    #[must_use]
     pub fn process_lookup(&self) -> &Arc<ProcessLookup> {
         &self.process_lookup
     }
 
     /// Whether the config has any GEOIP or IP-CIDR rules that need a resolved IP.
+    #[must_use]
     pub fn needs_resolved_ip(&self) -> bool {
         self.has_ip_rules
     }
 
-    /// Whether a GeoIP database is currently loaded.
+    /// Whether a `GeoIP` database is currently loaded.
+    #[must_use]
     pub fn has_geoip_db(&self) -> bool {
         self.geoip_db.is_some()
     }
@@ -158,11 +173,13 @@ impl RuleEngine {
     /// absent from `input` cannot match. Use [`RuleEngine::evaluate_from`] when
     /// a PROCESS-NAME or IP rule may require a lookup. The returned target
     /// borrows from the engine.
+    #[must_use]
     pub fn evaluate<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a str> {
-        self.find_match(input).map(|r| r.target())
+        self.find_match(input).map(RuleEntry::target)
     }
 
     /// Evaluate rules top-to-bottom, returning the target and matched rule description.
+    #[must_use]
     pub fn evaluate_verbose<'a>(&'a self, input: &MatchInput<'_>) -> Option<(&'a str, String)> {
         self.find_match(input)
             .map(|r| (r.target(), r.description()))
@@ -176,8 +193,9 @@ impl RuleEngine {
     ///
     /// Rules that cheaply match on existing input (host / already-known IP /
     /// already-known process) still run and can short-circuit.
+    #[must_use]
     pub fn evaluate_from<'a>(&'a self, input: &MatchInput<'_>, start: usize) -> EvalStep<'a> {
-        let host_lower = self.host_lower(input);
+        let host_lower = host_lower(input);
         let host_lower = host_lower.as_deref().or(input.host);
 
         // Engine-wide pre-checks fold away per-rule work when the config
@@ -223,24 +241,25 @@ impl RuleEngine {
     }
 
     fn find_match<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a RuleEntry> {
-        let host_lower = self.host_lower(input);
+        let host_lower = host_lower(input);
         let host_lower = host_lower.as_deref().or(input.host);
         self.rules
             .iter()
             .find(|rule| matches_rule(rule, input, host_lower, self.geoip_db.as_deref()))
     }
+}
 
-    /// Lowercase the host only if it contains uppercase ASCII; otherwise
-    /// the caller reuses the borrowed original.
-    fn host_lower(&self, input: &MatchInput<'_>) -> Option<String> {
-        input
-            .host
-            .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
-            .map(|h| h.to_ascii_lowercase())
-    }
+/// Lowercase the host only if it contains uppercase ASCII; otherwise the
+/// caller reuses the borrowed original.
+fn host_lower(input: &MatchInput<'_>) -> Option<String> {
+    input
+        .host
+        .filter(|h| h.bytes().any(|b| b.is_ascii_uppercase()))
+        .map(str::to_ascii_lowercase)
 }
 
 /// Outcome of the first evaluation pass.
+#[derive(Debug)]
 pub enum EvalStep<'a> {
     /// A rule matched — no further lookups needed.
     Matched(&'a RuleEntry),
@@ -302,14 +321,14 @@ fn matches_rule(
             let Some(db) = geoip_db else { return false };
             let Some(ip) = input.ip else { return false };
             db.lookup_country(ip)
-                .map(|c| c.eq_ignore_ascii_case(country))
-                .unwrap_or(false)
+                .is_some_and(|c| c.eq_ignore_ascii_case(country))
         }
         RuleEntry::Match { .. } => true,
     }
 }
 
 /// Whether `addr` falls inside `network/prefix_len`.
+#[must_use]
 pub fn ip_in_cidr(addr: IpAddr, network: IpAddr, prefix_len: u8) -> bool {
     match (addr, network) {
         (IpAddr::V4(a), IpAddr::V4(n)) => ipv4_in_cidr(a, n, prefix_len),
@@ -344,15 +363,22 @@ fn ipv6_in_cidr(addr: Ipv6Addr, network: Ipv6Addr, prefix_len: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
 
     fn make_engine(rules: &[&str]) -> RuleEngine {
-        let raw: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
+        let raw: Vec<String> = rules.iter().map(ToString::to_string).collect();
         RuleEngine::new(&raw, None)
     }
 
     fn make_engine_with_geoip(rules: &[&str], db: Arc<GeoIpDb>) -> RuleEngine {
-        let raw: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
+        let raw: Vec<String> = rules.iter().map(ToString::to_string).collect();
         RuleEngine::new(&raw, Some(db))
     }
 

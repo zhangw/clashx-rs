@@ -103,6 +103,7 @@ pub trait RelayPromotion {
 }
 
 /// No-op promotion for callers that do not need lifetime classification.
+#[derive(Debug)]
 pub struct NoPromotion;
 
 impl RelayPromotion for NoPromotion {
@@ -140,7 +141,7 @@ impl Activity {
     }
 }
 
-/// AsyncRead wrapper that refreshes the activity clock on every non-empty read.
+/// `AsyncRead` wrapper that refreshes the activity clock on every non-empty read.
 struct ActivityReader<R> {
     inner: R,
     activity: Arc<Activity>,
@@ -170,7 +171,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ActivityReader<R> {
 }
 
 /// Peer-driven closes are normal termination for a proxy: clients reset
-/// HTTP/2 connections, and TLS peers often close without close_notify.
+/// HTTP/2 connections, and TLS peers often close without `close_notify`.
 fn is_peer_closed(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -210,6 +211,10 @@ fn tick_interval(policy: &RelayPolicy) -> Duration {
 /// not connected); those terminate normally as [`RelayEnd::PeerClosed`].
 /// Errors from shutting down the opposite direction after EOF are ignored, and
 /// neither a shutdown timeout nor a promotion callback is an error.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single state machine; splitting would hide the flow"
+)]
 pub async fn relay_with_policy<A, B, P>(
     a: A,
     b: B,
@@ -410,6 +415,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
@@ -498,7 +510,7 @@ mod tests {
         server.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello");
 
-        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+        let stats = time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("half-close timeout must fire")
             .unwrap()
@@ -527,7 +539,7 @@ mod tests {
             .await
         });
 
-        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+        let stats = time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("idle timeout must fire")
             .unwrap()
@@ -560,13 +572,13 @@ mod tests {
         // must keep resetting the 150ms half-close clock.
         let writer = tokio::spawn(async move {
             for _ in 0..6 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                time::sleep(Duration::from_millis(50)).await;
                 server.write_all(b"t").await.unwrap();
             }
             server.shutdown().await.unwrap();
         });
 
-        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+        let stats = time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("active stream must not be reaped")
             .unwrap()
@@ -616,21 +628,21 @@ mod tests {
         // Keep both directions open past promotion; a half-closed connection
         // is deliberately not promoted.
         client.write_all(b"x").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
         client.shutdown().await.unwrap();
         let mut buf = [0u8; 1];
         server.read_exact(&mut buf).await.unwrap();
 
         // Without promotion the 150ms half-close would fire; the zero-age
         // promotion must have extended it to 10s.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        time::sleep(Duration::from_millis(200)).await;
         assert!(
             !handle.is_finished(),
             "zero-age promotion must extend half-close"
         );
 
         server.shutdown().await.unwrap();
-        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+        let stats = time::timeout(Duration::from_secs(2), handle)
             .await
             .unwrap()
             .unwrap()
@@ -666,17 +678,17 @@ mod tests {
         });
 
         client.write_all(b"x").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        time::sleep(Duration::from_millis(150)).await;
         client.shutdown().await.unwrap();
         let mut buf = [0u8; 1];
         server.read_exact(&mut buf).await.unwrap();
 
         // Without promotion the half-close clock would fire at ~150ms.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        time::sleep(Duration::from_millis(400)).await;
         assert!(!handle.is_finished(), "promotion must extend half-close");
 
         server.shutdown().await.unwrap();
-        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+        let stats = time::timeout(Duration::from_secs(2), handle)
             .await
             .unwrap()
             .unwrap()
@@ -718,7 +730,7 @@ mod tests {
 
         // Promotion is skipped once a direction has reached EOF, so the
         // general 150ms drain applies instead of the 10s streaming budget.
-        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+        let stats = time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("general half-close must fire")
             .unwrap()

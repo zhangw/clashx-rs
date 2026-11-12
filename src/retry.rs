@@ -51,16 +51,16 @@ pub const MAX_REPLAY_BUFFER: usize = 64 * 1024;
 /// Close a connection when neither direction has carried a byte for an hour.
 /// Long enough for LLM reasoning gaps, short enough to reclaim truly dead
 /// connections (matches Envoy TCP proxy / Istio defaults).
-pub const RELAY_IDLE: Duration = Duration::from_secs(60 * 60);
+pub const RELAY_IDLE: Duration = Duration::from_hours(1);
 
 /// Half-close inactivity for ordinary traffic. Most protocols do not
 /// half-close; a minute is enough to drain a response and reclaim quickly.
 pub const HALF_CLOSE_GENERAL: Duration = Duration::from_secs(60);
 
 /// Half-close inactivity after a connection is promoted to long-lived.
-/// The OpenAI SDK's default read timeout is 10 minutes, so the proxy must not
+/// The `OpenAI` SDK's default read timeout is 10 minutes, so the proxy must not
 /// be stricter than the clients it serves.
-pub const HALF_CLOSE_STREAMING: Duration = Duration::from_secs(10 * 60);
+pub const HALF_CLOSE_STREAMING: Duration = Duration::from_mins(10);
 
 /// Connections still open in both directions after this long are treated as
 /// long-lived (SSE, WebSocket, large downloads) and promoted to the streaming
@@ -150,7 +150,7 @@ impl CooldownTracker {
     }
 
     /// Whether the proxy was sidelined by a health probe (persistent, cleared
-    /// only by record_success). Used by the probe scheduler to re-check
+    /// only by `record_success`). Used by the probe scheduler to re-check
     /// unhealthy nodes at a faster cadence.
     pub fn is_sidelined(&self, proxy: &str) -> bool {
         read_lock(&self.sidelined).contains(proxy)
@@ -171,7 +171,7 @@ impl CooldownTracker {
         entry.1 = Instant::now();
     }
 
-    /// Weak failure signal: demote in candidate ordering for DEGRADE_DURATION.
+    /// Weak failure signal: demote in candidate ordering for `DEGRADE_DURATION`.
     /// Used for first-byte timeouts/closes, which are probably (not
     /// certainly) node failures.
     pub fn degrade(&self, proxy: &str) {
@@ -195,6 +195,13 @@ impl CooldownTracker {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
 
     #[test]

@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const TARGET: u64 = 8192;
+const TARGET: libc::rlim_t = 8192;
 // Listeners, runtime, logs, four control requests (including latency probes),
 // DNS, subscription downloads and ten background health probes.
 const RESERVED: u64 = 128;
@@ -73,6 +73,10 @@ fn capacity(soft: u64) -> usize {
     (soft.saturating_sub(RESERVED) / PER_CONNECTION).min(2048) as usize
 }
 
+#[expect(
+    unsafe_code,
+    reason = "libc getrlimit/setrlimit calls with inline SAFETY notes"
+)]
 pub fn initialize() -> anyhow::Result<&'static Budget> {
     if let Some(budget) = BUDGET.get() {
         return Ok(budget);
@@ -82,21 +86,22 @@ pub fn initialize() -> anyhow::Result<&'static Budget> {
         rlim_max: 0,
     };
     // SAFETY: limits points to a valid writable rlimit structure.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limits) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    let desired = (TARGET as libc::rlim_t).min(limits.rlim_max);
+    let desired = TARGET.min(limits.rlim_max);
     if limits.rlim_cur < desired {
         let raised = libc::rlimit {
             rlim_cur: desired,
             rlim_max: limits.rlim_max,
         };
         // SAFETY: valid structure; only the soft limit is raised within hard limit.
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) } != 0 {
             tracing::warn!(error = %std::io::Error::last_os_error(), "could not raise file descriptor limit");
         }
         // Read back rather than assuming the requested limit took effect.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+        // SAFETY: `limits` is a valid writable rlimit structure.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limits) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
     }
@@ -168,34 +173,31 @@ fn last_relay_error(budget: &Budget) -> serde_json::Value {
 }
 
 pub fn status() -> serde_json::Value {
-    BUDGET
-        .get()
-        .map(|b| {
-            serde_json::json!({
-                "fd_soft_limit": b.soft, "fd_hard_limit": b.hard,
-                "connection_limit": b.limit,
-                "active_connections": b.limit.saturating_sub(b.global.available_permits()),
-                "streaming_limit": b.streaming_limit,
-                "active_streaming": b.streaming_limit.saturating_sub(b.streaming.available_permits()),
-                "general_limit": b.general_limit,
-                "active_general": b.general_limit.saturating_sub(b.general.available_permits()),
-                "active_control_connections": CONTROL_LIMIT - b.controls.available_permits(),
-                "overload_count": b.overloads.load(Ordering::Relaxed),
-                "general_overload_count": b.general_overloads.load(Ordering::Relaxed),
-                "promotion_count": b.promotions.load(Ordering::Relaxed),
-                "promotion_failure_count": b.promotion_failures.load(Ordering::Relaxed),
-                "completed_count": b.completed_count.load(Ordering::Relaxed),
-                "idle_reaped_count": b.idle_reaped.load(Ordering::Relaxed),
-                "half_closed_reaped_count": b.half_closed_reaped.load(Ordering::Relaxed),
-                "admitted_count": b.admitted.load(Ordering::Relaxed),
-                "stalled_count": b.stalled.load(Ordering::Relaxed),
-                "relay_error_count": b.relay_errors.load(Ordering::Relaxed),
-                "peer_closed_count": b.peer_closed.load(Ordering::Relaxed),
-                "current_half_closed": b.half_closed_current.load(Ordering::Relaxed),
-                "last_relay_error": last_relay_error(b),
-            })
+    BUDGET.get().map_or(serde_json::Value::Null, |b| {
+        serde_json::json!({
+            "fd_soft_limit": b.soft, "fd_hard_limit": b.hard,
+            "connection_limit": b.limit,
+            "active_connections": b.limit.saturating_sub(b.global.available_permits()),
+            "streaming_limit": b.streaming_limit,
+            "active_streaming": b.streaming_limit.saturating_sub(b.streaming.available_permits()),
+            "general_limit": b.general_limit,
+            "active_general": b.general_limit.saturating_sub(b.general.available_permits()),
+            "active_control_connections": CONTROL_LIMIT - b.controls.available_permits(),
+            "overload_count": b.overloads.load(Ordering::Relaxed),
+            "general_overload_count": b.general_overloads.load(Ordering::Relaxed),
+            "promotion_count": b.promotions.load(Ordering::Relaxed),
+            "promotion_failure_count": b.promotion_failures.load(Ordering::Relaxed),
+            "completed_count": b.completed_count.load(Ordering::Relaxed),
+            "idle_reaped_count": b.idle_reaped.load(Ordering::Relaxed),
+            "half_closed_reaped_count": b.half_closed_reaped.load(Ordering::Relaxed),
+            "admitted_count": b.admitted.load(Ordering::Relaxed),
+            "stalled_count": b.stalled.load(Ordering::Relaxed),
+            "relay_error_count": b.relay_errors.load(Ordering::Relaxed),
+            "peer_closed_count": b.peer_closed.load(Ordering::Relaxed),
+            "current_half_closed": b.half_closed_current.load(Ordering::Relaxed),
+            "last_relay_error": last_relay_error(b),
         })
-        .unwrap_or(serde_json::Value::Null)
+    })
 }
 
 /// Point-in-time pool occupancy, included in pressure/saturation warnings so
@@ -315,7 +317,10 @@ pub fn record_relay_error(error: &anyhow::Error, target: &str, proxy: &str) {
     }
 
     let now = Instant::now();
-    let mut warned = budget.relay_error_warned.lock().unwrap();
+    let mut warned = budget
+        .relay_error_warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if warned.is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(60)) {
         tracing::warn!(target, proxy, error = %message, "relay error");
         *warned = Some(now);
@@ -406,18 +411,15 @@ impl ConnectionSlot {
     /// counted so saturation is visible.
     pub fn try_promote(&mut self) -> Duration {
         if self.class == ConnectionClass::General {
-            match self.budget.streaming.clone().try_acquire_owned() {
-                Ok(permit) => {
-                    self.class_permit = Some(permit);
-                    self.class = ConnectionClass::Streaming;
-                    self.budget.promotions.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(_) => {
-                    self.budget
-                        .promotion_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    warn_promotion_saturated(self.budget);
-                }
+            if let Ok(permit) = self.budget.streaming.clone().try_acquire_owned() {
+                self.class_permit = Some(permit);
+                self.class = ConnectionClass::Streaming;
+                self.budget.promotions.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.budget
+                    .promotion_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                warn_promotion_saturated(self.budget);
             }
         }
         crate::retry::HALF_CLOSE_STREAMING
@@ -433,7 +435,10 @@ impl ConnectionSlot {
 /// the consequence (squatting in general) before admission starts failing.
 fn warn_promotion_saturated(budget: &Budget) {
     let now = Instant::now();
-    let mut last = budget.promotion_failure_warned.lock().unwrap();
+    let mut last = budget
+        .promotion_failure_warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if last.is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(600)) {
         let occupancy = occupancy_from(budget);
         tracing::warn!(
@@ -535,6 +540,14 @@ impl OverloadLog {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction,
+        unsafe_code
+    )]
+
     use super::*;
 
     fn test_budget(global: usize, streaming: usize, general: usize) -> &'static Budget {
@@ -623,6 +636,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)] // test child lowers its own RLIMIT_NOFILE
     fn exhausted_accept_recovers_in_child() {
         const CHILD: &str = "CLASHX_FD_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -647,7 +661,8 @@ mod tests {
             rlim_max: 256,
         };
         // SAFETY: valid rlimit pointer, no other process is affected.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limits) };
+        assert_eq!(rc, 0);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

@@ -25,6 +25,7 @@ use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream;
 
 /// A connected outbound stream ready for data relay.
+#[derive(Debug)]
 pub enum OutboundStream {
     /// A plain TCP stream to the destination (DIRECT) or to a SOCKS5 proxy
     /// that has already accepted the CONNECT request.
@@ -40,7 +41,7 @@ pub enum OutboundStream {
 /// Dial a proxy server over TCP: connect to the pre-resolved IP when one is
 /// provided, otherwise let the system resolver handle the hostname.
 ///
-/// TCP_NODELAY is enabled because proxy handshakes are small latency-sensitive
+/// `TCP_NODELAY` is enabled because proxy handshakes are small latency-sensitive
 /// writes, and TCP keepalive is applied as a best-effort backstop (failure is
 /// logged at debug level and does not fail the dial). The caller owns the
 /// returned stream.

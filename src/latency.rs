@@ -56,7 +56,7 @@ pub struct ProxyLatencyResult {
 }
 
 /// Measure raw TCP connect latency to all proxies.
-/// Uses TcpStream::connect(SocketAddr) — raw TCP, bypasses all HTTP/SOCKS proxy settings.
+/// Uses `TcpStream::connect(SocketAddr)` — raw TCP, bypasses all HTTP/SOCKS proxy settings.
 pub async fn measure_tcp(proxies: &[Proxy]) -> Vec<ProxyLatencyResult> {
     let _global = global_latency_lock().acquire().await;
     let deadline = Instant::now() + TCP_DEADLINE;
@@ -137,7 +137,7 @@ pub async fn measure_full(
     let mut set = JoinSet::new();
     let target = dummy_target();
 
-    for proxy in proxies.into_iter() {
+    for proxy in proxies {
         let (name, proxy_type) = match proxy_info(&proxy) {
             Some((n, _, _, t)) => (n.to_string(), t.to_string()),
             None => continue,
@@ -228,22 +228,22 @@ fn display_len(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+fn latency_val(ms: u64) -> String {
+    format!("{ms}ms")
+}
+
+fn latency_display_len(ms: u64) -> usize {
+    if ms == 0 {
+        3
+    } else {
+        (ms.ilog10() as usize) + 3
+    }
+}
+
 pub fn print_table(results: &[ProxyLatencyResult], full: bool) {
     if results.is_empty() {
         println!("no proxies to measure");
         return;
-    }
-
-    fn latency_val(ms: u64) -> String {
-        format!("{}ms", ms)
-    }
-
-    fn latency_display_len(ms: u64) -> usize {
-        if ms == 0 {
-            3
-        } else {
-            (ms.ilog10() as usize) + 3
-        }
     }
 
     let mut name_width = display_len("NAME");
@@ -326,6 +326,13 @@ fn pad(current: usize, target: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
 
     fn trojan_proxy() -> Proxy {

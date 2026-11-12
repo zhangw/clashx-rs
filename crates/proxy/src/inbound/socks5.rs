@@ -1,7 +1,7 @@
 //! The SOCKS5 inbound handshake.
 //!
 //! Implements just enough of RFC 1928 for a local mixed-port listener: version
-//! 5, the CONNECT command, and NO_AUTH only. IPv4, IPv6, and domain address
+//! 5, the CONNECT command, and `NO_AUTH` only. IPv4, IPv6, and domain address
 //! types are accepted; the reply advertises `0.0.0.0:0` because the real
 //! connection is established after the handshake, not here.
 //!
@@ -29,7 +29,7 @@ const REP_SUCCESS: u8 = 0x00;
 /// # Errors
 ///
 /// Returns an error when the client sends a version other than 5, offers no
-/// NO_AUTH method (the no-acceptable-methods reply is sent first), uses a
+/// `NO_AUTH` method (the no-acceptable-methods reply is sent first), uses a
 /// command other than CONNECT, uses an unknown address type, supplies a domain
 /// that is not valid UTF-8, or when reading or writing the handshake fails or
 /// the peer disconnects early.
@@ -119,6 +119,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::net::{TcpListener, TcpStream};
@@ -169,7 +176,7 @@ mod tests {
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 443);
             }
-            other => panic!("expected Domain, got {other:?}"),
+            other @ TargetAddr::Ip(..) => panic!("expected Domain, got {other:?}"),
         }
     }
 
@@ -211,10 +218,10 @@ mod tests {
         let target = server_handle.await.unwrap();
         match target {
             TargetAddr::Ip(ip, port) => {
-                assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+                assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
                 assert_eq!(port, 80);
             }
-            other => panic!("expected Ip, got {other:?}"),
+            other @ TargetAddr::Domain(..) => panic!("expected Ip, got {other:?}"),
         }
     }
 }

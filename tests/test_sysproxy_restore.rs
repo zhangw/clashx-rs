@@ -1,6 +1,12 @@
 //! macOS system-proxy snapshot/restore integration test. Exercises a real
 //! `networksetup` call path and restores the original settings afterwards.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unchecked_time_subtraction
+)]
 #![cfg(target_os = "macos")]
 
 use std::fs;
@@ -66,7 +72,7 @@ esac
 fn restore_without_snapshot_does_not_touch_system_settings() {
     let (success, calls, _) = exercise("restore", false, "original.proxy", false);
     assert!(success);
-    assert!(calls.is_empty());
+    assert_eq!(calls, "");
 }
 
 #[test]

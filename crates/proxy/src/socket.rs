@@ -60,18 +60,16 @@ fn seconds(duration: Duration) -> libc::c_int {
     duration.as_secs().clamp(1, i32::MAX as u64) as libc::c_int
 }
 
+#[expect(
+    unsafe_code,
+    reason = "setsockopt requires an unsafe libc call; SAFETY notes inline"
+)]
 fn set_opt(fd: RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> io::Result<()> {
+    let ptr = std::ptr::from_ref(&value).cast::<libc::c_void>();
     // SAFETY: `fd` is a live socket owned by the caller and `value` points to
     // a c_int that outlives this call.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            name,
-            &value as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&value) as libc::socklen_t,
-        )
-    };
+    let rc =
+        unsafe { libc::setsockopt(fd, level, name, ptr, size_of_val(&value) as libc::socklen_t) };
     if rc == 0 {
         Ok(())
     } else {
@@ -81,6 +79,13 @@ fn set_opt(fd: RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int)
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
     use tokio::net::TcpListener;
 

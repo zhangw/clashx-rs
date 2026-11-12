@@ -36,7 +36,7 @@ impl Bootstrap {
             match parse_udp_addr(entry) {
                 Some(addr) => servers.push(addr),
                 None => {
-                    tracing::warn!(entry = %entry, "ignoring unsupported default-nameserver entry (bootstrap needs plain UDP)")
+                    tracing::warn!(entry = %entry, "ignoring unsupported default-nameserver entry (bootstrap needs plain UDP)");
                 }
             }
         }
@@ -141,6 +141,13 @@ pub(crate) use tests::spawn_mock_dns_server;
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
     use crate::wire::test_util::{build_test_response, make_a_record};
     use tokio::net::UdpSocket;
@@ -211,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_resolves_via_default_nameserver() {
         let server = spawn_mock_dns_server([9, 9, 9, 9]).await;
-        let bootstrap = Bootstrap::from_nameservers(&[format!("udp://{}", server)]);
+        let bootstrap = Bootstrap::from_nameservers(&[format!("udp://{server}")]);
         let ip = bootstrap.resolve("dns.example.com").await.unwrap();
         assert_eq!(ip, "9.9.9.9".parse::<IpAddr>().unwrap());
     }

@@ -17,6 +17,7 @@ use crate::types::{Config, LogLevel};
 /// one-field struct skips building the proxy and rule lists, which is the
 /// expensive part of a real config. An unreadable or unparseable file falls
 /// back to [`LogLevel::Info`] so a bad config never silences the daemon.
+#[must_use]
 pub fn load_log_level(path: &Path) -> LogLevel {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "kebab-case")]
@@ -71,6 +72,12 @@ pub fn load_config(path: &Path) -> Result<Config> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
 
     #[test]
     fn log_level_read_without_full_parse() {

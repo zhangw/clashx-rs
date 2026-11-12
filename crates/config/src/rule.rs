@@ -82,6 +82,7 @@ impl RuleEntry {
     /// Returns `None` for an unrecognized type or a malformed entry (missing
     /// components, unparsable address, or unparsable prefix), which callers
     /// log and skip.
+    #[must_use]
     pub fn parse(raw: &str) -> Option<RuleEntry> {
         let parts: Vec<&str> = raw.splitn(3, ',').collect();
         match parts.as_slice() {
@@ -128,11 +129,13 @@ impl RuleEntry {
     ///
     /// Returns the same text as [`RuleEntry::display`], allocated as a
     /// `String` for log fields.
+    #[must_use]
     pub fn description(&self) -> String {
         self.display().to_string()
     }
 
     /// Rule target: a proxy or group name, `DIRECT`, or `REJECT`.
+    #[must_use]
     pub fn target(&self) -> &str {
         match self {
             RuleEntry::Domain { target, .. }
@@ -149,6 +152,7 @@ impl RuleEntry {
     ///
     /// The output names the rule type and its match pattern but omits the
     /// target, for example `DOMAIN-SUFFIX,example.com`.
+    #[must_use]
     pub fn display(&self) -> RuleDisplay<'_> {
         RuleDisplay(self)
     }
@@ -167,6 +171,7 @@ impl RuleEntry {
 }
 
 /// Borrowed [`RuleEntry`] renderer returned by [`RuleEntry::display`].
+#[derive(Debug)]
 pub struct RuleDisplay<'a>(&'a RuleEntry);
 
 impl fmt::Display for RuleDisplay<'_> {
@@ -177,6 +182,13 @@ impl fmt::Display for RuleDisplay<'_> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use std::net::IpAddr;
 
     use super::*;

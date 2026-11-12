@@ -14,14 +14,15 @@ use crate::{
 };
 
 /// Current unix timestamp in seconds.
+#[must_use]
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Returns true if the subscription has never been downloaded or its interval has elapsed.
+#[must_use]
 pub fn needs_update(sub: &Subscription) -> bool {
     if sub.last_updated == 0 {
         return true;
@@ -50,7 +51,7 @@ where
     };
 
     let mut results = Vec::new();
-    for sub in config.subscriptions.iter_mut() {
+    for sub in &mut config.subscriptions {
         if !should_update(sub) {
             continue;
         }
@@ -161,6 +162,13 @@ fn find_subscription_mut<'a>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
 
     fn sample(last_updated: u64, interval: u64) -> Subscription {

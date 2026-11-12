@@ -22,7 +22,7 @@ use crate::timeout::CONNECT_TIMEOUT;
 /// with the proxy set as system proxy can route DNS queries back through
 /// clashx-rs itself, creating recursive lookups and significant latency.
 ///
-/// TCP_NODELAY and keepalive use the same settings as the proxy dials. The
+/// `TCP_NODELAY` and keepalive use the same settings as the proxy dials. The
 /// returned stream is owned by the caller.
 ///
 /// # Errors
@@ -60,6 +60,15 @@ pub async fn connect(target: &TargetAddr, resolved_ip: Option<IpAddr>) -> Result
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
+    use std::net::Ipv4Addr;
+
     use super::*;
     use tokio::net::TcpListener;
 
@@ -70,10 +79,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        let target = TargetAddr::Ip(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-            addr.port(),
-        );
+        let target = TargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port());
         let result = connect(&target, None).await.unwrap();
         assert!(matches!(result, OutboundStream::Tcp(_)));
     }
@@ -92,12 +98,9 @@ mod tests {
             "this.domain.does.not.exist.invalid".to_string(),
             addr.port(),
         );
-        let result = connect(
-            &target,
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
-        )
-        .await
-        .unwrap();
+        let result = connect(&target, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+            .await
+            .unwrap();
         assert!(matches!(result, OutboundStream::Tcp(_)));
     }
 }

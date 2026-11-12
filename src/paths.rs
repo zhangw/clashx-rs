@@ -1,7 +1,7 @@
 //! Runtime filesystem paths and defaults.
 //!
-//! Keeps the config, PID, control socket, log, and GeoIP locations in one
-//! place so the daemon, CLI, and LaunchAgent agree on the same files.
+//! Keeps the config, PID, control socket, log, and `GeoIP` locations in one
+//! place so the daemon, CLI, and `LaunchAgent` agree on the same files.
 
 use std::path::PathBuf;
 
@@ -14,7 +14,7 @@ pub fn runtime_dir() -> PathBuf {
     home.join(".config/clashx-rs")
 }
 
-/// Runtime log directory. On macOS this matches the LaunchAgent's existing
+/// Runtime log directory. On macOS this matches the `LaunchAgent`'s existing
 /// log directory; other platforms keep logs beside the runtime state.
 pub fn log_dir() -> PathBuf {
     #[cfg(target_os = "macos")]

@@ -10,6 +10,7 @@ use crate::outbound::OutboundStream;
 ///
 /// The caller should drop the inbound connection without sending data; the
 /// returned [`OutboundStream::Rejected`] carries no socket.
+#[must_use]
 pub fn reject() -> OutboundStream {
     OutboundStream::Rejected
 }

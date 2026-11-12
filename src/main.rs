@@ -80,7 +80,7 @@ enum Command {
         /// Override the selected proxy in a group at startup (GROUP=PROXY)
         #[arg(long = "select", value_name = "GROUP=PROXY")]
         selections: Vec<String>,
-        /// Path to the GeoIP mmdb database file
+        /// Path to the `GeoIP` mmdb database file
         #[arg(long = "mmdb")]
         mmdb: Option<String>,
         /// If mmdb is missing, download it in the background after proxy starts
@@ -124,7 +124,7 @@ enum Command {
         #[command(subcommand)]
         action: SysproxyAction,
     },
-    /// Download the GeoIP mmdb database
+    /// Download the `GeoIP` mmdb database
     MmdbDownload {
         /// SOCKS5 or HTTP proxy URL for the download
         #[arg(long)]
@@ -384,9 +384,7 @@ fn run_daemon_command(
     config_path: &Path,
 ) -> Result<()> {
     install_crypto_provider();
-    let mmdb_path = mmdb
-        .map(|p| expand_tilde(&p))
-        .unwrap_or_else(paths::default_mmdb_path);
+    let mmdb_path = mmdb.map_or_else(paths::default_mmdb_path, |p| expand_tilde(&p));
     if daemon {
         daemon::start_background(
             config_path,
@@ -424,13 +422,13 @@ fn run_sysproxy(action: SysproxyAction, config_path: &Path, ctrl_port: u16) -> R
     match action {
         SysproxyAction::On { bypass } => {
             // Priority: CLI --bypass > config skip-proxy > built-in defaults.
-            let bypass_rules = if !bypass.is_empty() {
-                bypass
-            } else {
+            let bypass_rules = if bypass.is_empty() {
                 clashx_rs_config::load_config(config_path)
                     .ok()
                     .map(|c| c.skip_proxy)
                     .unwrap_or_default()
+            } else {
+                bypass
             };
             SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path())
                 .enable_with_bypass(&bypass_rules)?;
@@ -460,16 +458,14 @@ fn run_sysproxy(action: SysproxyAction, config_path: &Path, ctrl_port: u16) -> R
     Ok(())
 }
 
-/// Download a GeoIP mmdb file, optionally through a proxy.
+/// Download a `GeoIP` mmdb file, optionally through a proxy.
 fn run_mmdb_download(
     proxy: Option<String>,
     url: Option<String>,
     output: Option<String>,
 ) -> Result<()> {
     install_crypto_provider();
-    let output_path = output
-        .map(|p| expand_tilde(&p))
-        .unwrap_or_else(paths::default_mmdb_path);
+    let output_path = output.map_or_else(paths::default_mmdb_path, |p| expand_tilde(&p));
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -492,18 +488,15 @@ fn run_dns(action: DnsAction, ctrl_port: u16) -> Result<()> {
                 ControlRequest::DnsFlush { host: host.clone() },
                 ctrl_port,
             )?;
-            match host {
-                Some(h) => {
-                    if data["hit"].as_bool().unwrap_or(false) {
-                        println!("invalidated dns cache entry for '{h}'");
-                    } else {
-                        println!("no dns cache entry for '{h}'");
-                    }
+            if let Some(h) = host {
+                if data["hit"].as_bool().unwrap_or(false) {
+                    println!("invalidated dns cache entry for '{h}'");
+                } else {
+                    println!("no dns cache entry for '{h}'");
                 }
-                None => {
-                    let n = data["flushed"].as_u64().unwrap_or(0);
-                    println!("dns cache flushed ({n} entries)");
-                }
+            } else {
+                let n = data["flushed"].as_u64().unwrap_or(0);
+                println!("dns cache flushed ({n} entries)");
             }
         }
     }
@@ -662,10 +655,10 @@ fn format_unix_time(ts: u64) -> String {
     let second = time_of_day % 60;
 
     // Civil-from-days algorithm (Howard Hinnant, public domain).
-    let z = days_since_epoch + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days_since_epoch + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -713,6 +706,13 @@ fn redact_url_for_display(url: &str) -> String {
 
 #[cfg(test)]
 mod cli_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::{redact_url_for_display, Cli, Command};
     use clap::Parser;
 

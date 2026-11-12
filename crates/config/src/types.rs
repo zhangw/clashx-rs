@@ -231,6 +231,7 @@ impl Proxy {
     /// targets.
     ///
     /// Returns `None` for [`Proxy::Unknown`].
+    #[must_use]
     pub fn name(&self) -> Option<&str> {
         match self {
             Proxy::Trojan(p) => Some(&p.name),
@@ -380,6 +381,7 @@ impl ProxyGroup {
     ///
     /// An absent `health-check` block yields the default [`HealthCheck`],
     /// which has probing enabled.
+    #[must_use]
     pub fn effective_health_check(&self) -> HealthCheck {
         self.health_check.clone().unwrap_or_default()
     }
@@ -403,6 +405,13 @@ pub enum GroupType {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
 
     #[test]
@@ -416,7 +425,7 @@ mod tests {
 
     #[test]
     fn parse_trojan_proxy() {
-        let yaml = r#"
+        let yaml = r"
 proxies:
   - name: my-trojan
     type: trojan
@@ -425,7 +434,7 @@ proxies:
     password: secret
     sni: example.com
     skip-cert-verify: true
-"#;
+";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.proxies.len(), 1);
         if let Proxy::Trojan(p) = &config.proxies[0] {
@@ -442,7 +451,7 @@ proxies:
 
     #[test]
     fn parse_socks5_proxy() {
-        let yaml = r#"
+        let yaml = r"
 proxies:
   - name: my-socks5
     type: socks5
@@ -450,7 +459,7 @@ proxies:
     port: 1080
     username: user
     password: pass
-"#;
+";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.proxies.len(), 1);
         if let Proxy::Socks5(p) = &config.proxies[0] {
@@ -466,7 +475,7 @@ proxies:
 
     #[test]
     fn parse_proxy_group_select() {
-        let yaml = r#"
+        let yaml = r"
 proxy-groups:
   - name: Proxy
     type: select
@@ -474,7 +483,7 @@ proxy-groups:
       - my-trojan
       - my-socks5
       - DIRECT
-"#;
+";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.proxy_groups.len(), 1);
         let group = &config.proxy_groups[0];
@@ -485,13 +494,13 @@ proxy-groups:
 
     #[test]
     fn proxy_group_without_health_check_uses_defaults() {
-        let yaml = r#"
+        let yaml = r"
 proxy-groups:
   - name: Proxy
     type: select
     proxies:
       - my-trojan
-"#;
+";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let hc = config.proxy_groups[0].effective_health_check();
         assert!(hc.enable);
@@ -502,7 +511,7 @@ proxy-groups:
 
     #[test]
     fn parse_proxy_group_health_check() {
-        let yaml = r#"
+        let yaml = r"
 proxy-groups:
   - name: Proxy
     type: select
@@ -513,7 +522,7 @@ proxy-groups:
       url: http://cp.cloudflare.com/generate_204
       interval: 60
       expected-status: 204
-"#;
+";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let hc = config.proxy_groups[0].effective_health_check();
         assert!(!hc.enable);
@@ -578,8 +587,8 @@ hosts:
         let yaml = "dns:\n  enable: true\n";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let dns = config.dns.as_ref().unwrap();
-        assert!(dns.nameserver.is_empty());
-        assert!(dns.proxy_server_nameserver.is_empty());
+        assert_eq!(dns.nameserver, Vec::<String>::new());
+        assert_eq!(dns.proxy_server_nameserver, Vec::<String>::new());
         // Absent use-hosts means enabled (dns crate treats None as true).
         assert_eq!(dns.use_hosts, None);
         assert!(config.hosts.is_empty());
@@ -587,13 +596,13 @@ hosts:
 
     #[test]
     fn unknown_fields_are_ignored() {
-        let yaml = r#"
+        let yaml = r"
 mixed-port: 7890
 tun:
   enable: true
   stack: system
 some-future-field: whatever
-"#;
+";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.mixed_port, Some(7890));
         assert!(config.extra.contains_key("tun"));
@@ -602,14 +611,14 @@ some-future-field: whatever
 
     #[test]
     fn unknown_proxy_type_is_skipped() {
-        let yaml = r#"
+        let yaml = r"
 proxies:
   - name: my-vmess
     type: vmess
     server: example.com
     port: 443
     uuid: some-uuid
-"#;
+";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.proxies.len(), 1);
         assert!(matches!(config.proxies[0], Proxy::Unknown));

@@ -68,6 +68,13 @@ pub async fn system_resolve(host: &str) -> Result<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )]
+
     use super::*;
 
     #[tokio::test]
