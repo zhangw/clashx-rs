@@ -129,7 +129,7 @@ Impact: the `libproc` union access is the highest-risk code in the workspace;
 the invariant that makes it sound must be written down next to the block.
 
 Fix: add the missing `// SAFETY:` notes, deny `unsafe_code` at workspace level,
-and add a local `#[expect(unsafe_code, reason = "...")]` on the four functions
+and add a local `#[expect(unsafe_code, reason = "...")]` on the three functions
 that need `libc`/`libproc`; deny `clippy::undocumented_unsafe_blocks` so new
 blocks require a note. Commit 2/3.
 
@@ -156,6 +156,11 @@ directories stay). Commit 4.
   function).
 - `src/client.rs:8` takes `ControlRequest` by value but does not consume it;
   take `&ControlRequest`.
+
+Resolution: `unused_self` and the `ControlRequest` borrow were fixed; the
+remaining boolean flags mirror documented config keys (`skip_cert_verify`,
+`full`, `half_closed`) and are kept; `Option<Option<..>>` keeps its documented
+three-state contract with a local `#[expect(clippy::option_option)]`.
 
 Commit 3.
 
@@ -254,17 +259,18 @@ cargo clippy --all-targets --message-format=short -- \
 
 ## Remediation status (2026-11-12)
 
-All findings were addressed on `feat/rust-style-guide`:
+All findings were addressed or explicitly accepted on `feat/rust-style-guide`
+(review fixes in `85b2249`):
 
 | Finding | Status | Where |
 | --- | --- | --- |
 | F-01 public API docs | resolved | `4c3979f` (crates), `0d1f445` (binary modules) |
-| F-02 panic-prone locks | resolved | `2f5d4cd` (poison recovery, budget error) |
+| F-02 panic-prone locks | resolved | `0d1f445` (retry), `2f5d4cd` (DNS/cache, budget error) |
 | F-03 silent fallbacks / `Option` unwraps | resolved | `0d1f445`, `2f5d4cd`, `06e124d` |
 | F-04 oversized functions | mostly resolved | `0d1f445` (CLI/control splits), `06e124d` (SOCKS5 auth helper); `handle_connection`, `run_daemon`, `probe::run`, `relay_with_policy` keep a documented `#[expect(clippy::too_many_lines)]` |
-| F-05 unsafe documentation | resolved | `2f5d4cd` (SAFETY notes), `06e124d` (`unsafe_code` deny + expectations) |
+| F-05 unsafe documentation | resolved | `2f5d4cd` (SAFETY notes), `06e124d` (`unsafe_code` deny + expectations), `85b2249` (drop the Linux-only stray expectation) |
 | F-06 `mod.rs` layout | resolved | `a42db57` |
-| F-07 naming / flags / three-state lookup | resolved | `a42db57`, `06e124d` (`unused_self`, `option_option` expectation) |
+| F-07 naming / flags / three-state lookup | partially resolved | `a42db57` (naming), `06e124d` (`unused_self`, `option_option` expectation); boolean flags kept as config mirrors |
 | F-08 stale suppressions | resolved | `0d1f445` |
 | F-09 lint sweep | resolved | `06e124d` |
 | F-10 missing `Debug` | resolved | `06e124d` |
@@ -274,14 +280,76 @@ All findings were addressed on `feat/rust-style-guide`:
 | F-14 Linux sysproxy stdout | accepted | documented in `LOG-1` |
 | F-15 `start_background` stub | accepted | `#[expect(clippy::unnecessary_wraps, reason = "...")]` |
 
-The enforcement baseline is now green:
+The enforcement baseline is green on both declared platforms (Linux target
+installed with `rustup target add x86_64-unknown-linux-musl`):
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace --all-targets   # 335 tests
+cargo clippy --all-targets -- -D warnings                      # macOS
+cargo clippy --target x86_64-unknown-linux-musl --all-targets -- -D warnings
+cargo test --workspace --all-targets   # 337 tests
 ```
 
 Known follow-up: the four long functions kept under `#[expect]` are cohesive
 data-plane/startup state machines. Splitting them further is a separate,
 behavior-focused refactor, not a style sweep.
+
+## Adversarial review (2026-11-12)
+
+Three independent read-only reviewers re-checked `e878c55..c23e13e` with a
+mandate to falsify the "behavior-preserving" claim:
+
+- **Data plane** (routing, relay, timeouts, pools, DNS, rules): no semantic
+  drift found on normal or error paths. Every clippy rewrite was checked
+  against the base behavior, including the merged `Err(_) | Ok(0)` arms, the
+  `()` select pattern, `map_or` laziness, duration rewrites, `rlim_t`/`&raw`
+  FFI changes, the SOCKS5 `negotiate_auth` extraction, `host_lower`, and the
+  `LeaderGuard` move.
+- **CLI/control/daemon**: control-wire shapes, config defaults, subscription
+  update flow, sysproxy snapshot semantics, and printed text are unchanged
+  except for the intentional error-path deltas below.
+- **Dependencies/tests**: zero dependency delta (`Cargo.lock` blob-identical;
+  manifests only add `[lints]`). No test was removed, ignored, or weakened;
+  the test count grew from 335 to 337. The claimed doc-only commits contain no
+  non-comment lines.
+
+Issues found and fixed in `85b2249`:
+
+- The `stop`-path sysproxy cleanup error had been moved from `eprintln!` to
+  `tracing::error!`, where a silent log level could hide it and the
+  non-blocking writer may not flush before `exit(0)`. Restored the explicit
+  stderr print (and `LOG-1` now allows it).
+- `doc_markdown` backticks leaked into `--help` for the mmdb options. Restored
+  the original wording with explicit clap `help`/`about` text and added a
+  regression test.
+- The Linux-target `clippy -D warnings` gate was red (a stray
+  `#[expect(unsafe_code)]` on the non-unsafe `/proc` scanner, Linux-only
+  `manual_let_else`, and sysproxy Linux lints). Fixed and verified on
+  `x86_64-unknown-linux-musl`.
+- Added a SOCKS5 regression test for a server that demands credentials the
+  client never offered (previously a panic, now a clean connect error).
+
+## Observable behavior changes
+
+After `85b2249` these are the only runtime differences versus `e878c55`; all
+are edge-path robustness changes and none alters routing, relay, timeout, DNS,
+or rule semantics:
+
+| Change | Commit | Notes |
+| --- | --- | --- |
+| `latency` malformed/unserializable payload exits 1 with context instead of printing empty output and exiting 0 | `0d1f445` | intentional, review F-03 |
+| daemon `Latency` serialization failure returns `ok:false` instead of `ok:true, data:null` | `0d1f445` | unreachable for the current result type |
+| `last_err`/budget/empty nameserver group/ctrl-c expects return errors instead of panicking | `0d1f445`, `2f5d4cd` | unreachable or startup-only |
+| poisoned diagnostic locks recover instead of panicking | `0d1f445`, `2f5d4cd` | affects post-panic behavior only |
+| SOCKS5 server selects USER/PASS although no credentials were offered: clean error instead of panic | `2f5d4cd` | hostile/non-conforming server; now tested |
+
+The `stop`-path stderr diagnostic and the `--help` wording were restored in
+`85b2249`, so they are no longer deltas.
+
+## Erratum
+
+`2f5d4cd`'s commit message says the geoip download error chain was preserved.
+No such change exists: `src/main.rs` still maps the error with
+`anyhow!("{e}")`, identical to the base commit. There is no behavior delta;
+the message bullet is inaccurate. Implementing `ERR-4` there remains an
+optional follow-up.

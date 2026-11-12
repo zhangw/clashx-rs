@@ -164,8 +164,9 @@ in the review document; blanket `#![allow(...)]` is reserved for test modules.
 
 - **LOG-1 (MUST)** Libraries and the daemon use `tracing` only. `println!` /
   `eprintln!` are allowed only for user-facing CLI output in `src/main.rs` and
-  `src/client.rs`, plus the Linux sysproxy helper whose documented contract is
-  to print shell `export` lines.
+  `src/client.rs`, the Linux sysproxy helper whose documented contract is to
+  print shell `export` lines, and fatal shutdown diagnostics that must reach
+  stderr even when the log filter is silent (print, do not log).
 - **LOG-2 (MUST)** Use structured fields (`host = %host`, `err = %e`) and a
   lowercase message without a trailing period. Do not interpolate values into
   the message string.
@@ -203,11 +204,14 @@ in the review document; blanket `#![allow(...)]` is reserved for test modules.
   or `test_*`.
 - **TEST-3 (MUST)** Arrange-act-assert; one behavior per test; assert on
   observable results, not private implementation details.
-- **TEST-4 (MUST)** No wall-clock sleeps in unit tests. Use Tokio's paused
-  time or generous bounds; tests must be deterministic on a loaded machine.
+- **TEST-4 (MUST)** No unbounded sleeps or sleep-polling in unit tests. A
+  short bounded sleep used to force a timeout is acceptable; prefer Tokio's
+  paused time or explicit timeouts, and keep tests deterministic on a loaded
+  machine.
 - **TEST-5 (MUST)** Tests may `unwrap`/`expect`/`panic`; production code may
   not. Test modules opt out with
-  `#![allow(clippy::unwrap_used, clippy::expect_used)]`.
+  `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic,
+  clippy::unchecked_time_subtraction)]`.
 - **TEST-6 (SHOULD)** Cover error paths and boundaries, not just the happy
   path: empty input, truncated frames, peer reset, timeout.
 - **TEST-7 (MUST)** Integration tests use only the crate's public API.
@@ -288,7 +292,7 @@ cargo deny check advisories
 
 - Use `#[expect(lint, reason = "...")]` on the smallest item that needs it.
 - Test modules may opt out of panic-on-failure lints with a module-level
-  `#![allow(clippy::unwrap_used, clippy::expect_used,
+  `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic,
   clippy::unchecked_time_subtraction)]`.
 - Any exception that survives two review rounds is either promoted to a rule
   amendment or removed; do not accumulate permanent ignores.
