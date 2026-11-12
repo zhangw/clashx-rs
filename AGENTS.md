@@ -96,7 +96,7 @@ Current implemented shape:
 
 ## Working Rules
 
-- Follow `docs/rust-style-guide.md`; style reviews are posted under `docs/reviews/`.
+- Follow `docs/rust-style-guide.md`; report style review findings with the change.
 - Prefer small, reviewable changes.
 - Do not add dependencies unless clearly justified.
 - Reuse existing crate boundaries and patterns before inventing new abstractions.

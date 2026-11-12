@@ -314,10 +314,8 @@ When reviewing a change, check in this order:
 
 ## Review outputs
 
-Dated review reports live in `docs/reviews/`:
-
-- `docs/reviews/YYYY-MM-DD-rust-style-review.md`
-
-The report lists findings by rule ID, severity, and location, and records the
-remediation status. It does not replace this guide; rule changes are made
-here.
+Style review findings are reported with the change (commit message or review
+thread) and are not retained as dated style reports. Durable architecture,
+security, and performance reviews continue to live in `docs/reviews/`
+according to `AGENTS.md`. Rule changes are made in this guide, not in a
+review report.
