@@ -1,3 +1,9 @@
+//! Subscription lifecycle: due/forced downloads and add/remove/enable.
+//!
+//! Automatic updates skip `enabled == false` entries. A successful download
+//! advances [`Subscription::last_updated`] to `now_unix()`; a failed one
+//! leaves the timestamp untouched so the next scheduling pass retries it.
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
@@ -8,14 +14,15 @@ use crate::{
 };
 
 /// Current unix timestamp in seconds.
+#[must_use]
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Returns true if the subscription has never been downloaded or its interval has elapsed.
+#[must_use]
 pub fn needs_update(sub: &Subscription) -> bool {
     if sub.last_updated == 0 {
         return true;
@@ -44,7 +51,7 @@ where
     };
 
     let mut results = Vec::new();
-    for sub in config.subscriptions.iter_mut() {
+    for sub in &mut config.subscriptions {
         if !should_update(sub) {
             continue;
         }
@@ -75,6 +82,15 @@ pub async fn update_all_subscriptions(
 }
 
 /// Download a specific subscription by name.
+///
+/// Unlike the bulk updaters this ignores both `enabled` and `interval`, so it
+/// is the way to force an update of a disabled or recently updated entry.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built, no subscription named
+/// `name` exists, or the download itself fails. `last_updated` is advanced only
+/// on success.
 pub async fn update_subscription_by_name(
     config: &mut SubscriptionConfig,
     name: &str,
@@ -88,7 +104,12 @@ pub async fn update_subscription_by_name(
     result
 }
 
-/// Add a subscription. Fails if a subscription with the same name already exists.
+/// Add a subscription.
+///
+/// # Errors
+///
+/// Returns an error when a subscription with the same `name` already exists;
+/// the config is left unchanged in that case.
 pub fn add_subscription(config: &mut SubscriptionConfig, sub: Subscription) -> Result<()> {
     if config.subscriptions.iter().any(|s| s.name == sub.name) {
         bail!("subscription '{}' already exists", sub.name);
@@ -97,7 +118,12 @@ pub fn add_subscription(config: &mut SubscriptionConfig, sub: Subscription) -> R
     Ok(())
 }
 
-/// Remove a subscription by name. Fails if not found.
+/// Remove a subscription by name.
+///
+/// # Errors
+///
+/// Returns an error when no subscription named `name` exists; the config is
+/// left unchanged in that case.
 pub fn remove_subscription(config: &mut SubscriptionConfig, name: &str) -> Result<()> {
     let initial_len = config.subscriptions.len();
     config.subscriptions.retain(|s| s.name != name);
@@ -108,7 +134,11 @@ pub fn remove_subscription(config: &mut SubscriptionConfig, name: &str) -> Resul
 }
 
 /// Enable or disable a subscription by name. Disabled subscriptions are skipped
-/// by automatic and bulk updates. Fails if not found.
+/// by automatic and bulk updates.
+///
+/// # Errors
+///
+/// Returns an error when no subscription named `name` exists.
 pub fn set_subscription_enabled(
     config: &mut SubscriptionConfig,
     name: &str,

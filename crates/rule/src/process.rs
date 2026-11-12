@@ -1,3 +1,18 @@
+//! Best-effort port-to-process-name lookup for PROCESS-NAME rules.
+//!
+//! [`ProcessLookup::lookup`] builds a port → process-name table from the OS
+//! (libproc on macOS, `/proc` on Linux) and caches it for two seconds. Only
+//! processes named by a PROCESS-NAME rule are scanned, so unrelated processes
+//! do not pay the file-descriptor walk. Cache hits are synchronous hash-map
+//! lookups; concurrent misses coalesce into one blocking scan.
+//!
+//! The snapshot is deliberately stale-tolerant: a port absent from a fresh
+//! snapshot is a definitive miss until the TTL expires, and a reused port can
+//! name its previous owner for the same window. PROCESS-NAME rules are
+//! therefore best-effort — prefer DOMAIN, IP-CIDR, or GEOIP rules when routing
+//! must be exact. On platforms other than macOS and Linux the scan returns an
+//! empty table and every lookup misses.
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +43,7 @@ struct Snapshot {
     target_gen: u64,
 }
 
-/// Per-engine cache of port → process_name lookups. Owning this on
+/// Per-engine cache of `port → process_name` lookups. Owning this on
 /// `RuleEngine` (instead of process-globals) means each test or daemon
 /// instance has isolated state — no cross-test pollution.
 pub struct ProcessLookup {
@@ -40,6 +55,12 @@ pub struct ProcessLookup {
 }
 
 impl ProcessLookup {
+    /// Create an empty lookup with no snapshot and no process-name filter.
+    ///
+    /// Until [`ProcessLookup::set_targets`] is called, the first scan considers
+    /// every process. [`crate::RuleEngine::new`] sets the targets derived from
+    /// the configured PROCESS-NAME rules immediately after construction.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             snapshot: Mutex::new(None),
@@ -73,9 +94,10 @@ impl ProcessLookup {
 
     /// Look up the process name that owns the TCP connection from `source_addr`.
     ///
-    /// Uses a 2-second port→process table snapshot restricted to processes whose
-    /// names appear in any PROCESS-NAME rule. Cache hits are O(1) sync HashMap
-    /// lookups. Cache misses trigger a scan offloaded to a blocking thread.
+    /// Uses a 2-second `port→process` table snapshot restricted to processes
+    /// whose names appear in any PROCESS-NAME rule. Cache hits are O(1) sync
+    /// `HashMap` lookups. Cache misses trigger a scan offloaded to a blocking
+    /// thread.
     /// Concurrent misses coalesce — only one scan runs at a time.
     pub async fn lookup(self: &Arc<Self>, source_addr: SocketAddr) -> Option<String> {
         if let Some(hit) = self.fast_path_lookup(&source_addr) {
@@ -130,6 +152,10 @@ impl ProcessLookup {
     /// Returns `Some(Some(name))` for a hit, `Some(None)` for a known miss
     /// within the snapshot, and `None` when the snapshot is stale or absent
     /// (caller should trigger a rebuild).
+    #[expect(
+        clippy::option_option,
+        reason = "documented hit/miss/stale three-state lookup"
+    )]
     fn fast_path_lookup(&self, source_addr: &SocketAddr) -> Option<Option<String>> {
         let port = source_addr.port();
         let guard = self.snapshot.lock().ok()?;
@@ -157,7 +183,19 @@ impl Default for ProcessLookup {
     }
 }
 
+impl std::fmt::Debug for ProcessLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessLookup")
+            .field("target_gen", &self.target_gen.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "libproc socket union fields are read after checking soi_kind; SAFETY inline"
+)]
 fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
     use libproc::bsd_info::BSDInfo;
     use libproc::file_info::{pidfdinfo, ListFDs, ProcFDType};
@@ -166,18 +204,16 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
     use libproc::processes::{pids_by_type, ProcFilter};
 
     let mut map: HashMap<u16, String> = HashMap::new();
-    let pids = match pids_by_type(ProcFilter::All) {
-        Ok(p) => p,
-        Err(_) => return map,
+    let Ok(pids) = pids_by_type(ProcFilter::All) else {
+        return map;
     };
 
     for pid in pids {
         let pid = pid as i32;
 
         // Filter by process name first — skip fd walk for non-matches.
-        let proc_name = match name(pid) {
-            Ok(n) => n,
-            Err(_) => continue,
+        let Ok(proc_name) = name(pid) else {
+            continue;
         };
         if let Some(targets) = targets {
             if !targets.contains(&proc_name) {
@@ -189,9 +225,8 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
             Ok(i) => i,
             Err(_) => continue,
         };
-        let fds = match listpidinfo::<ListFDs>(pid, info.pbi_nfiles as usize) {
-            Ok(f) => f,
-            Err(_) => continue,
+        let Ok(fds) = listpidinfo::<ListFDs>(pid, info.pbi_nfiles as usize) else {
+            continue;
         };
 
         for fd in fds {
@@ -204,7 +239,11 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
             };
             let kind = SocketInfoKind::from(sock.psi.soi_kind);
             let local_port = match kind {
+                // SAFETY: `kind` is derived from `sock.psi.soi_kind`, so the
+                // active union member is `pri_tcp` and the kernel initialized
+                // `insi_lport` for a TCP socket.
                 SocketInfoKind::Tcp => unsafe { sock.psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport },
+                // SAFETY: same discriminant guarantee for the `pri_in` member.
                 SocketInfoKind::In => unsafe { sock.psi.soi_proto.pri_in.insi_lport },
                 _ => continue,
             };
@@ -226,9 +265,8 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
 
     let mut inode_to_port: HashMap<String, u16> = HashMap::new();
     for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Ok(content) = std::fs::read_to_string(file) else {
+            continue;
         };
         for line in content.lines().skip(1) {
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -240,9 +278,8 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
             if inode == "0" {
                 continue;
             }
-            let port_hex = match local.rsplit_once(':') {
-                Some((_, p)) => p,
-                None => continue,
+            let Some((_, port_hex)) = local.rsplit_once(':') else {
+                continue;
             };
             if let Ok(port) = u16::from_str_radix(port_hex, 16) {
                 inode_to_port.insert(inode.to_string(), port);
@@ -254,25 +291,26 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
         return map;
     }
 
-    let proc_dir = match std::fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return map,
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return map;
     };
 
     for entry in proc_dir.flatten() {
         let pid_name = entry.file_name();
-        let pid_str = match pid_name.to_str() {
-            Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
-            _ => continue,
+        let Some(pid_str) = pid_name.to_str() else {
+            continue;
         };
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
 
         // Read comm first so we can skip non-matching processes before the
         // expensive fd walk. Reading /proc/{pid}/comm is a single small file.
         let comm_path = format!("/proc/{pid_str}/comm");
-        let proc_name = match std::fs::read_to_string(&comm_path) {
-            Ok(s) => s.trim().to_string(),
-            Err(_) => continue,
+        let Ok(proc_name) = std::fs::read_to_string(&comm_path) else {
+            continue;
         };
+        let proc_name = proc_name.trim().to_string();
         if let Some(targets) = targets {
             if !targets.contains(&proc_name) {
                 continue;
@@ -280,22 +318,19 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
         }
 
         let fd_dir = format!("/proc/{pid_str}/fd");
-        let fds = match std::fs::read_dir(&fd_dir) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
         };
         for fd_entry in fds.flatten() {
-            let link = match std::fs::read_link(fd_entry.path()) {
-                Ok(l) => l,
-                Err(_) => continue,
+            let Ok(link) = std::fs::read_link(fd_entry.path()) else {
+                continue;
             };
             let link_str = link.to_string_lossy();
-            let inode = match link_str
+            let Some(inode) = link_str
                 .strip_prefix("socket:[")
                 .and_then(|s| s.strip_suffix(']'))
-            {
-                Some(i) => i,
-                None => continue,
+            else {
+                continue;
             };
             if let Some(&port) = inode_to_port.get(inode) {
                 map.entry(port).or_insert_with(|| proc_name.clone());

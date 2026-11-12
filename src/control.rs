@@ -1,31 +1,54 @@
+//! JSON request/response types shared by the daemon control socket and CLI.
+//!
+//! The protocol is line-oriented: one serialized [`ControlRequest`] per line
+//! and one [`ControlResponse`] per line. Both sides derive the wire format
+//! from these types, so field renames are protocol changes.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "lowercase")]
 pub enum ControlRequest {
+    /// Report daemon status: port, mode, config path, proxy/rule/group counts,
+    /// selections, and resource counters.
     Status,
+    /// Ask the daemon to shut down.
     Stop,
+    /// Re-read the config file and rebuild resolvers, rules, and proxies.
     Reload,
+    /// Select `proxy` inside `group` until the next config reload.
     Switch { group: String, proxy: String },
+    /// List the configured proxies.
     Proxies,
+    /// List proxy groups and their current selections.
     Groups,
+    /// List the parsed rules in evaluation order.
     Rules,
+    /// Resolve routing for `domain`: resolve DNS lazily for `IP-CIDR`/`GEOIP`
+    /// rules, skip `PROCESS-NAME` (no client source address), and report the
+    /// decision plus whether process rules were skipped.
     Test { domain: String },
+    /// Measure latency for every proxy; `full` performs an HTTP round trip
+    /// instead of a TCP connect.
     Latency { full: bool },
+    /// Flush resolver caches, optionally only the entry for `host`.
     DnsFlush { host: Option<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ControlResponse {
+    /// Whether the request succeeded.
     pub ok: bool,
+    /// Command-specific payload on success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// Human-readable failure description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl ControlResponse {
-    #[allow(dead_code)]
+    /// Success response carrying a JSON payload.
     pub fn success(data: serde_json::Value) -> Self {
         ControlResponse {
             ok: true,
@@ -34,7 +57,7 @@ impl ControlResponse {
         }
     }
 
-    #[allow(dead_code)]
+    /// Failure response carrying a human-readable message.
     pub fn error(msg: impl Into<String>) -> Self {
         ControlResponse {
             ok: false,
@@ -43,7 +66,7 @@ impl ControlResponse {
         }
     }
 
-    #[allow(dead_code)]
+    /// Success response without a payload.
     pub fn ok() -> Self {
         ControlResponse {
             ok: true,

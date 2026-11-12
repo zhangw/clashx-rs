@@ -5,6 +5,9 @@
 //! upstreams themselves; routing bootstrap through them would be circular).
 //! With no usable default-nameserver, bootstrap falls back to the system
 //! resolver (fail-open) with a one-time warning.
+//!
+//! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
+//! bootstrap and `default-nameserver` rules.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -33,7 +36,7 @@ impl Bootstrap {
             match parse_udp_addr(entry) {
                 Some(addr) => servers.push(addr),
                 None => {
-                    tracing::warn!(entry = %entry, "ignoring unsupported default-nameserver entry (bootstrap needs plain UDP)")
+                    tracing::warn!(entry = %entry, "ignoring unsupported default-nameserver entry (bootstrap needs plain UDP)");
                 }
             }
         }
@@ -208,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_resolves_via_default_nameserver() {
         let server = spawn_mock_dns_server([9, 9, 9, 9]).await;
-        let bootstrap = Bootstrap::from_nameservers(&[format!("udp://{}", server)]);
+        let bootstrap = Bootstrap::from_nameservers(&[format!("udp://{server}")]);
         let ip = bootstrap.resolve("dns.example.com").await.unwrap();
         assert_eq!(ip, "9.9.9.9".parse::<IpAddr>().unwrap());
     }

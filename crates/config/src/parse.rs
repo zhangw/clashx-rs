@@ -1,15 +1,50 @@
+//! Loading configuration files from disk.
+//!
+//! [`load_config`] is the full parser; [`load_log_level`] is a cheap
+//! single-field read used before tracing is initialized. Both treat the file
+//! as read-only and never create or modify it.
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::types::{Config, LogLevel};
 
+/// Warn when a file that may embed secrets is readable by group or others.
+///
+/// `artifact` names the file in the message (for example `"config file"`) and
+/// `reason` explains what it may contain. On non-Unix platforms this is a
+/// no-op; other loaders share the same message shape so the security advice
+/// cannot drift between files.
+pub fn warn_if_group_or_world_readable(path: &Path, artifact: &str, reason: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{mode:o}"),
+                    "{artifact} has group/other read permissions — {reason}; chmod 600 recommended"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, artifact, reason);
+    }
+}
+
 /// Read just `log-level` from the config file.
 ///
 /// Logging has to be configured before [`load_config`] runs, because that
 /// function reports problems through `tracing` itself. Deserialising into a
 /// one-field struct skips building the proxy and rule lists, which is the
-/// expensive part of a real config.
+/// expensive part of a real config. An unreadable or unparseable file falls
+/// back to [`LogLevel::Info`] so a bad config never silences the daemon.
+#[must_use]
 pub fn load_log_level(path: &Path) -> LogLevel {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "kebab-case")]
@@ -25,23 +60,20 @@ pub fn load_log_level(path: &Path) -> LogLevel {
         .unwrap_or_default()
 }
 
+/// Read and deserialize the full configuration file.
+///
+/// On Unix, a file that is group- or world-readable triggers a warning,
+/// because configs commonly embed proxy passwords. Unknown keys are preserved
+/// rather than rejected, so subscription-style configs load unmodified.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read (missing, unreadable, or not
+/// UTF-8) or when its YAML does not deserialize into [`Config`] (malformed
+/// syntax, or a known key with an invalid value). Both errors include the
+/// path.
 pub fn load_config(path: &Path) -> Result<Config> {
-    // Warn if config file is world/group-readable. It typically contains
-    // proxy passwords, so recommend 0600 or 0400.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{mode:o}"),
-                    "config file has group/other read permissions — it may contain proxy passwords; chmod 600 recommended"
-                );
-            }
-        }
-    }
+    warn_if_group_or_world_readable(path, "config file", "it may contain proxy passwords");
 
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
@@ -52,7 +84,6 @@ pub fn load_config(path: &Path) -> Result<Config> {
 
 #[cfg(test)]
 mod tests {
-
     #[test]
     fn log_level_read_without_full_parse() {
         let dir = std::env::temp_dir().join(format!("clashx-loglevel-{}", std::process::id()));

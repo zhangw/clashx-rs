@@ -1,3 +1,20 @@
+//! CLI entry point for `clashx-rs`.
+//!
+//! Parses command-line arguments, initializes logging (daily rolling files for
+//! daemon runs, stderr for control commands), and dispatches to the daemon or
+//! the Unix-socket control client. Daemon data-plane code lives in
+//! [`daemon`]; this module stays a command router.
+
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )
+)]
+
 mod client;
 mod control;
 mod daemon;
@@ -7,13 +24,21 @@ mod probe;
 mod resources;
 mod retry;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use clashx_rs_config::LogLevel;
 use clashx_rs_sysproxy::SysProxy;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
+
+use clashx_rs_subscribe::{
+    add_subscription, expand_tilde, load_subscriptions, remove_subscription, save_subscriptions,
+    set_subscription_enabled, update_all_subscriptions, update_subscription_by_name, Subscription,
+    SubscriptionConfig,
+};
 
 use control::ControlRequest;
 
@@ -59,14 +84,15 @@ fn resolve_port(cli: &Cli) -> u16 {
 enum Command {
     /// Start the proxy daemon
     Run {
-        /// Run as a background daemon
+        /// Run as a background daemon (not yet implemented)
         #[arg(short = 'd', long)]
         daemon: bool,
         /// Override the selected proxy in a group at startup (GROUP=PROXY)
         #[arg(long = "select", value_name = "GROUP=PROXY")]
         selections: Vec<String>,
-        /// Path to the GeoIP mmdb database file
-        #[arg(long = "mmdb")]
+        // Path to the GeoIP mmdb database file. The explicit `help` keeps
+        // clap's output free of doc-comment backticks.
+        #[arg(long = "mmdb", help = "Path to the GeoIP mmdb database file")]
         mmdb: Option<String>,
         /// If mmdb is missing, download it in the background after proxy starts
         #[arg(long = "mmdb-auto-download")]
@@ -99,9 +125,9 @@ enum Command {
         /// Proxy name to activate
         proxy: String,
     },
-    /// Test reachability of a domain
+    /// Resolve rule-mode routing for a domain (DNS resolved; PROCESS-NAME rules skipped)
     Test {
-        /// Domain to test
+        /// Domain to resolve
         domain: String,
     },
     /// Manage system proxy settings
@@ -109,7 +135,8 @@ enum Command {
         #[command(subcommand)]
         action: SysproxyAction,
     },
-    /// Download the GeoIP mmdb database
+    // Download the GeoIP mmdb database.
+    #[command(about = "Download the GeoIP mmdb database")]
     MmdbDownload {
         /// SOCKS5 or HTTP proxy URL for the download
         #[arg(long)]
@@ -203,232 +230,291 @@ enum SysproxyAction {
     /// Restore the saved pre-enable settings; leave unrelated proxies unchanged
     #[cfg(target_os = "macos")]
     Restore,
-    /// Show system proxy status
+    /// Show system proxy status for web, secure web, and SOCKS
     Status,
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-        home.join(rest)
-    } else if path == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
-    } else {
-        PathBuf::from(path)
-    }
-}
-
-/// Install the log filter.
+/// Build the log filter.
 ///
 /// `RUST_LOG` wins when it is set — an explicit override should not be
 /// second-guessed. Otherwise the config file's `log-level` decides, so the
 /// setting is not silently inert.
-fn init_logging(config_path: &Path, quiet: bool) {
-    let filter = if quiet {
-        EnvFilter::new("off")
-    } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            let directive = match clashx_rs_config::load_log_level(config_path) {
-                LogLevel::Silent => "off",
-                LogLevel::Error => "error",
-                LogLevel::Warning => "warn",
-                LogLevel::Info => "info",
-                LogLevel::Debug => "debug",
-            };
-            EnvFilter::new(directive)
-        })
-    };
+fn log_filter(config_path: &Path, machine_readable: bool) -> EnvFilter {
+    if machine_readable {
+        return EnvFilter::new("off");
+    }
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let directive = match clashx_rs_config::load_log_level(config_path) {
+            LogLevel::Silent => "off",
+            LogLevel::Error => "error",
+            LogLevel::Warning => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+        };
+        EnvFilter::new(directive)
+    })
+}
+
+/// Install logging. Daemon runs write daily rolling files under
+/// [`paths::log_dir`] (7 retained); CLI commands keep using stderr.
+fn init_logging(
+    config_path: &Path,
+    machine_readable: bool,
+    file_logging: bool,
+) -> Option<WorkerGuard> {
+    if file_logging {
+        let log_dir = paths::log_dir();
+        if let Err(error) = std::fs::create_dir_all(&log_dir) {
+            eprintln!(
+                "warning: cannot create log directory {}: {error}; logging to stderr",
+                log_dir.display()
+            );
+        } else {
+            // `max_log_files` is enforced by the appender on every runtime
+            // rotation (and when opening): no separate startup scan.
+            match RollingFileAppender::builder()
+                .rotation(Rotation::DAILY)
+                .filename_prefix("clashx-rs")
+                .filename_suffix("log")
+                .max_log_files(paths::LOG_RETENTION_FILES)
+                .build(&log_dir)
+            {
+                Ok(appender) => {
+                    let (writer, guard) = tracing_appender::non_blocking(appender);
+                    tracing_subscriber::fmt()
+                        .with_env_filter(log_filter(config_path, machine_readable))
+                        .with_ansi(false)
+                        .with_writer(writer)
+                        .init();
+                    return Some(guard);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: cannot open rolling log in {}: {error}; logging to stderr",
+                        log_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(log_filter(config_path, machine_readable))
         .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
+    None
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = expand_tilde(&cli.config);
     let machine_status = matches!(&cli.command, Command::Status { json: true });
-    init_logging(&config_path, machine_status);
+    let daemon_mode = matches!(&cli.command, Command::Run { .. });
+    let _log_guard = init_logging(&config_path, machine_status, daemon_mode);
     let ctrl_port = resolve_port(&cli);
+    let port_override = cli.port;
 
-    match cli.command {
+    dispatch(cli.command, &config_path, ctrl_port, port_override)
+}
+
+/// Dispatch one already-parsed CLI command.
+///
+/// [`main`] owns argument parsing and logging setup; this function owns the
+/// command surface so each branch can be tested or extended independently.
+fn dispatch(
+    command: Command,
+    config_path: &Path,
+    ctrl_port: u16,
+    port_override: Option<u16>,
+) -> Result<()> {
+    match command {
         Command::Run {
             daemon,
             selections,
             mmdb,
             mmdb_auto_download,
             sysproxy,
-        } => {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .ok();
-            let mmdb_path = mmdb
-                .map(|p| expand_tilde(&p))
-                .unwrap_or_else(paths::default_mmdb_path);
-            if daemon {
-                daemon::start_background(
-                    &config_path,
-                    &selections,
-                    mmdb_path,
-                    mmdb_auto_download,
-                    sysproxy,
-                )?;
-            } else {
-                daemon::start_foreground(
-                    &config_path,
-                    &selections,
-                    mmdb_path,
-                    mmdb_auto_download,
-                    sysproxy,
-                )?;
-            }
-        }
+        } => run_daemon_command(
+            daemon,
+            selections,
+            mmdb,
+            mmdb_auto_download,
+            sysproxy,
+            config_path,
+            port_override,
+        ),
 
-        Command::Stop => client::send_command(ControlRequest::Stop, ctrl_port)?,
-        Command::Reload => client::send_command(ControlRequest::Reload, ctrl_port)?,
-        Command::Status { .. } => client::send_command(ControlRequest::Status, ctrl_port)?,
-        Command::Proxies => client::send_command(ControlRequest::Proxies, ctrl_port)?,
-        Command::Groups => client::send_command(ControlRequest::Groups, ctrl_port)?,
-        Command::Rules => client::send_command(ControlRequest::Rules, ctrl_port)?,
+        Command::Stop => client::send_command(ControlRequest::Stop, ctrl_port),
+        Command::Reload => client::send_command(ControlRequest::Reload, ctrl_port),
+        Command::Status { .. } => client::send_command(ControlRequest::Status, ctrl_port),
+        Command::Proxies => client::send_command(ControlRequest::Proxies, ctrl_port),
+        Command::Groups => client::send_command(ControlRequest::Groups, ctrl_port),
+        Command::Rules => client::send_command(ControlRequest::Rules, ctrl_port),
 
         Command::Switch { group, proxy } => {
-            client::send_command(ControlRequest::Switch { group, proxy }, ctrl_port)?
+            client::send_command(ControlRequest::Switch { group, proxy }, ctrl_port)
         }
 
         Command::Test { domain } => {
-            client::send_command(ControlRequest::Test { domain }, ctrl_port)?
+            client::send_command(ControlRequest::Test { domain }, ctrl_port)
         }
 
         Command::Latency {
             full,
             json: as_json,
-        } => {
-            let data = client::send_command_with_data(ControlRequest::Latency { full }, ctrl_port)?;
-            let results: Vec<latency::ProxyLatencyResult> =
-                serde_json::from_value(data).unwrap_or_default();
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&results).unwrap_or_default()
-                );
-            } else {
-                latency::print_table(&results, full);
-            }
-        }
+        } => run_latency(full, as_json, ctrl_port),
 
-        Command::Sysproxy { action } => match action {
-            SysproxyAction::On { bypass } => {
-                // Priority: CLI --bypass > config skip-proxy > built-in defaults
-                let bypass_rules = if !bypass.is_empty() {
-                    bypass
-                } else {
-                    clashx_rs_config::load_config(&config_path)
-                        .ok()
-                        .map(|c| c.skip_proxy)
-                        .unwrap_or_default()
-                };
-                SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path())
-                    .enable_with_bypass(&bypass_rules)?;
-                if bypass_rules.is_empty() {
-                    println!("system proxy enabled on port {ctrl_port} (default bypass rules)");
-                } else {
-                    println!(
-                        "system proxy enabled on port {ctrl_port} (bypass: {})",
-                        bypass_rules.join(", ")
-                    );
-                }
-            }
-            SysproxyAction::Off => {
-                SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).turn_off()?;
-                println!("system proxy disabled");
-            }
-            #[cfg(target_os = "macos")]
-            SysproxyAction::Restore => {
-                SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).disable()?;
-                println!("system proxy snapshot restoration completed");
-            }
-            SysproxyAction::Status => {
-                let status = SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).status()?;
-                println!("{status}");
-            }
-        },
+        Command::Sysproxy { action } => run_sysproxy(action, config_path, ctrl_port),
 
-        Command::MmdbDownload { proxy, url, output } => {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .ok();
-            let output_path = output
-                .map(|p| expand_tilde(&p))
-                .unwrap_or_else(paths::default_mmdb_path);
+        Command::MmdbDownload { proxy, url, output } => run_mmdb_download(proxy, url, output),
 
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
-                clashx_rs_geoip::download::download_mmdb(
-                    url.as_deref(),
-                    proxy.as_deref(),
-                    &output_path,
-                )
-                .await
-            })
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Command::Subscribe { action } => run_subscribe(action, ctrl_port),
 
-            println!("mmdb downloaded to {}", output_path.display());
-        }
-
-        Command::Subscribe { action } => {
-            run_subscribe(action, ctrl_port)?;
-        }
-
-        Command::Dns { action } => match action {
-            DnsAction::Flush { host } => {
-                let data = client::send_command_with_data(
-                    ControlRequest::DnsFlush { host: host.clone() },
-                    ctrl_port,
-                )?;
-                match host {
-                    Some(h) => {
-                        if data["hit"].as_bool().unwrap_or(false) {
-                            println!("invalidated dns cache entry for '{h}'");
-                        } else {
-                            println!("no dns cache entry for '{h}'");
-                        }
-                    }
-                    None => {
-                        let n = data["flushed"].as_u64().unwrap_or(0);
-                        println!("dns cache flushed ({n} entries)");
-                    }
-                }
-            }
-        },
+        Command::Dns { action } => run_dns(action, ctrl_port),
     }
+}
 
+/// Install the rustls crypto provider for commands that open TLS connections.
+fn install_crypto_provider() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+}
+
+/// Start the daemon in the foreground or background.
+fn run_daemon_command(
+    daemon: bool,
+    selections: Vec<String>,
+    mmdb: Option<String>,
+    mmdb_auto_download: bool,
+    sysproxy: bool,
+    config_path: &Path,
+    port_override: Option<u16>,
+) -> Result<()> {
+    install_crypto_provider();
+    let mmdb_path = mmdb.map_or_else(paths::default_mmdb_path, |p| expand_tilde(&p));
+    if daemon {
+        daemon::start_background(
+            config_path,
+            &selections,
+            mmdb_path,
+            mmdb_auto_download,
+            sysproxy,
+            port_override,
+        )
+    } else {
+        daemon::start_foreground(
+            config_path,
+            &selections,
+            mmdb_path,
+            mmdb_auto_download,
+            sysproxy,
+            port_override,
+        )
+    }
+}
+
+/// Query the daemon for latency results and print them as JSON or a table.
+fn run_latency(full: bool, as_json: bool, ctrl_port: u16) -> Result<()> {
+    let data = client::send_command_with_data(ControlRequest::Latency { full }, ctrl_port)?;
+    let results: Vec<latency::ProxyLatencyResult> =
+        serde_json::from_value(data).context("daemon returned an invalid latency payload")?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        latency::print_table(&results, full);
+    }
+    Ok(())
+}
+
+/// Enable, disable, restore, or inspect the system proxy.
+fn run_sysproxy(action: SysproxyAction, config_path: &Path, ctrl_port: u16) -> Result<()> {
+    match action {
+        SysproxyAction::On { bypass } => {
+            // Priority: CLI --bypass > config skip-proxy > built-in defaults.
+            let bypass_rules = if bypass.is_empty() {
+                clashx_rs_config::load_config(config_path)
+                    .ok()
+                    .map(|c| c.skip_proxy)
+                    .unwrap_or_default()
+            } else {
+                bypass
+            };
+            SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path())
+                .enable_with_bypass(&bypass_rules)?;
+            if bypass_rules.is_empty() {
+                println!("system proxy enabled on port {ctrl_port} (default bypass rules)");
+            } else {
+                println!(
+                    "system proxy enabled on port {ctrl_port} (bypass: {})",
+                    bypass_rules.join(", ")
+                );
+            }
+        }
+        SysproxyAction::Off => {
+            SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).turn_off()?;
+            println!("system proxy disabled");
+        }
+        #[cfg(target_os = "macos")]
+        SysproxyAction::Restore => {
+            SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).disable()?;
+            println!("system proxy snapshot restoration completed");
+        }
+        SysproxyAction::Status => {
+            let status = SysProxy::new(ctrl_port, paths::sysproxy_snapshot_path()).status()?;
+            println!("{status}");
+        }
+    }
+    Ok(())
+}
+
+/// Download a `GeoIP` mmdb file, optionally through a proxy.
+fn run_mmdb_download(
+    proxy: Option<String>,
+    url: Option<String>,
+    output: Option<String>,
+) -> Result<()> {
+    install_crypto_provider();
+    let output_path = output.map_or_else(paths::default_mmdb_path, |p| expand_tilde(&p));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        clashx_rs_geoip::download::download_mmdb(url.as_deref(), proxy.as_deref(), &output_path)
+            .await
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("mmdb downloaded to {}", output_path.display());
+    Ok(())
+}
+
+/// Flush the daemon's DNS caches, optionally for a single host.
+fn run_dns(action: DnsAction, ctrl_port: u16) -> Result<()> {
+    match action {
+        DnsAction::Flush { host } => {
+            let data = client::send_command_with_data(
+                ControlRequest::DnsFlush { host: host.clone() },
+                ctrl_port,
+            )?;
+            if let Some(h) = host {
+                if data["hit"].as_bool().unwrap_or(false) {
+                    println!("invalidated dns cache entry for '{h}'");
+                } else {
+                    println!("no dns cache entry for '{h}'");
+                }
+            } else {
+                let n = data["flushed"].as_u64().unwrap_or(0);
+                println!("dns cache flushed ({n} entries)");
+            }
+        }
+    }
     Ok(())
 }
 
 fn run_subscribe(action: SubscribeAction, ctrl_port: u16) -> Result<()> {
-    use clashx_rs_subscribe::{
-        add_subscription, load_subscriptions, remove_subscription, save_subscriptions,
-        update_all_subscriptions, update_subscription_by_name, Subscription, SubscriptionConfig,
-    };
-
-    // Shared load-set-save-print for the `enable`/`disable` subcommands.
-    fn apply_enabled(name: &str, enabled: bool) -> Result<()> {
-        use clashx_rs_subscribe::{
-            load_subscriptions, save_subscriptions, set_subscription_enabled,
-        };
-        let mut config = load_subscriptions()?;
-        set_subscription_enabled(&mut config, name, enabled)?;
-        save_subscriptions(&config)?;
-        println!(
-            "{} subscription '{name}'",
-            if enabled { "enabled" } else { "disabled" }
-        );
-        Ok(())
-    }
-
     match action {
         SubscribeAction::Add {
             name,
@@ -459,87 +545,115 @@ fn run_subscribe(action: SubscribeAction, ctrl_port: u16) -> Result<()> {
             println!("removed subscription '{name}'");
         }
 
-        SubscribeAction::Enable { name } => apply_enabled(&name, true)?,
+        SubscribeAction::Enable { name } => set_subscription_enabled_cli(&name, true)?,
 
-        SubscribeAction::Disable { name } => apply_enabled(&name, false)?,
+        SubscribeAction::Disable { name } => set_subscription_enabled_cli(&name, false)?,
 
-        SubscribeAction::List => {
-            let config: SubscriptionConfig = load_subscriptions()?;
-            if config.subscriptions.is_empty() {
-                println!("no subscriptions configured");
-            } else {
-                for sub in &config.subscriptions {
-                    let last = if sub.last_updated == 0 {
-                        "never".to_string()
-                    } else {
-                        format_unix_time(sub.last_updated)
-                    };
-                    println!("- {}", sub.name);
-                    println!("    url:          {}", redact_url_for_display(&sub.url));
-                    println!("    output:       {}", sub.output);
-                    println!("    interval:     {}s", sub.interval);
-                    println!("    enabled:      {}", sub.enabled);
-                    println!("    last_updated: {last}");
-                }
-            }
-        }
+        SubscribeAction::List => print_subscription_list()?,
 
-        SubscribeAction::Update { name } => {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .ok();
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            let mut config = load_subscriptions()?;
-            let had_success = rt.block_on(async {
-                let mut any_ok = false;
-                if let Some(target) = name.as_deref() {
-                    match update_subscription_by_name(&mut config, target).await {
-                        Ok(()) => {
-                            println!("updated subscription '{target}'");
-                            any_ok = true;
-                        }
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                        }
-                    }
-                } else {
-                    let results = update_all_subscriptions(&mut config).await;
-                    if results.is_empty() {
-                        if config.subscriptions.is_empty() {
-                            println!("no subscriptions configured");
-                        } else {
-                            println!("no enabled subscriptions to update");
-                        }
-                    }
-                    for (sub_name, result) in results {
-                        match result {
-                            Ok(()) => {
-                                println!("updated subscription '{sub_name}'");
-                                any_ok = true;
-                            }
-                            Err(e) => {
-                                eprintln!("error updating '{sub_name}': {e}");
-                            }
-                        }
-                    }
-                }
-                any_ok
-            });
-            save_subscriptions(&config)?;
-
-            if had_success {
-                // Best-effort reload — daemon may not be running.
-                match client::send_command_quiet(ControlRequest::Reload, ctrl_port) {
-                    Ok(()) => println!("daemon reloaded"),
-                    Err(_) => println!("daemon not running — reload skipped"),
-                }
-            }
-        }
+        SubscribeAction::Update { name } => update_subscriptions(name, ctrl_port)?,
     }
 
     Ok(())
+}
+
+/// Load-set-save helper for `subscribe enable` / `subscribe disable`.
+fn set_subscription_enabled_cli(name: &str, enabled: bool) -> Result<()> {
+    let mut config = load_subscriptions()?;
+    set_subscription_enabled(&mut config, name, enabled)?;
+    save_subscriptions(&config)?;
+    println!(
+        "{} subscription '{name}'",
+        if enabled { "enabled" } else { "disabled" }
+    );
+    Ok(())
+}
+
+/// Print every configured subscription, including the redacted URL and the
+/// last successful update time.
+fn print_subscription_list() -> Result<()> {
+    let config: SubscriptionConfig = load_subscriptions()?;
+    if config.subscriptions.is_empty() {
+        println!("no subscriptions configured");
+        return Ok(());
+    }
+    for sub in &config.subscriptions {
+        let last = if sub.last_updated == 0 {
+            "never".to_string()
+        } else {
+            format_unix_time(sub.last_updated)
+        };
+        println!("- {}", sub.name);
+        println!("    url:          {}", redact_url_for_display(&sub.url));
+        println!("    output:       {}", sub.output);
+        println!("    interval:     {}s", sub.interval);
+        println!("    enabled:      {}", sub.enabled);
+        println!("    last_updated: {last}");
+    }
+    Ok(())
+}
+
+/// Update one or all subscriptions and, on success, ask a running daemon to
+/// reload. A missing daemon is not an error for this command.
+fn update_subscriptions(name: Option<String>, ctrl_port: u16) -> Result<()> {
+    install_crypto_provider();
+    let mut config = load_subscriptions()?;
+    let had_success = block_on_subscription_update(&mut config, name.as_deref())?;
+    save_subscriptions(&config)?;
+
+    if had_success {
+        // Best-effort reload — the daemon may not be running.
+        match client::send_command_quiet(ControlRequest::Reload, ctrl_port) {
+            Ok(()) => println!("daemon reloaded"),
+            Err(_) => println!("daemon not running — reload skipped"),
+        }
+    }
+    Ok(())
+}
+
+/// Run the async update against a single subscription or all of them.
+fn block_on_subscription_update(
+    config: &mut SubscriptionConfig,
+    target: Option<&str>,
+) -> Result<bool> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    Ok(rt.block_on(async {
+        let mut any_ok = false;
+        if let Some(target) = target {
+            match update_subscription_by_name(config, target).await {
+                Ok(()) => {
+                    println!("updated subscription '{target}'");
+                    any_ok = true;
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                }
+            }
+        } else {
+            let results = update_all_subscriptions(config).await;
+            if results.is_empty() {
+                if config.subscriptions.is_empty() {
+                    println!("no subscriptions configured");
+                } else {
+                    println!("no enabled subscriptions to update");
+                }
+            }
+            for (sub_name, result) in results {
+                match result {
+                    Ok(()) => {
+                        println!("updated subscription '{sub_name}'");
+                        any_ok = true;
+                    }
+                    Err(e) => {
+                        eprintln!("error updating '{sub_name}': {e}");
+                    }
+                }
+            }
+        }
+        any_ok
+    }))
 }
 
 fn format_unix_time(ts: u64) -> String {
@@ -552,10 +666,10 @@ fn format_unix_time(ts: u64) -> String {
     let second = time_of_day % 60;
 
     // Civil-from-days algorithm (Howard Hinnant, public domain).
-    let z = days_since_epoch + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days_since_epoch + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -605,6 +719,28 @@ fn redact_url_for_display(url: &str) -> String {
 mod cli_tests {
     use super::{redact_url_for_display, Cli, Command};
     use clap::Parser;
+
+    #[test]
+    fn clap_help_keeps_the_original_mmdb_wording() {
+        use clap::CommandFactory;
+
+        let mut cmd = Cli::command();
+        let run = cmd.find_subcommand_mut("run").expect("run subcommand");
+        let run_help = run.render_long_help().to_string();
+        assert!(
+            run_help.contains("Path to the GeoIP mmdb database file"),
+            "unexpected run help: {run_help}"
+        );
+
+        let mmdb = cmd
+            .find_subcommand_mut("mmdb-download")
+            .expect("mmdb-download subcommand");
+        let mmdb_help = mmdb.render_long_help().to_string();
+        assert!(
+            mmdb_help.contains("Download the GeoIP mmdb database"),
+            "unexpected mmdb-download help: {mmdb_help}"
+        );
+    }
 
     #[test]
     fn machine_status_flag_is_parsed() {

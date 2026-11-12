@@ -1,6 +1,12 @@
-use anyhow::Result;
+//! Linux system proxy management.
+//!
+//! Linux has no portable, user-scoped system proxy store, so this module does
+//! not mutate anything: [`enable`] prints shell `export` lines and [`disable`]
+//! prints `unset` lines on stdout. That is the documented contract — the caller
+//! evaluates or sources the output. [`status`] only inspects the environment it
+//! inherited and compares it with the values [`enable`] would print for a port.
 
-pub fn enable(port: u16) -> Result<()> {
+pub(crate) fn enable(port: u16) {
     let proxy = format!("http://127.0.0.1:{port}");
     let socks = format!("socks5://127.0.0.1:{port}");
 
@@ -12,20 +18,22 @@ pub fn enable(port: u16) -> Result<()> {
     println!("export ALL_PROXY=\"{socks}\"");
     println!("export no_proxy=\"localhost,127.0.0.1,::1\"");
     println!("export NO_PROXY=\"localhost,127.0.0.1,::1\"");
-
-    Ok(())
 }
 
-pub fn disable() -> Result<()> {
+pub(crate) fn disable() {
     println!("unset http_proxy HTTP_PROXY");
     println!("unset https_proxy HTTPS_PROXY");
     println!("unset all_proxy ALL_PROXY");
     println!("unset no_proxy NO_PROXY");
-
-    Ok(())
 }
 
-pub fn status(port: u16) -> Result<String> {
+#[expect(
+    clippy::similar_names,
+    reason = "locals mirror the environment variable names they read"
+)]
+pub(crate) fn status(port: u16) -> String {
+    use std::fmt::Write as _;
+
     let expected_http = format!("http://127.0.0.1:{port}");
     let expected_socks = format!("socks5://127.0.0.1:{port}");
 
@@ -46,20 +54,25 @@ pub fn status(port: u16) -> Result<String> {
     let https_active = https_proxy == expected_http;
     let socks_active = all_proxy == expected_socks;
 
+    // Writing to a String cannot fail; the `let _` keeps the formatter calls
+    // concise without an unwrap in production code.
     let mut result = String::new();
-    result.push_str(&format!(
-        "http_proxy:  {} (expected: {expected_http})\n",
+    let _ = writeln!(
+        result,
+        "http_proxy:  {} (expected: {expected_http})",
         if http_active { "active" } else { "inactive" }
-    ));
-    result.push_str(&format!(
-        "https_proxy: {} (expected: {expected_http})\n",
+    );
+    let _ = writeln!(
+        result,
+        "https_proxy: {} (expected: {expected_http})",
         if https_active { "active" } else { "inactive" }
-    ));
-    result.push_str(&format!(
-        "all_proxy:   {} (expected: {expected_socks})\n",
+    );
+    let _ = writeln!(
+        result,
+        "all_proxy:   {} (expected: {expected_socks})",
         if socks_active { "active" } else { "inactive" }
-    ));
-    result.push_str(&format!("no_proxy:    {no_proxy}\n"));
+    );
+    let _ = writeln!(result, "no_proxy:    {no_proxy}");
 
-    Ok(result)
+    result
 }

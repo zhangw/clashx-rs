@@ -3,6 +3,9 @@
 //! Classification of config strings lives here (the config crate stays pure
 //! data). Unknown/unsupported entries are warned about and skipped, matching
 //! the repo's "ignore, don't reject" config style.
+//!
+//! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
+//! per-upstream semantics, TLS pinning, and timeout budgets.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -115,7 +118,7 @@ pub(crate) fn classify(entry: &str) -> Option<Upstream> {
     None
 }
 
-/// Classify a `https://host[:port]/path` DoH entry.
+/// Classify a `https://host[:port]/path` `DoH` entry.
 fn classify_doh(entry: &str) -> Option<Upstream> {
     let url = match reqwest::Url::parse(entry) {
         Ok(u) => u,
@@ -124,7 +127,7 @@ fn classify_doh(entry: &str) -> Option<Upstream> {
             return None;
         }
     };
-    let Some(host) = url.host_str().map(|s| s.to_string()) else {
+    let Some(host) = url.host_str().map(ToString::to_string) else {
         tracing::warn!(entry, "ignoring DoH entry without a host");
         return None;
     };
@@ -137,19 +140,19 @@ fn classify_doh(entry: &str) -> Option<Upstream> {
     }))
 }
 
-/// Classify a `tls://host[:port]` DoT entry (default port 853).
+/// Classify a `tls://host[:port]` `DoT` entry (default port 853).
 fn classify_dot(rest: &str) -> Option<Upstream> {
     let (host, port) = match rest.split_once(':') {
         // Split on the FIRST ':' — IPv6 literals (bracketed or bare) fail the
         // port parse below and are skipped with a warning; v1 supports IPv4
         // addresses and domain names as DoT hosts only.
-        Some((h, p)) if !h.is_empty() => match p.parse::<u16>() {
-            Ok(port) => (h.trim_matches(['[', ']']).to_string(), port),
-            Err(_) => {
+        Some((h, p)) if !h.is_empty() => {
+            let Ok(port) = p.parse::<u16>() else {
                 tracing::warn!(entry = %format!("tls://{rest}"), "ignoring DoT entry with invalid port");
                 return None;
-            }
-        },
+            };
+            (h.trim_matches(['[', ']']).to_string(), port)
+        }
         _ => (rest.trim_matches(['[', ']']).to_string(), 853),
     };
     if host.is_empty() {
@@ -278,18 +281,17 @@ impl DohUpstream {
     /// Test constructor: plain-HTTP URL against a loopback mock with a
     /// literal-IP host, so bootstrap short-circuits.
     #[cfg(test)]
-    fn new_for_test(url: &str, port: u16) -> Self {
-        let url = reqwest::Url::parse(url).unwrap();
+    fn new_for_test(url: &str, host: &str, port: u16) -> Self {
         Self {
             url: url.to_string(),
-            host: url.host_str().unwrap().to_string(),
+            host: host.to_string(),
             port,
             state: tokio::sync::RwLock::new(None),
         }
     }
 }
 
-/// Build the per-upstream DoH client pinned to `ip`.
+/// Build the per-upstream `DoH` client pinned to `ip`.
 fn build_doh_client(host: &str, ip: IpAddr, port: u16) -> Result<reqwest::Client> {
     let client = reqwest::Client::builder()
         // CRITICAL: never let DoH honor HTTP(S)_PROXY env vars — with
@@ -318,8 +320,12 @@ pub struct DotUpstream {
     tls_config: Arc<rustls::ClientConfig>,
 }
 
-/// One webpki-roots client config shared by every DoT upstream — the configs
+/// One webpki-roots client config shared by every `DoT` upstream — the configs
 /// never differ, so don't rebuild the root store per upstream.
+#[expect(
+    clippy::expect_used,
+    reason = "ring always supports the default rustls protocol versions"
+)]
 fn dot_tls_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     Arc::clone(CONFIG.get_or_init(|| {
@@ -610,7 +616,7 @@ mod tests {
     async fn doh_exchange_over_loopback_http() {
         let server = spawn_mock_doh_server([192, 0, 2, 55]).await;
         let url = format!("http://127.0.0.1:{}/dns-query", server.port());
-        let doh = DohUpstream::new_for_test(&url, server.port());
+        let doh = DohUpstream::new_for_test(&url, "127.0.0.1", server.port());
         let bootstrap = Bootstrap::system_only_for_test();
         let result = doh.exchange("example.com", &bootstrap).await.unwrap();
         assert_eq!(result.ip, "192.0.2.55".parse::<IpAddr>().unwrap());
@@ -638,7 +644,7 @@ mod tests {
             }
         });
         let url = format!("http://127.0.0.1:{}/dns-query", addr.port());
-        let doh = DohUpstream::new_for_test(&url, addr.port());
+        let doh = DohUpstream::new_for_test(&url, "127.0.0.1", addr.port());
         let bootstrap = Bootstrap::system_only_for_test();
         let err = doh.exchange("example.com", &bootstrap).await.unwrap_err();
         assert!(err.to_string().contains("500"));

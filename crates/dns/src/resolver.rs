@@ -1,5 +1,8 @@
 //! Top-level resolver: hosts mappings, cache/singleflight, upstream race,
 //! system fallback — the mihomo-compatible DNS semantics entry point.
+//!
+//! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
+//! resolution order and the fail-open rules.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -32,12 +35,9 @@ impl Hosts {
         let mut exact = HashMap::new();
         let mut wildcard = Vec::new();
         for (key, value) in map {
-            let ip = match value.trim().parse::<IpAddr>() {
-                Ok(ip) => ip,
-                Err(_) => {
-                    tracing::warn!(key = %key, value = %value, "hosts value is not an IP literal; skipping entry");
-                    continue;
-                }
+            let Ok(ip) = value.trim().parse::<IpAddr>() else {
+                tracing::warn!(key = %key, value = %value, "hosts value is not an IP literal; skipping entry");
+                continue;
             };
             let key = key.to_ascii_lowercase();
             if let Some(suffix) = key.strip_prefix("*.") {
@@ -84,6 +84,19 @@ enum ResolverMode {
     },
 }
 
+/// Clears the singleflight in-flight slot when the leader finishes, returns
+/// early, or is cancelled, so waiters can proceed.
+struct LeaderGuard<'a> {
+    cache: &'a DnsCache,
+    host: &'a str,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        self.cache.complete_inflight(self.host);
+    }
+}
+
 /// The daemon-facing DNS resolver. One instance resolves target hostnames
 /// (rules + DIRECT), a second instance resolves proxy server addresses via
 /// `proxy-server-nameserver`.
@@ -92,7 +105,25 @@ pub struct Resolver {
     cache: DnsCache,
 }
 
+impl std::fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mode = match &self.mode {
+            ResolverMode::System => "system",
+            ResolverMode::Custom { .. } => "custom",
+        };
+        f.debug_struct("Resolver")
+            .field("mode", &mode)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Resolver {
+    /// Create a resolver that delegates every lookup to the system resolver.
+    ///
+    /// This is the mode used when `dns.enable` is `false` or no `dns:` block
+    /// is configured. Hosts mappings do not apply, and results are cached with
+    /// `SYSTEM_RESOLVE_TTL_SECS`.
+    #[must_use]
     pub fn system() -> Self {
         Self {
             mode: ResolverMode::System,
@@ -120,6 +151,13 @@ impl Resolver {
     /// Custom-mode flow: IP-literal short-circuit → hosts hit (never cached)
     /// → cache/singleflight → upstream race (first success wins) → system
     /// fallback (fail-open, warn) → cache write (TTL clamp / negative cache).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `host` is not an IP literal and cannot be
+    /// resolved: every configured nameserver failed or timed out *and* the
+    /// fail-open system fallback also failed, or a recent negative cache entry
+    /// for `host` is still suppressing lookups. IP literals always succeed.
     pub async fn resolve(&self, host: &str) -> Result<IpAddr> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(ip);
@@ -208,15 +246,6 @@ impl Resolver {
 
         // We're the leader. Ensure the in-flight slot is cleared even on
         // panic/early-return so waiters can proceed.
-        struct LeaderGuard<'a> {
-            cache: &'a DnsCache,
-            host: &'a str,
-        }
-        impl Drop for LeaderGuard<'_> {
-            fn drop(&mut self) {
-                self.cache.complete_inflight(self.host);
-            }
-        }
         let _leader = LeaderGuard {
             cache: &self.cache,
             host,
@@ -254,16 +283,10 @@ async fn race_group(
     group: &Arc<[Upstream]>,
     bootstrap: &Arc<Bootstrap>,
 ) -> Result<DnsResult> {
-    if group.is_empty() {
+    let Some(window) = group.iter().map(Upstream::participant_timeout).max() else {
         anyhow::bail!("no nameservers configured");
-    }
-
-    let window = group
-        .iter()
-        .map(|u| u.participant_timeout())
-        .max()
-        .expect("group is non-empty")
-        + Duration::from_millis(100);
+    };
+    let window = window + Duration::from_millis(100);
 
     // Spawned attempts must be 'static — each carries an Arc clone of the
     // group and indexes into it rather than borrowing the upstream.

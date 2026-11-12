@@ -1,39 +1,88 @@
+//! Parsed rule entries shared by the config and rule crates.
+//!
+//! [`RuleEntry::parse`] accepts the comma-separated Clash rule syntax used in
+//! the top-level `rules` list. Matching semantics live in the
+//! `clashx-rs-rule` crate; this module only parses, normalizes, and renders
+//! entries.
+
 use std::fmt;
 use std::net::IpAddr;
 
+/// One parsed Clash rule.
+///
+/// The variant names mirror the rule type in the config (for example
+/// `DOMAIN-SUFFIX`); the rule crate evaluates variants in config order and
+/// routes to the first match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleEntry {
+    /// `DOMAIN`: match one exact hostname.
     Domain {
+        /// Hostname to match, lowercased at parse time.
         domain: String,
+        /// Rule target: a proxy or group name, `DIRECT`, or `REJECT`.
         target: String,
     },
+    /// `DOMAIN-SUFFIX`: match a hostname suffix on a dot boundary.
     DomainSuffix {
+        /// Suffix to match, lowercased at parse time. It matches `example.com`
+        /// itself and `a.example.com`, but not `aexample.com`.
         suffix: String,
+        /// Rule target: a proxy or group name, `DIRECT`, or `REJECT`.
         target: String,
     },
+    /// `DOMAIN-KEYWORD`: match a substring of the hostname.
     DomainKeyword {
+        /// Substring to search for, lowercased at parse time and compared
+        /// against the lowercased hostname.
         keyword: String,
+        /// Rule target: a proxy or group name, `DIRECT`, or `REJECT`.
         target: String,
     },
+    /// `IP-CIDR` or `IP-CIDR6`: match a resolved address against a CIDR block.
     IpCidr {
+        /// Network address parsed from the rule's CIDR.
         ip: IpAddr,
+        /// Prefix length in bits; the rule crate compares only these leading
+        /// bits of the address.
         prefix_len: u8,
+        /// Rule target: a proxy or group name, `DIRECT`, or `REJECT`.
         target: String,
     },
+    /// `PROCESS-NAME`: match the exact name of the originating process.
     ProcessName {
+        /// Process name to match. Lookup is best-effort and comparatively
+        /// expensive.
         name: String,
+        /// Rule target: a proxy or group name, `DIRECT`, or `REJECT`.
         target: String,
     },
+    /// `GEOIP`: match the resolved address's country in the loaded database.
     GeoIp {
+        /// Country code to match, uppercased at parse time. Without a loaded
+        /// database the rule never matches.
         country: String,
+        /// Rule target: a proxy or group name, `DIRECT`, or `REJECT`.
         target: String,
     },
+    /// `MATCH`: catch-all rule that always matches.
     Match {
+        /// Rule target: a proxy or group name, `DIRECT`, or `REJECT`.
         target: String,
     },
 }
 
 impl RuleEntry {
+    /// Parse one rule line.
+    ///
+    /// The type is matched case-sensitively; domains and keywords are
+    /// lowercased, and `GEOIP` countries are uppercased. Leading and trailing
+    /// whitespace around every component is trimmed. `IP-CIDR` and
+    /// `IP-CIDR6` share one variant and must carry an `address/prefix` CIDR.
+    ///
+    /// Returns `None` for an unrecognized type or a malformed entry (missing
+    /// components, unparsable address, or unparsable prefix), which callers
+    /// log and skip.
+    #[must_use]
     pub fn parse(raw: &str) -> Option<RuleEntry> {
         let parts: Vec<&str> = raw.splitn(3, ',').collect();
         match parts.as_slice() {
@@ -75,11 +124,18 @@ impl RuleEntry {
         }
     }
 
-    /// Short description of the rule for logging (e.g., "GEOIP,CN", "DOMAIN-SUFFIX,google.com").
+    /// Short description of the rule for logging (e.g., `GEOIP,CN`,
+    /// `DOMAIN-SUFFIX,google.com`).
+    ///
+    /// Returns the same text as [`RuleEntry::display`], allocated as a
+    /// `String` for log fields.
+    #[must_use]
     pub fn description(&self) -> String {
         self.display().to_string()
     }
 
+    /// Rule target: a proxy or group name, `DIRECT`, or `REJECT`.
+    #[must_use]
     pub fn target(&self) -> &str {
         match self {
             RuleEntry::Domain { target, .. }
@@ -92,6 +148,11 @@ impl RuleEntry {
         }
     }
 
+    /// Borrowed renderer for the rule's normalized description.
+    ///
+    /// The output names the rule type and its match pattern but omits the
+    /// target, for example `DOMAIN-SUFFIX,example.com`.
+    #[must_use]
     pub fn display(&self) -> RuleDisplay<'_> {
         RuleDisplay(self)
     }
@@ -109,6 +170,8 @@ impl RuleEntry {
     }
 }
 
+/// Borrowed [`RuleEntry`] renderer returned by [`RuleEntry::display`].
+#[derive(Debug)]
 pub struct RuleDisplay<'a>(&'a RuleEntry);
 
 impl fmt::Display for RuleDisplay<'_> {

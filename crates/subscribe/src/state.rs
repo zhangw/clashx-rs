@@ -1,3 +1,12 @@
+//! Loading and saving the on-disk subscription list.
+//!
+//! The state file is `~/.config/clashx-rs/subscriptions.yaml`. Writes go
+//! through a sibling `.yaml.tmp` file that is renamed into place, and on Unix
+//! the file is restricted to `0600` because subscription URLs may embed tokens.
+//! A missing file is not an error: it loads as an empty configuration. Older
+//! files that omit `interval`, `last_updated`, or `enabled` keep their
+//! documented defaults.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -5,31 +14,38 @@ use anyhow::{Context, Result};
 use crate::SubscriptionConfig;
 
 /// Path to the subscriptions.yaml file.
+#[must_use]
 pub fn subscriptions_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     home.join(".config/clashx-rs/subscriptions.yaml")
 }
 
 /// Load subscriptions from disk. Returns an empty config if the file doesn't exist.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read, or when its
+/// contents are not valid YAML for [`SubscriptionConfig`].
 pub fn load_subscriptions() -> Result<SubscriptionConfig> {
     load_subscriptions_from(&subscriptions_path())
 }
 
+/// Load subscriptions from an explicit path.
+///
+/// A missing file yields [`SubscriptionConfig::default`]. On Unix a warning is
+/// logged when the file is readable by group or others, since it may contain
+/// subscription tokens.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read, or when its
+/// contents are not valid YAML for [`SubscriptionConfig`].
 pub fn load_subscriptions_from(path: &Path) -> Result<SubscriptionConfig> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{mode:o}"),
-                    "subscriptions file has group/other read permissions — it may contain subscription tokens; chmod 600 recommended"
-                );
-            }
-        }
-    }
+    clashx_rs_config::warn_if_group_or_world_readable(
+        path,
+        "subscriptions file",
+        "it may contain subscription tokens",
+    );
 
     let content = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -47,61 +63,33 @@ pub fn load_subscriptions_from(path: &Path) -> Result<SubscriptionConfig> {
 }
 
 /// Save subscriptions to disk atomically (.tmp + rename).
+///
+/// # Errors
+///
+/// Returns an error when the parent directory cannot be created, the config
+/// cannot be serialized, the temp file cannot be written, the rename fails, or
+/// the final permissions cannot be set.
 pub fn save_subscriptions(config: &SubscriptionConfig) -> Result<()> {
     save_subscriptions_to(&subscriptions_path(), config)
 }
 
+/// Save subscriptions to an explicit path, atomically.
+///
+/// The parent directory is created if needed; on Unix the resulting file is
+/// restricted to `0600`.
+///
+/// # Errors
+///
+/// Returns an error when the parent directory cannot be created, the config
+/// cannot be serialized, the temp file cannot be written, the rename fails, or
+/// the final permissions cannot be set.
 pub fn save_subscriptions_to(path: &Path, config: &SubscriptionConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let yaml = serde_yaml::to_string(config).context("failed to serialize subscriptions")?;
-    let tmp = path.with_extension("yaml.tmp");
-    write_restricted_file(&tmp, yaml.as_bytes())
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("failed to rename {} -> {}", tmp.display(), path.display())
-    })?;
-    set_owner_only_permissions(path)
-        .with_context(|| format!("failed to secure {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_restricted_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_restricted_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+    crate::fsutil::write_atomic_sync(path, yaml.as_bytes())
 }
 
 #[cfg(test)]
@@ -126,7 +114,7 @@ mod tests {
             name: "wgetcloud".into(),
             url: "https://example.com/sub".into(),
             output: "~/.config/clash/wgetcloud.yaml".into(),
-            interval: 864000,
+            interval: 864_000,
             last_updated: 1_700_000_000,
             enabled: false,
         });
@@ -135,7 +123,7 @@ mod tests {
         let loaded = load_subscriptions_from(&path).unwrap();
         assert_eq!(loaded.subscriptions.len(), 1);
         assert_eq!(loaded.subscriptions[0].name, "wgetcloud");
-        assert_eq!(loaded.subscriptions[0].interval, 864000);
+        assert_eq!(loaded.subscriptions[0].interval, 864_000);
         assert_eq!(loaded.subscriptions[0].last_updated, 1_700_000_000);
         assert!(!loaded.subscriptions[0].enabled);
     }
@@ -146,12 +134,12 @@ mod tests {
         let path = dir.path().join("subs.yaml");
         std::fs::write(
             &path,
-            r#"
+            r"
 subscriptions:
   - name: foo
     url: https://example.com/sub
     output: /tmp/foo.yaml
-"#,
+",
         )
         .unwrap();
         let loaded = load_subscriptions_from(&path).unwrap();

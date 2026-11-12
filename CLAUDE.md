@@ -13,18 +13,18 @@ cargo run -- run --config <path>     # Run daemon with config
 cargo run -- status                  # CLI client commands
 ```
 
-**Pre-commit hooks**: `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` run automatically before every `git commit` via Claude Code hooks (`.claude/settings.json`). Commits are blocked if either check fails.
+**Pre-commit hooks**: `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` run automatically before every `git commit` via Claude Code hooks (`.claude/settings.json`). Commits are blocked if either check fails.
 
 ## Architecture
 
-Single binary, two modes (daemon + CLI client) in a Cargo workspace: `crates/` holds config, proxy, rule, dns, and sysproxy; `src/` is the CLI entry that routes to daemon or client mode.
+Single binary, two modes (daemon + CLI client) in a Cargo workspace: `crates/` holds config, proxy, rule, dns, geoip, subscribe, and sysproxy; `src/` is the CLI entry that routes to daemon or client mode.
 
 ## Key Design Decisions
 
 - **Mixed-port detection**: peek first byte — `0x05` = SOCKS5, else HTTP proxy
 - **Trojan protocol**: SHA-224(password) hex-encoded as auth, TLS with configurable SNI, no server response before relay
 - **Rule matching**: DOMAIN-SUFFIX uses dot-boundary check (`foo.com` matches `a.foo.com` but not `afoo.com`)
-- **Control socket**: `~/.config/clashx-rs/clashx-rs.sock` with JSON request-response
+- **Control socket**: `~/.config/clashx-rs/clashx-rs-<port>.sock` with JSON request-response (keyed by the resolved port)
 - **DNS resolution**: mihomo-compatible `dns:` block drives rule/DIRECT resolution and proxy-server dialing (UDP/DoH/DoT race, bootstrap, hosts, fail-open system fallback) — see `docs/dns-resolver-design.md`
 - **System proxy**: opt-in via `--sysproxy` / `sysproxy: true`, off by default. When on, the pre-existing settings are snapshotted to `sysproxy-snapshot.json` and restored on exit (SIGTERM/SIGINT both reach the cleanup path); a service whose proxy points at another port is left alone
 - **Config compatibility**: unknown YAML fields are ignored, not rejected — subscription provider configs work unmodified
@@ -36,5 +36,6 @@ Trojan and SOCKS5 outbound only. These are the protocols actively used in the us
 ## Runtime Paths
 
 - Config: `~/.config/clashx-rs/config.yaml` (default) or `--config <path>`
-- PID file: `~/.config/clashx-rs/clashx-rs.pid`
-- Control socket: `~/.config/clashx-rs/clashx-rs.sock`
+- Port: resolves from `--port`, then config `mixed-port`, then the default `7890`
+- PID file: `~/.config/clashx-rs/clashx-rs-<port>.pid`
+- Control socket: `~/.config/clashx-rs/clashx-rs-<port>.sock`

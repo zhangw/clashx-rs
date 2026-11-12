@@ -1,4 +1,7 @@
 //! TTL-based DNS cache with negative caching and in-flight coalescing.
+//!
+//! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
+//! TTL clamp and negative-cache rules this implements.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -14,7 +17,7 @@ const MAX_CACHE_SIZE: usize = 4096;
 const MIN_TTL_SECS: u32 = 10;
 
 /// Maximum TTL we'll honor from a DNS response. Protects against a hostile
-/// upstream returning huge TTLs (e.g., u32::MAX) that would pin cache entries.
+/// upstream returning huge TTLs (e.g., `u32::MAX`) that would pin cache entries.
 const MAX_TTL_SECS: u32 = 3600;
 
 /// Negative cache TTL — how long to remember a DNS lookup failure.
@@ -72,9 +75,12 @@ impl DnsCache {
     /// Singleflight claim: if no one is resolving `host`, mark it as in-flight
     /// and return Ok. If another task is already resolving it, return Err with
     /// the Notify to wait on. Caller must call `complete_inflight` on Ok path.
-    pub(crate) fn claim_inflight(&self, host: &str) -> std::result::Result<(), Arc<Notify>> {
+    pub(crate) fn claim_inflight(&self, host: &str) -> Result<(), Arc<Notify>> {
         let key = normalize(host);
-        let mut guard = self.inflight.lock().expect("inflight mutex poisoned");
+        let mut guard = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = guard.get(key.as_ref()) {
             return Err(Arc::clone(existing));
         }
@@ -84,7 +90,10 @@ impl DnsCache {
 
     pub(crate) fn complete_inflight(&self, host: &str) {
         let key = normalize(host);
-        let mut guard = self.inflight.lock().expect("inflight mutex poisoned");
+        let mut guard = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(notify) = guard.remove(key.as_ref()) {
             notify.notify_waiters();
         }
@@ -95,7 +104,7 @@ impl DnsCache {
         self.insert(
             host,
             CacheValue::Resolved(ip),
-            Duration::from_secs(ttl as u64),
+            Duration::from_secs(u64::from(ttl)),
         )
         .await;
     }

@@ -48,7 +48,7 @@ dist/clashx-rs-<程序版本>-<UTC构建时间>-macos<主版本>-arm64.pkg.sha25
 | 启动或节点恢复失败 | 尝试恢复旧程序、管理脚本及原运行状态；安装器报告失败 |
 | 安装残缺或路径不匹配 | 停止安装，不覆盖原配置；需先检查现有部署 |
 
-同一个包支持首次安装和升级，也支持本仓库原有的完整 LaunchAgent 安装。升级不会将包内初始配置覆盖到目标机；配置调整仍在目标机单独进行。后续登录或崩溃重启时，默认节点仍由 LaunchAgent 决定。
+同一个包支持首次安装和升级，也支持本仓库原有的完整 LaunchAgent 安装。升级不会重写现有 LaunchAgent；仅当软 FD 上限低于 8192 时提高该值（硬上限更低时以硬上限为准）。升级不会将包内初始配置覆盖到目标机；配置调整仍在目标机单独进行。后续登录或崩溃重启时，默认节点仍由 LaunchAgent 决定。
 
 代理以目标桌面用户身份运行，不作为 root 常驻服务。只在该用户登录后自启动。首次安装优先使用目标机已有配置（须包含普通文件 `config.yaml`），否则采用包内配置；LaunchAgent 来自安装包。已有配置引用的数据库等资源须在目标机可用。包内配置可能允许局域网无认证访问，目标机须使用适合其网络的配置。
 
@@ -78,7 +78,7 @@ curl --proxy http://127.0.0.1:7890 --max-time 20 -o /dev/null -w '%{http_code}\n
 "$HOME/Library/Application Support/clashx-rs/local-service.sh" start
 ```
 
-日志位于 `~/Library/Logs/clashx-rs/`，安装记录位于 `~/Library/Application Support/clashx-rs/package-info.txt`。永久禁用/重新启用自启动见 [服务管理](local-macos-deployment.md)。
+日志位于 `~/Library/Logs/clashx-rs/`：运行时日志为 `clashx-rs.<日期>.log`，按天轮转并自动保留最近 7 份；`stdout.log` / `stderr.log` 仅用于启动打印和早期/panic 输出。安装记录位于 `~/Library/Application Support/clashx-rs/package-info.txt`。永久禁用/重新启用自启动见 [服务管理](local-macos-deployment.md)。
 
 安装失败时查看安装器日志（“窗口 → 安装器日志”）及服务日志。普通失败会自动尝试回滚。首次安装回滚使用 `sysproxy restore` 恢复原代理设置；无快照或 daemon 已恢复时不修改设置，恢复失败则保留快照及程序以便重试。若提示回滚不完整，备份保留在 `~/Library/Application Support/clashx-rs/.pkg-install/`，检查恢复前不要删除该目录或强行重装。断电或强制终止安装也可能留下此目录。
 

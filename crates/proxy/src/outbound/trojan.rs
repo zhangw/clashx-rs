@@ -1,3 +1,16 @@
+//! The Trojan outbound connector.
+//!
+//! Opens a TLS connection to a Trojan server and sends a request header made
+//! of the hex-encoded SHA-224 of the password followed by the CONNECT command
+//! and the target address. Certificates are verified against the bundled
+//! webpki roots unless `skip_cert_verify` is enabled, which disables all
+//! validation and logs a warning once per TLS configuration. TLS connectors
+//! are cached per verification mode and shared for the process lifetime.
+//!
+//! The server is dialed by its pre-resolved IP when the daemon supplies one,
+//! but SNI always uses the configured server domain or `sni` override so
+//! certificate verification still matches the configured identity.
+
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
@@ -93,7 +106,7 @@ fn build_tls_config(skip_cert_verify: bool) -> ClientConfig {
 static CONNECTOR_VERIFY: OnceLock<TlsConnector> = OnceLock::new();
 static CONNECTOR_SKIP: OnceLock<TlsConnector> = OnceLock::new();
 
-fn get_connector(skip_cert_verify: bool) -> &'static TlsConnector {
+fn tls_connector(skip_cert_verify: bool) -> &'static TlsConnector {
     if skip_cert_verify {
         CONNECTOR_SKIP.get_or_init(|| {
             let config = build_tls_config(true);
@@ -171,6 +184,14 @@ fn build_trojan_header(password: &str, target: &TargetAddr) -> Result<Vec<u8>> {
 /// unaffected.
 ///
 /// Both the TCP connect and the TLS handshake must complete within [`PROXY_CONNECT_TIMEOUT`].
+///
+/// # Errors
+///
+/// Returns an error when the SNI host is not a valid TLS server name, when the
+/// TCP dial or TLS handshake fails (certificate validation, protocol mismatch,
+/// reset), when either does not complete within [`PROXY_CONNECT_TIMEOUT`],
+/// when a domain target exceeds the 255-byte Trojan address limit, or when
+/// writing the request header fails.
 pub async fn connect(
     server: &str,
     port: u16,
@@ -180,7 +201,7 @@ pub async fn connect(
     target: &TargetAddr,
     resolved_server_ip: Option<IpAddr>,
 ) -> Result<OutboundStream> {
-    let connector = get_connector(skip_cert_verify).clone();
+    let connector = tls_connector(skip_cert_verify).clone();
 
     let sni_host = sni.unwrap_or(server);
     let server_name = ServerName::try_from(sni_host.to_string())?;
@@ -267,7 +288,7 @@ mod tests {
         assert_eq!(header.len(), 68);
     }
 
-    /// Verify that `get_connector` returns the same cached instance on repeated calls.
+    /// Verify that `tls_connector` returns the same cached instance on repeated calls.
     #[test]
     fn connector_is_cached() {
         // Ensure the process-level crypto provider is installed (no-op if already done).
@@ -276,12 +297,12 @@ mod tests {
             .ok();
 
         // Each call must return the same static reference (pointer equality).
-        let a = get_connector(false) as *const TlsConnector;
-        let b = get_connector(false) as *const TlsConnector;
+        let a = std::ptr::from_ref(tls_connector(false));
+        let b = std::ptr::from_ref(tls_connector(false));
         assert_eq!(a, b, "normal-verify connector should be the same instance");
 
-        let c = get_connector(true) as *const TlsConnector;
-        let d = get_connector(true) as *const TlsConnector;
+        let c = std::ptr::from_ref(tls_connector(true));
+        let d = std::ptr::from_ref(tls_connector(true));
         assert_eq!(c, d, "skip-verify connector should be the same instance");
 
         // The two modes must produce distinct connectors.

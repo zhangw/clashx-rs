@@ -1,3 +1,9 @@
+//! Latency probes and table rendering for `clashx-rs latency`.
+//!
+//! Measures either TCP reachability or a full HTTP round trip through each
+//! proxy, then renders the result as a table or JSON. Probe failures are
+//! reported per node rather than aborting the whole run.
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -50,7 +56,7 @@ pub struct ProxyLatencyResult {
 }
 
 /// Measure raw TCP connect latency to all proxies.
-/// Uses TcpStream::connect(SocketAddr) — raw TCP, bypasses all HTTP/SOCKS proxy settings.
+/// Uses `TcpStream::connect(SocketAddr)` — raw TCP, bypasses all HTTP/SOCKS proxy settings.
 pub async fn measure_tcp(proxies: &[Proxy]) -> Vec<ProxyLatencyResult> {
     let _global = global_latency_lock().acquire().await;
     let deadline = Instant::now() + TCP_DEADLINE;
@@ -131,7 +137,7 @@ pub async fn measure_full(
     let mut set = JoinSet::new();
     let target = dummy_target();
 
-    for proxy in proxies.into_iter() {
+    for proxy in proxies {
         let (name, proxy_type) = match proxy_info(&proxy) {
             Some((n, _, _, t)) => (n.to_string(), t.to_string()),
             None => continue,
@@ -190,7 +196,6 @@ async fn probe_through_tunnel(stream: &mut OutboundStream) -> Result<()> {
         match stream {
             OutboundStream::Tcp(s) => probe_io(s).await,
             OutboundStream::Tls(s) => probe_io(s.as_mut()).await,
-            OutboundStream::Rejected => bail!("rejected"),
         }
     })
     .await
@@ -222,22 +227,22 @@ fn display_len(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+fn latency_val(ms: u64) -> String {
+    format!("{ms}ms")
+}
+
+fn latency_display_len(ms: u64) -> usize {
+    if ms == 0 {
+        3
+    } else {
+        (ms.ilog10() as usize) + 3
+    }
+}
+
 pub fn print_table(results: &[ProxyLatencyResult], full: bool) {
     if results.is_empty() {
         println!("no proxies to measure");
         return;
-    }
-
-    fn latency_val(ms: u64) -> String {
-        format!("{}ms", ms)
-    }
-
-    fn latency_display_len(ms: u64) -> usize {
-        if ms == 0 {
-            3
-        } else {
-            (ms.ilog10() as usize) + 3
-        }
     }
 
     let mut name_width = display_len("NAME");
@@ -544,12 +549,5 @@ mod tests {
         probe_through_tunnel(&mut stream)
             .await
             .expect("probe should succeed when bytes flow back");
-    }
-
-    #[tokio::test]
-    async fn probe_rejects_rejected_stream() {
-        let mut stream = OutboundStream::Rejected;
-        let err = probe_through_tunnel(&mut stream).await.err().unwrap();
-        assert!(format!("{err:#}").contains("rejected"));
     }
 }

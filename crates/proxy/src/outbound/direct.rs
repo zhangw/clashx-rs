@@ -1,3 +1,10 @@
+//! The DIRECT outbound connector.
+//!
+//! [`connect`] dials the target itself, preferring a caller-supplied
+//! pre-resolved IP over the system resolver. Resolution policy lives in the
+//! daemon and `crates/dns`; this module only opens the TCP connection and
+//! applies the shared socket options.
+
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context, Result};
@@ -14,6 +21,15 @@ use crate::timeout::CONNECT_TIMEOUT;
 /// `TcpStream::connect((host, port))` invokes getaddrinfo which on systems
 /// with the proxy set as system proxy can route DNS queries back through
 /// clashx-rs itself, creating recursive lookups and significant latency.
+///
+/// `TCP_NODELAY` and keepalive use the same settings as the proxy dials. The
+/// returned stream is owned by the caller.
+///
+/// # Errors
+///
+/// Returns an error when the connection is refused, unreachable, or reset, when
+/// hostname resolution fails in the fallback path, or when the attempt does not
+/// complete within [`CONNECT_TIMEOUT`].
 pub async fn connect(target: &TargetAddr, resolved_ip: Option<IpAddr>) -> Result<OutboundStream> {
     let connect = async {
         match (resolved_ip, target) {
@@ -30,11 +46,15 @@ pub async fn connect(target: &TargetAddr, resolved_ip: Option<IpAddr>) -> Result
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect)
         .await
         .context("direct connect timed out")??;
+    let peer = format!("{}:{}", target.host_string(), target.port());
+    crate::socket::configure_tcp(&stream, &peer);
     Ok(OutboundStream::Tcp(stream))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
     use tokio::net::TcpListener;
 
@@ -45,10 +65,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        let target = TargetAddr::Ip(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-            addr.port(),
-        );
+        let target = TargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port());
         let result = connect(&target, None).await.unwrap();
         assert!(matches!(result, OutboundStream::Tcp(_)));
     }
@@ -67,12 +84,9 @@ mod tests {
             "this.domain.does.not.exist.invalid".to_string(),
             addr.port(),
         );
-        let result = connect(
-            &target,
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
-        )
-        .await
-        .unwrap();
+        let result = connect(&target, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+            .await
+            .unwrap();
         assert!(matches!(result, OutboundStream::Tcp(_)));
     }
 }

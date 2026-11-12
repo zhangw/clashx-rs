@@ -1,9 +1,19 @@
+//! Integration tests for rule parsing and evaluation across DOMAIN-SUFFIX,
+//! IP-CIDR, PROCESS-NAME, GEOIP, and MATCH rules.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unchecked_time_subtraction
+)]
+
 use std::net::IpAddr;
 
 use clashx_rs_rule::{MatchInput, RuleEngine};
 
 fn make_engine(rules: &[&str]) -> RuleEngine {
-    let raw: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
+    let raw: Vec<String> = rules.iter().map(ToString::to_string).collect();
     RuleEngine::new(&raw, None)
 }
 

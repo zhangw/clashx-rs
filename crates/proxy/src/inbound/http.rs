@@ -1,3 +1,16 @@
+//! The HTTP proxy inbound handshake.
+//!
+//! Handles both `CONNECT host:port` and plain absolute-form proxy requests.
+//! Plain requests are rebuilt for the origin: the request line is rewritten to
+//! origin-form, hop-by-hop headers (including those nominated by `Connection`)
+//! are stripped, and `Connection: close` is added so a connection cannot carry
+//! a second request that bypassed rule matching. Upgrade requests keep their
+//! `Connection`/`Upgrade` pair instead.
+//!
+//! Request lines are limited to 8 KiB and requests to 128 header lines. Bytes
+//! read past the header block are returned as initial data so pipelined bodies
+//! and early TLS handshakes are not lost.
+
 use anyhow::{bail, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -10,11 +23,11 @@ use super::TargetAddr;
 const MAX_LINE_LEN: usize = 8 * 1024;
 
 /// Max number of header lines in one HTTP request.
-/// Real browsers send 20-40; 128 gives headroom without permitting DoS.
+/// Real browsers send 20-40; 128 gives headroom without permitting `DoS`.
 const MAX_HEADERS: usize = 128;
 
-/// Read a single line, bailing if it exceeds MAX_LINE_LEN bytes.
-/// Guards against slowloris-style unbounded-line DoS attacks.
+/// Read a single line, bailing if it exceeds `MAX_LINE_LEN` bytes.
+/// Guards against slowloris-style unbounded-line `DoS` attacks.
 async fn read_bounded_line<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     out: &mut String,
@@ -147,6 +160,16 @@ fn parse_host_port_default(s: &str, default_port: u16) -> Result<TargetAddr> {
 /// Supports:
 /// - `CONNECT host:port HTTP/1.x` — returns `(target, None)` after sending 200.
 /// - Plain HTTP methods (`GET`, `POST`, etc.) — returns `(target, Some(raw_request_bytes))`.
+///
+/// # Errors
+///
+/// Returns an error when the request line or a header is not valid UTF-8,
+/// exceeds the 8 KiB line limit, or the request carries more than 128 headers;
+/// when the request line is empty; when a CONNECT target is missing a port or
+/// has an invalid port or IPv6 address; when a plain request has neither an
+/// absolute-form request target nor a `Host` header to route by; or when the
+/// underlying socket fails while reading the request or writing the CONNECT
+/// response.
 pub async fn handshake(stream: &mut TcpStream) -> Result<(TargetAddr, Option<Vec<u8>>)> {
     let mut reader = BufReader::new(stream);
 
@@ -368,7 +391,7 @@ mod tests {
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 80);
             }
-            other => panic!("expected Domain, got {other:?}"),
+            other @ TargetAddr::Ip(..) => panic!("expected Domain, got {other:?}"),
         }
 
         // The request line must have been rewritten to origin-form.
@@ -393,7 +416,7 @@ mod tests {
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 443);
             }
-            other => panic!("expected Domain, got {other:?}"),
+            other @ TargetAddr::Ip(..) => panic!("expected Domain, got {other:?}"),
         }
     }
 
@@ -416,7 +439,7 @@ mod tests {
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 443);
             }
-            other => panic!("expected Domain, got {other:?}"),
+            other @ TargetAddr::Ip(..) => panic!("expected Domain, got {other:?}"),
         }
 
         let data = initial_data.expect("expected initial_data for CONNECT with early data");
@@ -434,7 +457,7 @@ mod tests {
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 443);
             }
-            other => panic!("expected Domain, got {other:?}"),
+            other @ TargetAddr::Ip(..) => panic!("expected Domain, got {other:?}"),
         }
     }
 
@@ -450,7 +473,7 @@ mod tests {
                 assert_eq!(ip, "192.0.2.10".parse::<IpAddr>().unwrap());
                 assert_eq!(port, 9100);
             }
-            other => panic!("expected Ip, got {other:?}"),
+            other @ TargetAddr::Domain(..) => panic!("expected Ip, got {other:?}"),
         }
 
         assert!(
@@ -532,7 +555,7 @@ mod tests {
                 assert_eq!(ip, "192.0.2.10".parse::<IpAddr>().unwrap());
                 assert_eq!(port, 9100);
             }
-            other => panic!("expected the URI authority, got {other:?}"),
+            other @ TargetAddr::Domain(..) => panic!("expected the URI authority, got {other:?}"),
         }
 
         assert!(data.starts_with("GET /health HTTP/1.1\r\n"), "{data:?}");
@@ -578,7 +601,7 @@ mod tests {
                 assert_eq!(ip, "1.2.3.4".parse::<IpAddr>().unwrap());
                 assert_eq!(port, 80);
             }
-            other => panic!("expected Ip, got {other:?}"),
+            other @ TargetAddr::Domain(..) => panic!("expected Ip, got {other:?}"),
         }
     }
 }

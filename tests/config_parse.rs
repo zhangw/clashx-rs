@@ -1,10 +1,20 @@
+//! Integration tests for Clash-compatible YAML parsing: defaults, proxies,
+//! groups, rules, DNS keys, and unknown-field tolerance.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unchecked_time_subtraction
+)]
+
 use std::io::Write;
 
 use clashx_rs_config::load_config;
 use clashx_rs_config::types::{GroupType, Proxy};
 use tempfile::NamedTempFile;
 
-const REALISTIC_CONFIG: &str = r#"
+const REALISTIC_CONFIG: &str = r"
 mixed-port: 7890
 allow-lan: false
 mode: rule
@@ -59,7 +69,7 @@ rules:
   - IP-CIDR,172.16.0.0/16,corpnet
   - PROCESS-NAME,FortiClientAgent,direct-only
   - MATCH,DIRECT
-"#;
+";
 
 fn write_temp_config(content: &str) -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("failed to create temp file");
@@ -86,7 +96,7 @@ fn parse_realistic_config_proxies() {
         assert_eq!(p.sni, Some("sg.example.com".to_string()));
         assert!(!p.skip_cert_verify);
     } else {
-        panic!("expected Proxy::Trojan at index 0, got {:?}", trojan);
+        panic!("expected Proxy::Trojan at index 0, got {trojan:?}");
     }
 
     // --- SOCKS5 ---
@@ -98,15 +108,14 @@ fn parse_realistic_config_proxies() {
         assert_eq!(p.username, Some("alice".to_string()));
         assert_eq!(p.password, Some("hunter2".to_string()));
     } else {
-        panic!("expected Proxy::Socks5 at index 1, got {:?}", socks5);
+        panic!("expected Proxy::Socks5 at index 1, got {socks5:?}");
     }
 
     // --- VMess -> Unknown ---
     let vmess = &config.proxies[2];
     assert!(
         matches!(vmess, Proxy::Unknown),
-        "expected Proxy::Unknown for vmess, got {:?}",
-        vmess
+        "expected Proxy::Unknown for vmess, got {vmess:?}"
     );
     assert_eq!(vmess.name(), None);
 }

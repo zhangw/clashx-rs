@@ -2,6 +2,8 @@
 //!
 //! Hand-rolled to avoid a DNS-crate dependency; supports exactly what the
 //! resolver needs — single-question queries and A/AAAA answer extraction.
+//! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
+//! wire-format scope.
 
 use std::net::IpAddr;
 
