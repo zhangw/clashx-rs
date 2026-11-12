@@ -164,7 +164,8 @@ in the review document; blanket `#![allow(...)]` is reserved for test modules.
 
 - **LOG-1 (MUST)** Libraries and the daemon use `tracing` only. `println!` /
   `eprintln!` are allowed only for user-facing CLI output in `src/main.rs` and
-  `src/client.rs`.
+  `src/client.rs`, plus the Linux sysproxy helper whose documented contract is
+  to print shell `export` lines.
 - **LOG-2 (MUST)** Use structured fields (`host = %host`, `err = %e`) and a
   lowercase message without a trailing period. Do not interpolate values into
   the message string.
@@ -229,6 +230,15 @@ in the review document; blanket `#![allow(...)]` is reserved for test modules.
   methods.
 - **API-7 (SHOULD)** Implement `Debug` for every public type. Derive `Clone`,
   `Copy`, `PartialEq` only when the semantics are real.
+- **API-8 (MUST)** Remove `#[allow]`/`#[expect]` attributes that are no longer
+  needed. A suppression is not documentation; if the reason is not obvious,
+  it belongs in a `reason = "..."` string or a nearby comment.
+- **API-9 (MAY)** Numeric `as` casts are acceptable only where the value is
+  provably bounded by the wire format or the platform constant at the cast
+  site. At trust boundaries and for sizes that cross protocols, use
+  `u16::try_from(..)` (or the matching `TryFrom`) and handle the error. The
+  workspace lint set allows the pedantic cast lints; reviewers still check
+  each new cast against this rule.
 
 ## 11. Comments (`CMT`)
 
@@ -278,7 +288,8 @@ cargo deny check advisories
 
 - Use `#[expect(lint, reason = "...")]` on the smallest item that needs it.
 - Test modules may opt out of panic-on-failure lints with a module-level
-  `#![allow(clippy::unwrap_used, clippy::expect_used)]`.
+  `#![allow(clippy::unwrap_used, clippy::expect_used,
+  clippy::unchecked_time_subtraction)]`.
 - Any exception that survives two review rounds is either promoted to a rule
   amendment or removed; do not accumulate permanent ignores.
 
