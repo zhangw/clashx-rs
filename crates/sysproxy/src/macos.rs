@@ -30,7 +30,7 @@ fn run_networksetup(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn get_active_services() -> Result<Vec<String>> {
+fn active_services() -> Result<Vec<String>> {
     let stdout = run_networksetup(&["-listallnetworkservices"])?;
 
     let services = stdout
@@ -205,7 +205,7 @@ fn save_snapshot(path: &Path, snapshot: &Snapshot) -> Result<()> {
 }
 
 pub fn enable(port: u16, bypass: &[String], snapshot_path: &Path) -> Result<()> {
-    let services = get_active_services()?;
+    let services = active_services()?;
     let host = "127.0.0.1";
     let port_str = port.to_string();
 
@@ -321,7 +321,7 @@ pub fn disable(port: u16, snapshot_path: &Path) -> Result<()> {
 /// system proxy, not for the previous one back, so any snapshot we were holding
 /// is dropped along with it.
 pub fn turn_off(snapshot_path: &Path) -> Result<()> {
-    let services = get_active_services()?;
+    let services = active_services()?;
     for service in &services {
         turn_off_service(service)
             .with_context(|| format!("failed to disable system proxy for {service}"))?;
@@ -331,7 +331,7 @@ pub fn turn_off(snapshot_path: &Path) -> Result<()> {
 }
 
 pub fn status() -> Result<String> {
-    let services = get_active_services()?;
+    let services = active_services()?;
     let mut result = String::new();
 
     for service in &services {
@@ -494,9 +494,9 @@ mod tests {
     }
 
     #[test]
-    fn get_active_services_returns_list() {
+    fn active_services_returns_list() {
         // On macOS, this should return at least one service
-        let services = get_active_services().unwrap();
+        let services = active_services().unwrap();
         assert!(
             !services.is_empty(),
             "expected at least one network service"

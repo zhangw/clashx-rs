@@ -106,7 +106,7 @@ fn build_tls_config(skip_cert_verify: bool) -> ClientConfig {
 static CONNECTOR_VERIFY: OnceLock<TlsConnector> = OnceLock::new();
 static CONNECTOR_SKIP: OnceLock<TlsConnector> = OnceLock::new();
 
-fn get_connector(skip_cert_verify: bool) -> &'static TlsConnector {
+fn tls_connector(skip_cert_verify: bool) -> &'static TlsConnector {
     if skip_cert_verify {
         CONNECTOR_SKIP.get_or_init(|| {
             let config = build_tls_config(true);
@@ -201,7 +201,7 @@ pub async fn connect(
     target: &TargetAddr,
     resolved_server_ip: Option<IpAddr>,
 ) -> Result<OutboundStream> {
-    let connector = get_connector(skip_cert_verify).clone();
+    let connector = tls_connector(skip_cert_verify).clone();
 
     let sni_host = sni.unwrap_or(server);
     let server_name = ServerName::try_from(sni_host.to_string())?;
@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(header.len(), 68);
     }
 
-    /// Verify that `get_connector` returns the same cached instance on repeated calls.
+    /// Verify that `tls_connector` returns the same cached instance on repeated calls.
     #[test]
     fn connector_is_cached() {
         // Ensure the process-level crypto provider is installed (no-op if already done).
@@ -297,12 +297,12 @@ mod tests {
             .ok();
 
         // Each call must return the same static reference (pointer equality).
-        let a = get_connector(false) as *const TlsConnector;
-        let b = get_connector(false) as *const TlsConnector;
+        let a = tls_connector(false) as *const TlsConnector;
+        let b = tls_connector(false) as *const TlsConnector;
         assert_eq!(a, b, "normal-verify connector should be the same instance");
 
-        let c = get_connector(true) as *const TlsConnector;
-        let d = get_connector(true) as *const TlsConnector;
+        let c = tls_connector(true) as *const TlsConnector;
+        let d = tls_connector(true) as *const TlsConnector;
         assert_eq!(c, d, "skip-verify connector should be the same instance");
 
         // The two modes must produce distinct connectors.

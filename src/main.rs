@@ -238,8 +238,8 @@ fn expand_tilde(path: &str) -> PathBuf {
 /// `RUST_LOG` wins when it is set — an explicit override should not be
 /// second-guessed. Otherwise the config file's `log-level` decides, so the
 /// setting is not silently inert.
-fn log_filter(config_path: &Path, quiet: bool) -> EnvFilter {
-    if quiet {
+fn log_filter(config_path: &Path, machine_readable: bool) -> EnvFilter {
+    if machine_readable {
         return EnvFilter::new("off");
     }
     EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -256,7 +256,11 @@ fn log_filter(config_path: &Path, quiet: bool) -> EnvFilter {
 
 /// Install logging. Daemon runs write daily rolling files under
 /// [`paths::log_dir`] (7 retained); CLI commands keep using stderr.
-fn init_logging(config_path: &Path, quiet: bool, file_logging: bool) -> Option<WorkerGuard> {
+fn init_logging(
+    config_path: &Path,
+    machine_readable: bool,
+    file_logging: bool,
+) -> Option<WorkerGuard> {
     if file_logging {
         let log_dir = paths::log_dir();
         if let Err(error) = std::fs::create_dir_all(&log_dir) {
@@ -277,7 +281,7 @@ fn init_logging(config_path: &Path, quiet: bool, file_logging: bool) -> Option<W
                 Ok(appender) => {
                     let (writer, guard) = tracing_appender::non_blocking(appender);
                     tracing_subscriber::fmt()
-                        .with_env_filter(log_filter(config_path, quiet))
+                        .with_env_filter(log_filter(config_path, machine_readable))
                         .with_ansi(false)
                         .with_writer(writer)
                         .init();
@@ -294,7 +298,7 @@ fn init_logging(config_path: &Path, quiet: bool, file_logging: bool) -> Option<W
     }
 
     tracing_subscriber::fmt()
-        .with_env_filter(log_filter(config_path, quiet))
+        .with_env_filter(log_filter(config_path, machine_readable))
         .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
