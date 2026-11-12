@@ -477,7 +477,7 @@ fn parse_cidr(entry: &str) -> Option<(IpAddr, u8)> {
 /// SIGTERM is what `kill`, a logout and a shutdown send by default, so it has
 /// to reach the same cleanup path as Ctrl-C — otherwise the process dies with
 /// the system proxy still pointing at a port nothing is listening on.
-async fn wait_for_shutdown_signal() -> &'static str {
+async fn wait_for_shutdown_signal() -> Result<&'static str> {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut sigterm = match signal(SignalKind::terminate()) {
@@ -486,15 +486,15 @@ async fn wait_for_shutdown_signal() -> &'static str {
             tracing::warn!("failed to install SIGTERM handler: {e}");
             tokio::signal::ctrl_c()
                 .await
-                .expect("failed to listen for ctrl-c");
-            return "SIGINT";
+                .context("failed to listen for ctrl-c")?;
+            return Ok("SIGINT");
         }
     };
 
-    tokio::select! {
+    Ok(tokio::select! {
         _ = tokio::signal::ctrl_c() => "SIGINT",
         _ = sigterm.recv() => "SIGTERM",
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -784,7 +784,7 @@ async fn run_daemon(
         subscription_auto_update(sub_state).await;
     });
 
-    let signal = wait_for_shutdown_signal().await;
+    let signal = wait_for_shutdown_signal().await?;
     println!("\nshutting down ({signal})");
 
     if sysproxy_enabled {

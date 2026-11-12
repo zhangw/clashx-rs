@@ -77,7 +77,10 @@ impl DnsCache {
     /// the Notify to wait on. Caller must call `complete_inflight` on Ok path.
     pub(crate) fn claim_inflight(&self, host: &str) -> std::result::Result<(), Arc<Notify>> {
         let key = normalize(host);
-        let mut guard = self.inflight.lock().expect("inflight mutex poisoned");
+        let mut guard = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = guard.get(key.as_ref()) {
             return Err(Arc::clone(existing));
         }
@@ -87,7 +90,10 @@ impl DnsCache {
 
     pub(crate) fn complete_inflight(&self, host: &str) {
         let key = normalize(host);
-        let mut guard = self.inflight.lock().expect("inflight mutex poisoned");
+        let mut guard = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(notify) = guard.remove(key.as_ref()) {
             notify.notify_waiters();
         }

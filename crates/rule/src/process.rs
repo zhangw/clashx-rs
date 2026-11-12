@@ -224,7 +224,11 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
             };
             let kind = SocketInfoKind::from(sock.psi.soi_kind);
             let local_port = match kind {
+                // SAFETY: `kind` is derived from `sock.psi.soi_kind`, so the
+                // active union member is `pri_tcp` and the kernel initialized
+                // `insi_lport` for a TCP socket.
                 SocketInfoKind::Tcp => unsafe { sock.psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport },
+                // SAFETY: same discriminant guarantee for the `pri_in` member.
                 SocketInfoKind::In => unsafe { sock.psi.soi_proto.pri_in.insi_lport },
                 _ => continue,
             };

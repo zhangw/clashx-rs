@@ -277,7 +277,7 @@ async fn race_group(
         .iter()
         .map(|u| u.participant_timeout())
         .max()
-        .expect("group is non-empty")
+        .ok_or_else(|| anyhow::anyhow!("nameserver group is empty"))?
         + Duration::from_millis(100);
 
     // Spawned attempts must be 'static — each carries an Arc clone of the

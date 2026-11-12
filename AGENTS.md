@@ -96,6 +96,7 @@ Current implemented shape:
 
 ## Working Rules
 
+- Follow `docs/rust-style-guide.md`; style reviews are posted under `docs/reviews/`.
 - Prefer small, reviewable changes.
 - Do not add dependencies unless clearly justified.
 - Reuse existing crate boundaries and patterns before inventing new abstractions.
@@ -107,6 +108,7 @@ Current implemented shape:
 For code changes, run at least:
 
 ```bash
+cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```

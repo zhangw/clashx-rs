@@ -81,8 +81,11 @@ async fn connect_with_timeout(
         let mut stream = crate::outbound::dial_server(server, port, resolved_server_ip).await?;
 
         // --- Method negotiation ---
-        let have_creds = username.is_some() && password.is_some();
-        if have_creds {
+        let creds = match (username, password) {
+            (Some(user), Some(pass)) => Some((user, pass)),
+            _ => None,
+        };
+        if creds.is_some() {
             // Offer NO_AUTH and USERNAME/PASSWORD
             stream
                 .write_all(&[SOCKS5_VERSION, 0x02, NO_AUTH, USERNAME_PASSWORD_AUTH])
@@ -106,9 +109,12 @@ async fn connect_with_timeout(
                 // No authentication required — proceed to CONNECT request.
             }
             USERNAME_PASSWORD_AUTH => {
-                // RFC 1929 sub-negotiation
-                let user = username.unwrap(); // safe: have_creds guarantees Some
-                let pass = password.unwrap();
+                // RFC 1929 sub-negotiation. A server may select this method
+                // even when we only offered NO_AUTH, so fail explicitly if no
+                // credentials are configured instead of unwrapping.
+                let Some((user, pass)) = creds else {
+                    bail!("SOCKS5 server requested username/password but no credentials are configured");
+                };
 
                 if user.len() > 255 {
                     bail!("SOCKS5 username exceeds 255 bytes");
