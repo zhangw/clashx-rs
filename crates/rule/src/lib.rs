@@ -19,6 +19,16 @@
 //! keeps requesting data. PROCESS-NAME matching is best-effort; see [`process`]
 //! for the snapshot window.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )
+)]
+
 pub mod process;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -155,12 +165,6 @@ impl RuleEngine {
         &self.process_lookup
     }
 
-    /// Whether the config has any GEOIP or IP-CIDR rules that need a resolved IP.
-    #[must_use]
-    pub fn needs_resolved_ip(&self) -> bool {
-        self.has_ip_rules
-    }
-
     /// Whether a `GeoIP` database is currently loaded.
     #[must_use]
     pub fn has_geoip_db(&self) -> bool {
@@ -169,10 +173,10 @@ impl RuleEngine {
 
     /// Return the target of the first rule that matches `input`.
     ///
-    /// This pass performs no DNS or process lookups: rules that need data
-    /// absent from `input` cannot match. Use [`RuleEngine::evaluate_from`] when
-    /// a PROCESS-NAME or IP rule may require a lookup. The returned target
-    /// borrows from the engine.
+    /// This eager pass performs no DNS or process lookups: rules that need
+    /// data absent from `input` cannot match. It is used by tests; production
+    /// routing uses [`RuleEngine::evaluate_from`] with the daemon resolver.
+    /// The returned target borrows from the engine.
     #[must_use]
     pub fn evaluate<'a>(&'a self, input: &MatchInput<'_>) -> Option<&'a str> {
         self.find_match(input).map(RuleEntry::target)
@@ -193,6 +197,11 @@ impl RuleEngine {
     ///
     /// Rules that cheaply match on existing input (host / already-known IP /
     /// already-known process) still run and can short-circuit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `start` is greater than the number of rules. Callers pass
+    /// the `resume_from` value returned by a previous call.
     #[must_use]
     pub fn evaluate_from<'a>(&'a self, input: &MatchInput<'_>, start: usize) -> EvalStep<'a> {
         let host_lower = host_lower(input);
@@ -363,13 +372,6 @@ fn ipv6_in_cidr(addr: Ipv6Addr, network: Ipv6Addr, prefix_len: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     fn make_engine(rules: &[&str]) -> RuleEngine {

@@ -196,7 +196,6 @@ async fn probe_through_tunnel(stream: &mut OutboundStream) -> Result<()> {
         match stream {
             OutboundStream::Tcp(s) => probe_io(s).await,
             OutboundStream::Tls(s) => probe_io(s.as_mut()).await,
-            OutboundStream::Rejected => bail!("rejected"),
         }
     })
     .await
@@ -326,13 +325,6 @@ fn pad(current: usize, target: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     fn trojan_proxy() -> Proxy {
@@ -557,12 +549,5 @@ mod tests {
         probe_through_tunnel(&mut stream)
             .await
             .expect("probe should succeed when bytes flow back");
-    }
-
-    #[tokio::test]
-    async fn probe_rejects_rejected_stream() {
-        let mut stream = OutboundStream::Rejected;
-        let err = probe_through_tunnel(&mut stream).await.err().unwrap();
-        assert!(format!("{err:#}").contains("rejected"));
     }
 }

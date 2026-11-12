@@ -46,27 +46,13 @@ pub async fn connect(target: &TargetAddr, resolved_ip: Option<IpAddr>) -> Result
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect)
         .await
         .context("direct connect timed out")??;
-    let _ = stream.set_nodelay(true);
-    if let Err(e) = crate::socket::set_keepalive(
-        &stream,
-        crate::timeout::KEEPALIVE_IDLE,
-        crate::timeout::KEEPALIVE_INTERVAL,
-        crate::timeout::KEEPALIVE_COUNT,
-    ) {
-        tracing::debug!(error = %e, "could not enable TCP keepalive");
-    }
+    let peer = format!("{}:{}", target.host_string(), target.port());
+    crate::socket::configure_tcp(&stream, &peer);
     Ok(OutboundStream::Tcp(stream))
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use std::net::Ipv4Addr;
 
     use super::*;

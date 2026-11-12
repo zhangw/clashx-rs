@@ -24,9 +24,19 @@
 //! [DNS resolver design](../../../docs/dns-resolver-design.md); rule matching
 //! lives in the `clashx-rs-rule` crate.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )
+)]
+
 pub mod parse;
 pub mod rule;
 pub mod types;
 
-pub use parse::{load_config, load_log_level};
+pub use parse::{load_config, load_log_level, warn_if_group_or_world_readable};
 pub use types::{Config, LogLevel};

@@ -231,13 +231,6 @@ pub async fn connect(
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use std::net::{IpAddr, Ipv4Addr};
 
     use sha2::{Digest, Sha224};

@@ -43,25 +43,37 @@ fn active_services() -> Result<Vec<String>> {
     Ok(services)
 }
 
-/// Default bypass entries applied when no explicit bypass list is provided.
-const DEFAULT_BYPASS: &[&str] = &[
-    "192.168.0.0/16",
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "127.0.0.1",
-    "localhost",
-    "*.local",
-];
-
 /// `networksetup` sentinel that clears a service's bypass list.
 const CLEAR_BYPASS: &str = "Empty";
 
-/// The `-set…` / `-set…state` command pair for each kind of proxy, in the same
-/// order as the fields of [`ServiceState`].
-const PROXY_KINDS: [(&str, &str); 3] = [
-    ("-setwebproxy", "-setwebproxystate"),
-    ("-setsecurewebproxy", "-setsecurewebproxystate"),
-    ("-setsocksfirewallproxy", "-setsocksfirewallproxystate"),
+/// The `networksetup` command triple for each kind of proxy, in the same order
+/// as the fields of [`ServiceState`].
+struct ProxyKind {
+    set: &'static str,
+    set_state: &'static str,
+    get: &'static str,
+    label: &'static str,
+}
+
+const PROXY_KINDS: [ProxyKind; 3] = [
+    ProxyKind {
+        set: "-setwebproxy",
+        set_state: "-setwebproxystate",
+        get: "-getwebproxy",
+        label: "web proxy",
+    },
+    ProxyKind {
+        set: "-setsecurewebproxy",
+        set_state: "-setsecurewebproxystate",
+        get: "-getsecurewebproxy",
+        label: "secure web proxy",
+    },
+    ProxyKind {
+        set: "-setsocksfirewallproxy",
+        set_state: "-setsocksfirewallproxystate",
+        get: "-getsocksfirewallproxy",
+        label: "socks proxy",
+    },
 ];
 
 /// One proxy setting (web, secure web or SOCKS) as `networksetup` reports it.
@@ -144,23 +156,23 @@ fn parse_bypass(out: &str) -> Vec<String> {
 fn read_service_state(service: &str) -> Result<ServiceState> {
     Ok(ServiceState {
         service: service.to_string(),
-        web: parse_proxy_entry(&run_networksetup(&["-getwebproxy", service])?),
-        secure: parse_proxy_entry(&run_networksetup(&["-getsecurewebproxy", service])?),
-        socks: parse_proxy_entry(&run_networksetup(&["-getsocksfirewallproxy", service])?),
+        web: parse_proxy_entry(&run_networksetup(&[PROXY_KINDS[0].get, service])?),
+        secure: parse_proxy_entry(&run_networksetup(&[PROXY_KINDS[1].get, service])?),
+        socks: parse_proxy_entry(&run_networksetup(&[PROXY_KINDS[2].get, service])?),
         bypass: parse_bypass(&run_networksetup(&["-getproxybypassdomains", service])?),
     })
 }
 
 fn restore_service(state: &ServiceState) -> Result<()> {
     let entries = [&state.web, &state.secure, &state.socks];
-    for ((set, set_state), entry) in PROXY_KINDS.iter().zip(entries) {
+    for (kind, entry) in PROXY_KINDS.iter().zip(entries) {
         // `-set…proxy` also switches the proxy on, so the state command has to
         // follow it to reinstate a server that was configured but disabled.
         if !entry.server.is_empty() {
-            run_networksetup(&[set, &state.service, &entry.server, &entry.port])?;
+            run_networksetup(&[kind.set, &state.service, &entry.server, &entry.port])?;
         }
         let on_off = if entry.enabled { "on" } else { "off" };
-        run_networksetup(&[set_state, &state.service, on_off])?;
+        run_networksetup(&[kind.set_state, &state.service, on_off])?;
     }
 
     let mut args = vec!["-setproxybypassdomains", &state.service];
@@ -176,8 +188,8 @@ fn restore_service(state: &ServiceState) -> Result<()> {
 /// Switch every proxy kind off for one service, regardless of what it points
 /// at. Only for an explicit "turn it off" request, never for cleanup.
 fn turn_off_service(service: &str) -> Result<()> {
-    for (_, set_state) in PROXY_KINDS {
-        run_networksetup(&[set_state, service, "off"])?;
+    for kind in PROXY_KINDS {
+        run_networksetup(&[kind.set_state, service, "off"])?;
     }
     Ok(())
 }
@@ -204,13 +216,13 @@ fn save_snapshot(path: &Path, snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 
-pub fn enable(port: u16, bypass: &[String], snapshot_path: &Path) -> Result<()> {
+pub(crate) fn enable(port: u16, bypass: &[String], snapshot_path: &Path) -> Result<()> {
     let services = active_services()?;
     let host = "127.0.0.1";
     let port_str = port.to_string();
 
     let bypass_list: Vec<&str> = if bypass.is_empty() {
-        DEFAULT_BYPASS.to_vec()
+        crate::DEFAULT_BYPASS.to_vec()
     } else {
         bypass.iter().map(String::as_str).collect()
     };
@@ -240,14 +252,10 @@ pub fn enable(port: u16, bypass: &[String], snapshot_path: &Path) -> Result<()> 
     }
 
     for service in &services {
-        run_networksetup(&["-setwebproxy", service, host, &port_str])
-            .with_context(|| format!("failed to set web proxy for {service}"))?;
-
-        run_networksetup(&["-setsecurewebproxy", service, host, &port_str])
-            .with_context(|| format!("failed to set secure web proxy for {service}"))?;
-
-        run_networksetup(&["-setsocksfirewallproxy", service, host, &port_str])
-            .with_context(|| format!("failed to set SOCKS proxy for {service}"))?;
+        for kind in PROXY_KINDS {
+            run_networksetup(&[kind.set, service, host, &port_str])
+                .with_context(|| format!("failed to set {} for {service}", kind.label))?;
+        }
 
         // Set proxy bypass domains/subnets
         let mut args = vec!["-setproxybypassdomains", service];
@@ -263,7 +271,7 @@ pub fn enable(port: u16, bypass: &[String], snapshot_path: &Path) -> Result<()> 
 ///
 /// Does nothing unless this port owns the snapshot: with no snapshot we never
 /// replaced anything, so the current settings belong to whoever did set them.
-pub fn disable(port: u16, snapshot_path: &Path) -> Result<()> {
+pub(crate) fn disable(port: u16, snapshot_path: &Path) -> Result<()> {
     let Some(snapshot) = load_snapshot(snapshot_path) else {
         tracing::info!("no system proxy snapshot; leaving the system settings alone");
         return Ok(());
@@ -320,7 +328,7 @@ pub fn disable(port: u16, snapshot_path: &Path) -> Result<()> {
 /// This is the explicit `sysproxy off` request: the user is asking for no
 /// system proxy, not for the previous one back, so any snapshot we were holding
 /// is dropped along with it.
-pub fn turn_off(snapshot_path: &Path) -> Result<()> {
+pub(crate) fn turn_off(snapshot_path: &Path) -> Result<()> {
     let services = active_services()?;
     for service in &services {
         turn_off_service(service)
@@ -330,19 +338,28 @@ pub fn turn_off(snapshot_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn status() -> Result<String> {
+pub(crate) fn status() -> Result<String> {
     let services = active_services()?;
     let mut result = String::new();
 
     for service in &services {
-        let info = run_networksetup(&["-getwebproxy", service])
-            .with_context(|| format!("failed to get web proxy status for {service}"))?;
+        for (index, kind) in PROXY_KINDS.iter().enumerate() {
+            let info = run_networksetup(&[kind.get, service])
+                .with_context(|| format!("failed to get {} status for {service}", kind.label))?;
 
-        result.push('[');
-        result.push_str(service);
-        result.push_str("]\n");
-        result.push_str(&info);
-        result.push('\n');
+            if index == 0 {
+                // Keep the pre-existing first block byte-compatible for
+                // scripts that parse `networksetup -getwebproxy` output.
+                result.push('[');
+                result.push_str(service);
+                result.push_str("]\n");
+            } else {
+                result.push_str(kind.label);
+                result.push_str(":\n");
+            }
+            result.push_str(&info);
+            result.push('\n');
+        }
     }
 
     Ok(result)
@@ -350,13 +367,6 @@ pub fn status() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     /// Real `networksetup -getwebproxy` output.

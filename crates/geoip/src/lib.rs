@@ -7,6 +7,16 @@
 //! the database (private ranges, unmapped entries) yields `None` instead of an
 //! error, so callers can treat "no country" as an ordinary state.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )
+)]
+
 use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -75,13 +85,6 @@ impl std::error::Error for GeoIpError {}
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
     use std::path::PathBuf;
 

@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
-use tokio::io::AsyncWriteExt;
 
 use crate::{expand_tilde, Subscription};
 
@@ -102,59 +101,8 @@ pub async fn download_to(client: &Client, url: &str, output_path: &Path) -> Resu
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let tmp_path = output_path.with_extension("yaml.tmp");
-    write_restricted_file(&tmp_path, &bytes)
-        .await
-        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-
-    if let Err(e) = tokio::fs::rename(&tmp_path, output_path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e).with_context(|| {
-            format!(
-                "failed to rename {} -> {}",
-                tmp_path.display(),
-                output_path.display()
-            )
-        });
-    }
-
-    set_owner_only_permissions(output_path)
-        .await
-        .with_context(|| format!("failed to secure {}", output_path.display()))?;
+    crate::fsutil::write_atomic_async(output_path, &bytes).await?;
 
     tracing::info!(path = %output_path.display(), bytes = bytes.len(), "subscription downloaded");
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn write_restricted_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .await?;
-    file.write_all(bytes).await?;
-    file.flush().await?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-async fn write_restricted_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    tokio::fs::write(path, bytes).await?;
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn set_owner_only_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-async fn set_owner_only_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }

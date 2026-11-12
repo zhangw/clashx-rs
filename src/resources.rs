@@ -57,8 +57,38 @@ pub struct Budget {
     half_closed_current: AtomicU64,
     peer_closed: AtomicU64,
     last_relay_error: std::sync::Mutex<Option<LastRelayError>>,
-    relay_error_warned: std::sync::Mutex<Option<Instant>>,
-    promotion_failure_warned: std::sync::Mutex<Option<Instant>>,
+    relay_error_throttle: Throttle,
+    promotion_failure_throttle: Throttle,
+}
+
+/// A single-interval warning gate: [`Throttle::allow`] returns true at most
+/// once per `interval`, so repeated pressure does not flood the log.
+struct Throttle {
+    last: std::sync::Mutex<Option<Instant>>,
+    interval: Duration,
+}
+
+impl Throttle {
+    fn new(interval: Duration) -> Self {
+        Self {
+            last: std::sync::Mutex::new(None),
+            interval,
+        }
+    }
+
+    fn allow(&self) -> bool {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        if last.is_none_or(|previous| now.duration_since(previous) >= self.interval) {
+            *last = Some(now);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,7 +144,7 @@ pub fn initialize() -> anyhow::Result<&'static Budget> {
     );
     let streaming_limit = STREAMING_LIMIT.min(limit);
     let general_limit = GENERAL_LIMIT.min(limit);
-    let _ = BUDGET.set(Budget {
+    let created = Budget {
         soft,
         hard,
         limit,
@@ -137,9 +167,10 @@ pub fn initialize() -> anyhow::Result<&'static Budget> {
         half_closed_current: AtomicU64::new(0),
         peer_closed: AtomicU64::new(0),
         last_relay_error: std::sync::Mutex::new(None),
-        relay_error_warned: std::sync::Mutex::new(None),
-        promotion_failure_warned: std::sync::Mutex::new(None),
-    });
+        relay_error_throttle: Throttle::new(Duration::from_secs(60)),
+        promotion_failure_throttle: Throttle::new(Duration::from_secs(600)),
+    };
+    let budget = BUDGET.get_or_init(|| created);
     tracing::info!(
         soft,
         hard,
@@ -149,27 +180,22 @@ pub fn initialize() -> anyhow::Result<&'static Budget> {
         reserved = RESERVED,
         "file descriptor budget"
     );
-    BUDGET
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("connection budget was not initialized"))
+    Ok(budget)
 }
 
 fn last_relay_error(budget: &Budget) -> serde_json::Value {
-    budget
+    let last = budget
         .last_relay_error
         .lock()
-        .ok()
-        .and_then(|last| {
-            last.as_ref().map(|error| {
-                serde_json::json!({
-                    "age_secs": error.at.elapsed().as_secs(),
-                    "target": error.target,
-                    "proxy": error.proxy,
-                    "message": error.message,
-                })
-            })
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    last.as_ref().map_or(serde_json::Value::Null, |error| {
+        serde_json::json!({
+            "age_secs": error.at.elapsed().as_secs(),
+            "target": error.target,
+            "proxy": error.proxy,
+            "message": error.message,
         })
-        .unwrap_or(serde_json::Value::Null)
+    })
 }
 
 pub fn status() -> serde_json::Value {
@@ -307,23 +333,19 @@ pub fn record_relay_error(error: &anyhow::Error, target: &str, proxy: &str) {
     };
     budget.relay_errors.fetch_add(1, Ordering::Relaxed);
     let message = format!("{error:#}");
-    if let Ok(mut last) = budget.last_relay_error.lock() {
-        *last = Some(LastRelayError {
-            at: Instant::now(),
-            target: target.to_string(),
-            proxy: proxy.to_string(),
-            message: message.clone(),
-        });
-    }
-
-    let now = Instant::now();
-    let mut warned = budget
-        .relay_error_warned
+    let mut last = budget
+        .last_relay_error
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if warned.is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(60)) {
+    *last = Some(LastRelayError {
+        at: Instant::now(),
+        target: target.to_string(),
+        proxy: proxy.to_string(),
+        message: message.clone(),
+    });
+
+    if budget.relay_error_throttle.allow() {
         tracing::warn!(target, proxy, error = %message, "relay error");
-        *warned = Some(now);
     }
 }
 
@@ -434,12 +456,7 @@ impl ConnectionSlot {
 /// the streaming pool. The counter carries the exact rate; the log explains
 /// the consequence (squatting in general) before admission starts failing.
 fn warn_promotion_saturated(budget: &Budget) {
-    let now = Instant::now();
-    let mut last = budget
-        .promotion_failure_warned
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if last.is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(600)) {
+    if budget.promotion_failure_throttle.allow() {
         let occupancy = occupancy_from(budget);
         tracing::warn!(
             global_active = occupancy.global_active,
@@ -450,7 +467,6 @@ fn warn_promotion_saturated(budget: &Budget) {
             streaming_limit = occupancy.streaming_limit,
             "streaming pool saturated; long-lived connections stay in the general class"
         );
-        *last = Some(now);
     }
 }
 
@@ -540,14 +556,6 @@ impl OverloadLog {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction,
-        unsafe_code
-    )]
-
     use super::*;
 
     fn test_budget(global: usize, streaming: usize, general: usize) -> &'static Budget {
@@ -574,8 +582,8 @@ mod tests {
             half_closed_current: AtomicU64::new(0),
             peer_closed: AtomicU64::new(0),
             last_relay_error: std::sync::Mutex::new(None),
-            relay_error_warned: std::sync::Mutex::new(None),
-            promotion_failure_warned: std::sync::Mutex::new(None),
+            relay_error_throttle: Throttle::new(Duration::from_secs(60)),
+            promotion_failure_throttle: Throttle::new(Duration::from_secs(600)),
         }))
     }
 
@@ -636,6 +644,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the child lowers its own RLIMIT_NOFILE to force accept exhaustion"
+    )]
     fn exhausted_accept_recovers_in_child() {
         const CHILD: &str = "CLASHX_FD_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {

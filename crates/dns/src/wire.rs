@@ -290,13 +290,6 @@ pub(crate) mod test_util {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::test_util::*;
     use super::*;
 

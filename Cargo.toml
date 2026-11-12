@@ -94,8 +94,6 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-clashx-rs-config = { path = "crates/config" }
-clashx-rs-rule = { path = "crates/rule" }
 
 [lints]
 workspace = true

@@ -218,13 +218,6 @@ async fn connect_with_timeout(
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
@@ -414,7 +407,7 @@ mod tests {
     }
 
     /// Server that selects USERNAME/PASSWORD even though the client offered
-    /// only NO_AUTH (no credentials configured).
+    /// only `NO_AUTH` (no credentials configured).
     async fn run_unexpected_auth_server(listener: TcpListener) {
         let (mut conn, _) = listener.accept().await.unwrap();
 

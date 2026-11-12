@@ -5,6 +5,16 @@
 //! the Unix-socket control client. Daemon data-plane code lives in
 //! [`daemon`]; this module stays a command router.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )
+)]
+
 mod client;
 mod control;
 mod daemon;
@@ -14,7 +24,7 @@ mod probe;
 mod resources;
 mod retry;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -25,7 +35,7 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
 
 use clashx_rs_subscribe::{
-    add_subscription, load_subscriptions, remove_subscription, save_subscriptions,
+    add_subscription, expand_tilde, load_subscriptions, remove_subscription, save_subscriptions,
     set_subscription_enabled, update_all_subscriptions, update_subscription_by_name, Subscription,
     SubscriptionConfig,
 };
@@ -74,7 +84,7 @@ fn resolve_port(cli: &Cli) -> u16 {
 enum Command {
     /// Start the proxy daemon
     Run {
-        /// Run as a background daemon
+        /// Run as a background daemon (not yet implemented)
         #[arg(short = 'd', long)]
         daemon: bool,
         /// Override the selected proxy in a group at startup (GROUP=PROXY)
@@ -115,9 +125,9 @@ enum Command {
         /// Proxy name to activate
         proxy: String,
     },
-    /// Test reachability of a domain
+    /// Resolve rule-mode routing for a domain (DNS resolved; PROCESS-NAME rules skipped)
     Test {
-        /// Domain to test
+        /// Domain to resolve
         domain: String,
     },
     /// Manage system proxy settings
@@ -220,19 +230,8 @@ enum SysproxyAction {
     /// Restore the saved pre-enable settings; leave unrelated proxies unchanged
     #[cfg(target_os = "macos")]
     Restore,
-    /// Show system proxy status
+    /// Show system proxy status for web, secure web, and SOCKS
     Status,
-}
-
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-        home.join(rest)
-    } else if path == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
-    } else {
-        PathBuf::from(path)
-    }
 }
 
 /// Build the log filter.
@@ -314,15 +313,21 @@ fn main() -> Result<()> {
     let daemon_mode = matches!(&cli.command, Command::Run { .. });
     let _log_guard = init_logging(&config_path, machine_status, daemon_mode);
     let ctrl_port = resolve_port(&cli);
+    let port_override = cli.port;
 
-    dispatch(cli.command, &config_path, ctrl_port)
+    dispatch(cli.command, &config_path, ctrl_port, port_override)
 }
 
 /// Dispatch one already-parsed CLI command.
 ///
 /// [`main`] owns argument parsing and logging setup; this function owns the
 /// command surface so each branch can be tested or extended independently.
-fn dispatch(command: Command, config_path: &Path, ctrl_port: u16) -> Result<()> {
+fn dispatch(
+    command: Command,
+    config_path: &Path,
+    ctrl_port: u16,
+    port_override: Option<u16>,
+) -> Result<()> {
     match command {
         Command::Run {
             daemon,
@@ -337,6 +342,7 @@ fn dispatch(command: Command, config_path: &Path, ctrl_port: u16) -> Result<()> 
             mmdb_auto_download,
             sysproxy,
             config_path,
+            port_override,
         ),
 
         Command::Stop => client::send_command(ControlRequest::Stop, ctrl_port),
@@ -384,6 +390,7 @@ fn run_daemon_command(
     mmdb_auto_download: bool,
     sysproxy: bool,
     config_path: &Path,
+    port_override: Option<u16>,
 ) -> Result<()> {
     install_crypto_provider();
     let mmdb_path = mmdb.map_or_else(paths::default_mmdb_path, |p| expand_tilde(&p));
@@ -394,6 +401,7 @@ fn run_daemon_command(
             mmdb_path,
             mmdb_auto_download,
             sysproxy,
+            port_override,
         )
     } else {
         daemon::start_foreground(
@@ -402,6 +410,7 @@ fn run_daemon_command(
             mmdb_path,
             mmdb_auto_download,
             sysproxy,
+            port_override,
         )
     }
 }
@@ -708,13 +717,6 @@ fn redact_url_for_display(url: &str) -> String {
 
 #[cfg(test)]
 mod cli_tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::{redact_url_for_display, Cli, Command};
     use clap::Parser;
 

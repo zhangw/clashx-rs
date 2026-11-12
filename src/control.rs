@@ -9,13 +9,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "lowercase")]
 pub enum ControlRequest {
-    /// Report daemon status, including uptime, port, and active mode.
+    /// Report daemon status: port, mode, config path, proxy/rule/group counts,
+    /// selections, and resource counters.
     Status,
     /// Ask the daemon to shut down.
     Stop,
     /// Re-read the config file and rebuild resolvers, rules, and proxies.
     Reload,
-    /// Select `proxy` inside `group` for the rest of this daemon run.
+    /// Select `proxy` inside `group` until the next config reload.
     Switch { group: String, proxy: String },
     /// List the configured proxies.
     Proxies,
@@ -23,7 +24,9 @@ pub enum ControlRequest {
     Groups,
     /// List the parsed rules in evaluation order.
     Rules,
-    /// Resolve `domain` through the rule engine and report the decision.
+    /// Resolve routing for `domain`: resolve DNS lazily for `IP-CIDR`/`GEOIP`
+    /// rules, skip `PROCESS-NAME` (no client source address), and report the
+    /// decision plus whether process rules were skipped.
     Test { domain: String },
     /// Measure latency for every proxy; `full` performs an HTTP round trip
     /// instead of a TCP connect.
@@ -75,13 +78,6 @@ impl ControlResponse {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     #[test]

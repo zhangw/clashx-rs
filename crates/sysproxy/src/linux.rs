@@ -6,7 +6,7 @@
 //! evaluates or sources the output. [`status`] only inspects the environment it
 //! inherited and compares it with the values [`enable`] would print for a port.
 
-pub fn enable(port: u16) {
+pub(crate) fn enable(port: u16) {
     let proxy = format!("http://127.0.0.1:{port}");
     let socks = format!("socks5://127.0.0.1:{port}");
 
@@ -20,7 +20,7 @@ pub fn enable(port: u16) {
     println!("export NO_PROXY=\"localhost,127.0.0.1,::1\"");
 }
 
-pub fn disable() {
+pub(crate) fn disable() {
     println!("unset http_proxy HTTP_PROXY");
     println!("unset https_proxy HTTPS_PROXY");
     println!("unset all_proxy ALL_PROXY");
@@ -31,7 +31,7 @@ pub fn disable() {
     clippy::similar_names,
     reason = "locals mirror the environment variable names they read"
 )]
-pub fn status(port: u16) -> String {
+pub(crate) fn status(port: u16) -> String {
     use std::fmt::Write as _;
 
     let expected_http = format!("http://127.0.0.1:{port}");

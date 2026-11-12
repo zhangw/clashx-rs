@@ -286,7 +286,6 @@ dependencies = [
 name = "clashx-rs-geoip"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "maxminddb",
  "reqwest",
  "tokio",
@@ -298,12 +297,9 @@ name = "clashx-rs-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clashx-rs-config",
- "clashx-rs-dns",
  "hex",
  "libc",
  "rustls",
- "serde",
  "sha2",
  "tokio",
  "tokio-rustls",
@@ -315,11 +311,9 @@ dependencies = [
 name = "clashx-rs-rule"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "clashx-rs-config",
  "clashx-rs-geoip",
  "libproc",
- "once_cell",
  "tokio",
  "tracing",
 ]
@@ -329,6 +323,7 @@ name = "clashx-rs-subscribe"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clashx-rs-config",
  "dirs",
  "reqwest",
  "serde",
@@ -345,7 +340,6 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
- "tokio",
  "tracing",
 ]
 

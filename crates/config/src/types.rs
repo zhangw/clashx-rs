@@ -92,11 +92,13 @@ pub struct Config {
     #[serde(default)]
     pub skip_proxy: Vec<String>,
 
-    /// `sysproxy`: set the macOS system proxy while the daemon runs.
+    /// `sysproxy`: manage the system proxy while the daemon runs.
     ///
-    /// Absent means `false`; the `--sysproxy` CLI flag overrides it. Enabling
-    /// snapshots the previous settings and restores them on exit, but a crash
-    /// can leave global network settings pointing at the daemon.
+    /// Absent means `false`; the `--sysproxy` CLI flag overrides it. On macOS
+    /// enabling snapshots the previous settings and restores them on exit, but
+    /// a crash can leave global network settings pointing at the daemon. On
+    /// Linux the helper only prints `export`/`unset` lines and never persists
+    /// state.
     #[serde(default)]
     pub sysproxy: Option<bool>,
     /// Unknown top-level keys, preserved verbatim.
@@ -405,13 +407,6 @@ pub enum GroupType {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     #[test]

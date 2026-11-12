@@ -408,13 +408,6 @@ pub(crate) fn frame_len(prefix: [u8; 2]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
     use crate::bootstrap::spawn_mock_dns_server;
 

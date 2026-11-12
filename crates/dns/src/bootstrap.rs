@@ -141,13 +141,6 @@ pub(crate) use tests::spawn_mock_dns_server;
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
     use crate::wire::test_util::{build_test_response, make_a_record};
     use tokio::net::UdpSocket;

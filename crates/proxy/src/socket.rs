@@ -6,6 +6,23 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 
+/// Apply the shared TCP tuning for tunnel sockets: `TCP_NODELAY` (token-sized
+/// writes) plus the keepalive backstop. Both are best-effort: failures are
+/// logged at debug level and do not fail the connection.
+pub fn configure_tcp(stream: &TcpStream, peer: &str) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(peer = %peer, error = %error, "failed to set TCP_NODELAY");
+    }
+    if let Err(error) = set_keepalive(
+        stream,
+        crate::timeout::KEEPALIVE_IDLE,
+        crate::timeout::KEEPALIVE_INTERVAL,
+        crate::timeout::KEEPALIVE_COUNT,
+    ) {
+        tracing::debug!(peer = %peer, error = %error, "could not enable TCP keepalive");
+    }
+}
+
 /// Enable TCP keepalive with a bounded idle/interval/retry profile.
 ///
 /// This is a backstop for peers that vanish without FIN/RST (sleep/wake,
@@ -79,13 +96,6 @@ fn set_opt(fd: RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int)
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
     use tokio::net::TcpListener;
 

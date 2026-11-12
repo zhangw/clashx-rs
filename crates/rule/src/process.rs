@@ -348,13 +348,6 @@ fn scan_tcp_sockets(_targets: Option<&HashSet<String>>) -> HashMap<u16, String> 
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     #[tokio::test]

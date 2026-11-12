@@ -123,7 +123,6 @@ async fn probe_once(
         let status = match stream {
             OutboundStream::Tcp(mut s) => http_status_exchange(&mut s, target).await?,
             OutboundStream::Tls(mut s) => http_status_exchange(&mut *s, target).await?,
-            OutboundStream::Rejected => bail!("outbound rejected"),
         };
         if status != expected_status {
             bail!("unexpected probe status {status}, expected {expected_status}");
@@ -437,13 +436,6 @@ pub async fn run(state: Arc<RwLock<DaemonState>>) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     #[test]

@@ -9,9 +9,15 @@ pub const DEFAULT_MIXED_PORT: u16 = 7890;
 /// Daily runtime log files kept before the oldest is removed.
 pub const LOG_RETENTION_FILES: usize = 7;
 
+/// User's home directory, falling back to the literal `~` when the platform
+/// cannot resolve one.
+#[must_use]
+pub fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
+}
+
 pub fn runtime_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-    home.join(".config/clashx-rs")
+    home_dir().join(".config/clashx-rs")
 }
 
 /// Runtime log directory. On macOS this matches the `LaunchAgent`'s existing
@@ -19,8 +25,7 @@ pub fn runtime_dir() -> PathBuf {
 pub fn log_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-        home.join("Library/Logs/clashx-rs")
+        home_dir().join("Library/Logs/clashx-rs")
     }
     #[cfg(not(target_os = "macos"))]
     {

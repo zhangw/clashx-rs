@@ -283,16 +283,10 @@ async fn race_group(
     group: &Arc<[Upstream]>,
     bootstrap: &Arc<Bootstrap>,
 ) -> Result<DnsResult> {
-    if group.is_empty() {
+    let Some(window) = group.iter().map(Upstream::participant_timeout).max() else {
         anyhow::bail!("no nameservers configured");
-    }
-
-    let window = group
-        .iter()
-        .map(Upstream::participant_timeout)
-        .max()
-        .ok_or_else(|| anyhow::anyhow!("nameserver group is empty"))?
-        + Duration::from_millis(100);
+    };
+    let window = window + Duration::from_millis(100);
 
     // Spawned attempts must be 'static — each carries an Arc clone of the
     // group and indexes into it rather than borrowing the upstream.
@@ -395,13 +389,6 @@ fn build_group(entries: &[String]) -> Vec<Upstream> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
     use crate::bootstrap::spawn_mock_dns_server;
     use std::sync::atomic::Ordering;

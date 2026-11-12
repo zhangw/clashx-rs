@@ -171,6 +171,22 @@ impl CooldownTracker {
         entry.1 = Instant::now();
     }
 
+    /// Record a passive failure and emit the standard cooldown warning when
+    /// this failure pushes the proxy over the threshold.
+    ///
+    /// Kept next to [`Self::record_failure`] so the counter and its operator
+    /// message cannot drift apart; the daemon calls this at every failure site.
+    pub fn record_failure_and_warn(&self, proxy: &str) {
+        self.record_failure(proxy);
+        if self.is_cooled_down(proxy) && !self.is_sidelined(proxy) {
+            tracing::warn!(
+                proxy = %proxy,
+                "proxy entered timed cooldown ({} consecutive failures)",
+                COOLDOWN_FAILURE_THRESHOLD
+            );
+        }
+    }
+
     /// Weak failure signal: demote in candidate ordering for `DEGRADE_DURATION`.
     /// Used for first-byte timeouts/closes, which are probably (not
     /// certainly) node failures.
@@ -195,13 +211,6 @@ impl CooldownTracker {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     #[test]

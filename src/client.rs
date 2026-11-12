@@ -64,7 +64,6 @@ pub fn send_command_quiet(request: ControlRequest, port: u16) -> Result<()> {
     }
 }
 
-/// Send a command and return the response data on success, or an error.
 /// Send a command and return its JSON payload. Used by commands that format
 /// the result themselves.
 pub fn send_command_with_data(request: ControlRequest, port: u16) -> Result<serde_json::Value> {

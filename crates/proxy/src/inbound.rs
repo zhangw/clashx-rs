@@ -131,13 +131,6 @@ pub async fn detect_and_handle(
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use std::time::Duration;
 
     use tokio::net::TcpListener;

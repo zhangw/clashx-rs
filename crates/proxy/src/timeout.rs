@@ -28,13 +28,6 @@ pub const KEEPALIVE_COUNT: u32 = 3;
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     #[test]

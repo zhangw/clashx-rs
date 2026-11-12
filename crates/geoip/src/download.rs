@@ -59,6 +59,8 @@ pub async fn download_mmdb(
         )));
     }
 
+    // The mmdb is public data, not a secret, so it does not need the 0600
+    // restriction used for subscription and config files.
     let tmp_path = output_path.with_extension("mmdb.tmp");
 
     // Ensure parent directory exists

@@ -41,20 +41,11 @@ pub fn load_subscriptions() -> Result<SubscriptionConfig> {
 /// Returns an error when the file exists but cannot be read, or when its
 /// contents are not valid YAML for [`SubscriptionConfig`].
 pub fn load_subscriptions_from(path: &Path) -> Result<SubscriptionConfig> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{mode:o}"),
-                    "subscriptions file has group/other read permissions — it may contain subscription tokens; chmod 600 recommended"
-                );
-            }
-        }
-    }
+    clashx_rs_config::warn_if_group_or_world_readable(
+        path,
+        "subscriptions file",
+        "it may contain subscription tokens",
+    );
 
     let content = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -98,62 +89,11 @@ pub fn save_subscriptions_to(path: &Path, config: &SubscriptionConfig) -> Result
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let yaml = serde_yaml::to_string(config).context("failed to serialize subscriptions")?;
-    let tmp = path.with_extension("yaml.tmp");
-    write_restricted_file(&tmp, yaml.as_bytes())
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("failed to rename {} -> {}", tmp.display(), path.display())
-    })?;
-    set_owner_only_permissions(path)
-        .with_context(|| format!("failed to secure {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_restricted_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_restricted_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+    crate::fsutil::write_atomic_sync(path, yaml.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
     use crate::Subscription;
 

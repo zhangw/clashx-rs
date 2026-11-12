@@ -22,6 +22,16 @@
 //! fields keep working for older files: absent `interval` means `86400`, absent
 //! `last_updated` means `0`, and absent `enabled` means `true`.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )
+)]
+
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +42,8 @@ pub mod download;
 pub mod manager;
 /// Loading and saving the on-disk subscription list.
 pub mod state;
+
+mod fsutil;
 
 pub use manager::{
     add_subscription, remove_subscription, set_subscription_enabled, update_all_subscriptions,
@@ -78,7 +90,9 @@ fn default_enabled() -> bool {
     true
 }
 
-pub(crate) fn expand_tilde(path: &str) -> PathBuf {
+/// Expand a leading `~/` (or a bare `~`) to the user's home directory.
+#[must_use]
+pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
         home.join(rest)

@@ -348,13 +348,6 @@ async fn read_plain_request(
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
     use std::net::IpAddr;
     use tokio::io::AsyncWriteExt;

@@ -24,6 +24,16 @@
 //! - **Other platforms** return `Ok(())` without doing anything, logging a
 //!   warning for enable.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )
+)]
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -31,6 +41,23 @@ mod macos;
 
 use anyhow::Result;
 use std::path::PathBuf;
+
+/// Default bypass entries applied when no explicit `skip-proxy` list is set.
+///
+/// The CIDR subset is exposed separately because callers that analyze IP rules
+/// only need the subnet entries (the host entries cannot swallow an IP-CIDR
+/// rule).
+pub const DEFAULT_BYPASS: &[&str] = &[
+    "192.168.0.0/16",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "127.0.0.1",
+    "localhost",
+    "*.local",
+];
+
+/// The CIDR entries of [`DEFAULT_BYPASS`], in configuration order.
+pub const DEFAULT_BYPASS_CIDRS: &[&str] = &["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"];
 
 /// Facade over the platform system-proxy implementation.
 #[derive(Debug)]
@@ -55,27 +82,12 @@ impl SysProxy {
         }
     }
 
-    /// Install the system proxy pointing at this instance's listener.
-    ///
-    /// Equivalent to [`Self::enable_with_bypass`] with an empty bypass list,
-    /// which selects the built-in default bypass list on macOS.
-    ///
-    /// # Errors
-    ///
-    /// On macOS returns an error when the active services cannot be listed or
-    /// when applying the proxy or bypass settings fails for any service.
-    /// Linux only prints `export` lines and cannot fail; other platforms return
-    /// `Ok(())`.
-    pub fn enable(&self) -> Result<()> {
-        self.enable_with_bypass(&[])
-    }
-
     /// Install the system proxy with `bypass` as the bypass list.
     ///
     /// `bypass` entries are host names, domains, or CIDR ranges. An empty list
-    /// means the platform default: macOS applies its built-in LAN/local list,
-    /// while Linux logs a warning that bypass lists are unsupported and prints
-    /// the usual `export` lines.
+    /// means the platform default: macOS applies [`DEFAULT_BYPASS`], while
+    /// Linux logs a warning that bypass lists are unsupported and prints the
+    /// usual `export` lines.
     ///
     /// # Errors
     ///
@@ -102,7 +114,7 @@ impl SysProxy {
         }
     }
 
-    /// Undo the settings installed by [`Self::enable`].
+    /// Undo the settings installed by [`Self::enable_with_bypass`].
     ///
     /// macOS restores the recorded snapshot. It does nothing when no snapshot
     /// exists, when the snapshot belongs to another port, or when a service no
@@ -111,7 +123,7 @@ impl SysProxy {
     /// keeps it and reports the stranded services so a retry can use it.
     ///
     /// Linux prints `unset` lines on stdout, the documented counterpart to
-    /// [`Self::enable`]'s `export` lines, and changes no persistent state.
+    /// [`Self::enable_with_bypass`]'s `export` lines, and changes no persistent state.
     ///
     /// # Errors
     ///
@@ -158,10 +170,10 @@ impl SysProxy {
 
     /// Report the current system proxy configuration as human-readable text.
     ///
-    /// macOS returns the raw `networksetup -getwebproxy` output for each active
-    /// service. Linux compares `http_proxy`, `https_proxy`, and `all_proxy`
-    /// (upper- or lower-case) against the values [`Self::enable`] would print
-    /// for this port.
+    /// macOS prints the web-proxy block first for compatibility, then the
+    /// secure-web and SOCKS blocks for each active service. Linux compares
+    /// `http_proxy`, `https_proxy`, and `all_proxy` (upper- or lower-case)
+    /// against the values [`Self::enable_with_bypass`] would print for this port.
     ///
     /// # Errors
     ///

@@ -11,6 +11,16 @@
 //! See [the DNS resolver design](../../../docs/dns-resolver-design.md) for the
 //! as-built semantics, config keys, and layout.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unchecked_time_subtraction
+    )
+)]
+
 mod bootstrap;
 mod cache;
 mod resolver;
@@ -54,7 +64,7 @@ pub(crate) use warn_once;
 /// Returns an error when `getaddrinfo` fails for `host` (unknown host or name
 /// service failure), when it yields no IPv4 address (including IPv6-only
 /// results), or when the blocking resolver task cannot be joined.
-pub async fn system_resolve(host: &str) -> Result<IpAddr> {
+pub(crate) async fn system_resolve(host: &str) -> Result<IpAddr> {
     let host = host.to_string();
     task::spawn_blocking(move || -> Result<IpAddr> {
         format!("{host}:0")
@@ -68,13 +78,6 @@ pub async fn system_resolve(host: &str) -> Result<IpAddr> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     #[tokio::test]

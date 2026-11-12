@@ -35,19 +35,6 @@ const MAX_SELECTION_DEPTH: usize = 8;
 /// HTTP methods whose requests may be replayed after a first-byte timeout.
 const IDEMPOTENT_METHODS: [&[u8]; 5] = [b"GET ", b"HEAD ", b"OPTIONS ", b"PUT ", b"DELETE "];
 
-/// Build a `MatchInput` from a host string.
-/// If the string is a valid IP, set `ip` and leave `host` as None
-/// so that DOMAIN-SUFFIX rules don't try to match an IP string.
-fn match_input_from_host(host: &str) -> MatchInput<'_> {
-    let ip: Option<IpAddr> = host.parse().ok();
-    MatchInput {
-        host: if ip.is_some() { None } else { Some(host) },
-        ip,
-        process_name: None,
-        ..Default::default()
-    }
-}
-
 struct MatchedRuleDebug<'a>(Option<&'a clashx_rs_config::rule::RuleEntry>);
 
 impl fmt::Debug for MatchedRuleDebug<'_> {
@@ -77,6 +64,9 @@ pub(crate) struct DaemonState {
     /// daemon that never touched the setting cannot switch off one the user
     /// configured by hand.
     sysproxy_enabled: bool,
+    /// Explicit `--port` override. Reapplied after config reloads so the
+    /// listener, control socket, PID file, and sysproxy stay on one port.
+    port_override: Option<u16>,
 }
 
 impl DaemonState {
@@ -123,6 +113,7 @@ impl DaemonState {
             resolver,
             proxy_resolver,
             sysproxy_enabled: false,
+            port_override: None,
         }
     }
 
@@ -236,7 +227,11 @@ impl DaemonState {
         }
     }
 
-    /// Resolve routing for a given input. Returns (`group_name`, `proxy_name`, `matched_rule`).
+    /// Resolve routing for a given input, using the eager evaluator.
+    ///
+    /// Test-only: production code uses [`evaluate_rules_lazily`] with the
+    /// shared resolver. Returns (`group_name`, `proxy_name`, `matched_rule`).
+    #[cfg(test)]
     fn resolve_routing_with_group<'a>(
         &'a self,
         input: &MatchInput<'_>,
@@ -254,6 +249,33 @@ impl DaemonState {
                 Some((target, rule_desc)) => {
                     let (grp, proxy) = self.resolve_selection_chain(target);
                     (grp, proxy, Some(rule_desc))
+                }
+                None => (None, "DIRECT", None),
+            },
+        }
+    }
+
+    /// Resolve group/proxy for an already-matched rule.
+    ///
+    /// Shared by `clashx-rs test` and any caller that performs the lazy rule
+    /// walk itself; it keeps the mode→chain-start mapping in one place.
+    fn resolve_route_for_match<'a>(
+        &'a self,
+        matched: Option<&'a clashx_rs_config::rule::RuleEntry>,
+    ) -> (Option<&'a str>, &'a str, Option<String>) {
+        match self.config.mode {
+            Mode::Direct => (None, "DIRECT", None),
+            Mode::Global => match self.config.proxy_groups.first() {
+                Some(g) => {
+                    let (group, proxy) = self.resolve_selection_chain(&g.name);
+                    (group, proxy, None)
+                }
+                None => (None, "DIRECT", None),
+            },
+            Mode::Rule => match matched {
+                Some(rule) => {
+                    let (group, proxy) = self.resolve_selection_chain(rule.target());
+                    (group, proxy, Some(rule.description()))
                 }
                 None => (None, "DIRECT", None),
             },
@@ -370,12 +392,14 @@ impl DaemonState {
     }
 }
 
+/// Run the daemon in the foreground on a new multi-threaded runtime.
 pub fn start_foreground(
     config_path: &Path,
     selections: &[String],
     mmdb_path: PathBuf,
     mmdb_auto_download: bool,
     sysproxy: bool,
+    port_override: Option<u16>,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -386,28 +410,26 @@ pub fn start_foreground(
         mmdb_path,
         mmdb_auto_download,
         sysproxy,
+        port_override,
     ))
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "signature reserved for background mode"
-)]
+/// Background mode is not implemented.
+///
+/// Returns an error rather than printing and returning `Ok(())`, so a caller
+/// cannot mistake a no-op for a started daemon.
 pub fn start_background(
     _config_path: &Path,
     _selections: &[String],
     _mmdb_path: PathBuf,
     _mmdb_auto_download: bool,
     _sysproxy: bool,
+    _port_override: Option<u16>,
 ) -> Result<()> {
-    println!("background daemon mode is not yet implemented");
-    Ok(())
+    Err(anyhow::anyhow!(
+        "background daemon mode is not yet implemented"
+    ))
 }
-
-/// Private ranges the sysproxy crate bypasses when no `skip-proxy` is set.
-/// Kept in sync with `DEFAULT_BYPASS` in crates/sysproxy; only the subnet
-/// entries matter here, since only those can swallow an IP-CIDR rule.
-const DEFAULT_BYPASS_CIDRS: &[&str] = &["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"];
 
 /// Warn about rules the system proxy bypass list silently defeats.
 ///
@@ -421,7 +443,7 @@ fn warn_on_bypassed_rules(
 ) {
     let bypass: Vec<(IpAddr, u8)> = if bypass.is_empty() {
         // Mirrors the crate's built-in defaults, which cover the private ranges.
-        DEFAULT_BYPASS_CIDRS
+        clashx_rs_sysproxy::DEFAULT_BYPASS_CIDRS
             .iter()
             .filter_map(|entry| parse_cidr(entry))
             .collect()
@@ -455,9 +477,9 @@ fn warn_on_bypassed_rules(
             .iter()
             .find(|(net, len)| *len <= target.1 && clashx_rs_rule::ip_in_cidr(target.0, *net, *len))
         {
-            // Printed rather than logged: the default log filter only lets
-            // errors through, and this is the one thing the user has to see
-            // before their rules silently stop firing.
+            // Printed rather than logged: daemon logs go to the rolling file,
+            // and this is the one thing the user has to see before their rules
+            // silently stop firing.
             eprintln!(
                 "warning: system proxy bypass {net}/{len} covers rule \"{rule}\"; \
                  that traffic will not reach the proxy at all"
@@ -512,10 +534,19 @@ async fn run_daemon(
     mmdb_path: PathBuf,
     mmdb_auto_download: bool,
     sysproxy_flag: bool,
+    port_override: Option<u16>,
 ) -> Result<()> {
     let budget = crate::resources::initialize()?;
-    let config = load_config(config_path)?;
-    let port = config.mixed_port.unwrap_or(DEFAULT_MIXED_PORT);
+    let config_path_owned = config_path.to_path_buf();
+    let mut config = tokio::task::spawn_blocking(move || load_config(&config_path_owned))
+        .await
+        .map_err(|e| anyhow::anyhow!("config load task panicked: {e}"))??;
+    let port = port_override
+        .or(config.mixed_port)
+        .unwrap_or(DEFAULT_MIXED_PORT);
+    // Persist the effective port in the state so status, socket/PID paths,
+    // sysproxy, and a later reload all agree with the listener.
+    config.mixed_port = Some(port);
     let allow_lan = config.allow_lan.unwrap_or(false);
 
     tracing::info!(
@@ -547,22 +578,28 @@ async fn run_daemon(
     let mut daemon_state =
         DaemonState::from_config(config, config_path.to_path_buf(), mmdb_path.clone());
     daemon_state.sysproxy_enabled = sysproxy_enabled;
+    daemon_state.port_override = port_override;
     daemon_state.parse_and_apply_overrides(selections)?;
     daemon_state.validate();
     let geoip_loaded = daemon_state.rule_engine.has_geoip_db();
     let state = Arc::new(RwLock::new(daemon_state));
 
     let rt_dir = paths::runtime_dir();
-    std::fs::create_dir_all(&rt_dir)
-        .with_context(|| format!("failed to create runtime dir: {}", rt_dir.display()))?;
-    // Restrict runtime dir to owner only (prevents other local users from
-    // accessing the control socket or PID file).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&rt_dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to chmod runtime dir: {}", rt_dir.display()))?;
-    }
+    let rt_dir_display = rt_dir.display().to_string();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::create_dir_all(&rt_dir)?;
+        // Restrict runtime dir to owner only (prevents other local users from
+        // accessing the control socket or PID file).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&rt_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("runtime dir setup task panicked: {e}"))?
+    .with_context(|| format!("failed to prepare runtime dir: {rt_dir_display}"))?;
 
     let sock = paths::socket_path(port);
     let _ = std::fs::remove_file(&sock);
@@ -571,14 +608,22 @@ async fn run_daemon(
     // Restrict socket to owner only.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to chmod control socket: {}", sock.display()))?;
+        let sock_for_chmod = sock.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sock_for_chmod, std::fs::Permissions::from_mode(0o600))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("socket chmod task panicked: {e}"))?
+        .with_context(|| format!("failed to chmod control socket: {}", sock.display()))?;
     }
     tracing::info!(path = %sock.display(), "control socket bound");
 
     let pid_file = paths::pid_path(port);
-    std::fs::write(&pid_file, std::process::id().to_string())
+    let pid_path = pid_file.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(&pid_path, std::process::id().to_string()))
+        .await
+        .map_err(|e| anyhow::anyhow!("PID file task panicked: {e}"))?
         .with_context(|| format!("failed to write PID file: {}", pid_file.display()))?;
 
     let proxy_listener = TcpListener::bind((bind_addr.as_str(), port))
@@ -707,17 +752,7 @@ async fn run_daemon(
         loop {
             match proxy_listener.accept().await {
                 Ok((stream, addr)) => {
-                    if let Err(e) = stream.set_nodelay(true) {
-                        tracing::debug!(error = %e, peer = %addr, "failed to set TCP_NODELAY");
-                    }
-                    if let Err(e) = clashx_rs_proxy::socket::set_keepalive(
-                        &stream,
-                        clashx_rs_proxy::timeout::KEEPALIVE_IDLE,
-                        clashx_rs_proxy::timeout::KEEPALIVE_INTERVAL,
-                        clashx_rs_proxy::timeout::KEEPALIVE_COUNT,
-                    ) {
-                        tracing::debug!(error = %e, peer = %addr, "could not enable TCP keepalive");
-                    }
+                    clashx_rs_proxy::socket::configure_tcp(&stream, &addr.to_string());
                     // Admission control: every connection holds a global permit
                     // and starts in the general class pool. Exhaustion drops the
                     // new connection without closing established tunnels.
@@ -794,9 +829,9 @@ async fn run_daemon(
     if sysproxy_enabled {
         let sysproxy = clashx_rs_sysproxy::SysProxy::new(port, paths::sysproxy_snapshot_path());
         if let Err(e) = sysproxy.disable() {
-            // Printed, not logged: the default log filter shows only errors,
-            // and a silent failure here leaves the machine pointing at a port
-            // that is about to stop accepting connections.
+            // Printed, not logged: daemon logs go to the rolling file, and a
+            // silent failure here leaves the machine pointing at a port that
+            // is about to stop accepting connections.
             eprintln!("error: {e}");
         }
     }
@@ -810,6 +845,104 @@ async fn run_daemon(
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
+
+/// Result of the lazy rule walk shared by the data plane and `clashx-rs test`.
+struct RuleMatch<'a> {
+    matched: Option<&'a clashx_rs_config::rule::RuleEntry>,
+    resolved_ip: Option<IpAddr>,
+    process_rules_skipped: bool,
+}
+
+/// Walk rules lazily, resolving DNS and (when a source address is available)
+/// process names on demand.
+///
+/// `process_source` is `None` for `clashx-rs test`, where there is no client
+/// socket to attribute a process to. PROCESS-NAME rules are then marked
+/// attempted-and-skipped and reported via [`RuleMatch::process_rules_skipped`]
+/// instead of silently producing a different result.
+async fn evaluate_rules_lazily<'a>(
+    rule_engine: &'a RuleEngine,
+    resolver: &clashx_rs_dns::Resolver,
+    target_host: &str,
+    parsed_ip: Option<IpAddr>,
+    process_source: Option<std::net::SocketAddr>,
+) -> RuleMatch<'a> {
+    use clashx_rs_rule::EvalStep;
+
+    let host_field = if parsed_ip.is_some() {
+        None
+    } else {
+        Some(target_host)
+    };
+    let mut process_name: Option<String> = None;
+    let mut ip = parsed_ip;
+    // A literal-IP target counts as already-attempted-and-satisfied, so
+    // IP/GEOIP rules evaluate against it without triggering a DNS fetch.
+    let mut ip_attempted = parsed_ip.is_some();
+    let mut process_attempted = false;
+    let mut process_rules_skipped = false;
+    let mut start = 0usize;
+    let mut matched = None;
+
+    loop {
+        let input = MatchInput {
+            host: host_field,
+            ip,
+            process_name: process_name.as_deref(),
+            ip_attempted,
+            process_attempted,
+        };
+        match rule_engine.evaluate_from(&input, start) {
+            EvalStep::Matched(rule) => {
+                matched = Some(rule);
+                break;
+            }
+            EvalStep::NoMatch => break,
+            EvalStep::NeedsData {
+                resume_from,
+                need_ip,
+                need_process,
+            } => {
+                if need_ip {
+                    ip = match resolver.resolve(target_host).await {
+                        Ok(answer) => {
+                            tracing::debug!(
+                                host = %target_host,
+                                resolved = %answer,
+                                "DNS pre-resolved"
+                            );
+                            Some(answer)
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                host = %target_host,
+                                err = %e,
+                                "DNS pre-resolve failed, IP-based rules will skip"
+                            );
+                            None
+                        }
+                    };
+                    ip_attempted = true;
+                }
+                if need_process {
+                    if let Some(source) = process_source {
+                        process_name = rule_engine.process_lookup().lookup(source).await;
+                    } else {
+                        process_rules_skipped = true;
+                    }
+                    process_attempted = true;
+                }
+                start = resume_from;
+            }
+        }
+    }
+
+    RuleMatch {
+        matched,
+        resolved_ip: ip,
+        process_rules_skipped,
+    }
+}
 
 #[expect(
     clippy::too_many_lines,
@@ -844,76 +977,24 @@ async fn handle_connection(
         )
     };
 
-    let host_field: Option<&str> = if parsed_ip.is_some() {
-        None
+    let rule_match = if mode == Mode::Rule {
+        evaluate_rules_lazily(
+            &rule_engine,
+            &resolver,
+            &target_host,
+            parsed_ip,
+            Some(source_addr),
+        )
+        .await
     } else {
-        Some(&target_host)
-    };
-
-    let (matched_rule, resolved_ip, _process_name): (
-        Option<&clashx_rs_config::rule::RuleEntry>,
-        Option<IpAddr>,
-        Option<String>,
-    ) = if mode == Mode::Rule {
-        use clashx_rs_rule::EvalStep;
-        let mut owned_process: Option<String> = None;
-        let mut ip = parsed_ip;
-        // A literal-IP target counts as already-attempted-and-satisfied, so
-        // IP/GEOIP rules evaluate against it without triggering a DNS fetch.
-        let mut ip_attempted = parsed_ip.is_some();
-        let mut process_attempted = false;
-
-        let mut start = 0usize;
-        let mut matched_rule = None;
-        loop {
-            let input = MatchInput {
-                host: host_field,
-                ip,
-                process_name: owned_process.as_deref(),
-                ip_attempted,
-                process_attempted,
-            };
-            match rule_engine.evaluate_from(&input, start) {
-                EvalStep::Matched(rule) => {
-                    matched_rule = Some(rule);
-                    break;
-                }
-                EvalStep::NoMatch => break,
-                EvalStep::NeedsData {
-                    resume_from,
-                    need_ip,
-                    need_process,
-                } => {
-                    if need_ip {
-                        ip = match resolver.resolve(&target_host).await {
-                            Ok(r) => {
-                                tracing::debug!(host = %target_host, resolved = %r, "DNS pre-resolved");
-                                Some(r)
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    host = %target_host,
-                                    err = %e,
-                                    "DNS pre-resolve failed, IP-based rules will skip"
-                                );
-                                None
-                            }
-                        };
-                        ip_attempted = true;
-                    }
-                    if need_process {
-                        owned_process = rule_engine.process_lookup().lookup(source_addr).await;
-                        process_attempted = true;
-                    }
-                    start = resume_from;
-                }
-            }
+        RuleMatch {
+            matched: None,
+            resolved_ip: parsed_ip,
+            process_rules_skipped: false,
         }
-
-        (matched_rule, ip, owned_process)
-    } else {
-        (None, parsed_ip, None)
     };
+    let matched_rule = rule_match.matched;
+    let resolved_ip = rule_match.resolved_ip;
 
     // Selection-chain + candidate-list resolution (brief read lock — O(1) lookups).
     let group_name: Option<String>;
@@ -1008,7 +1089,7 @@ async fn handle_connection(
                 anyhow::bail!("proxy not found: {proxy_name}");
             }
 
-            let mut last_err = None;
+            let mut last_err = anyhow::anyhow!("no usable proxy candidate for {target_host}");
             let mut last_attempted = String::new();
             // Client bytes buffered during the first-byte window, replayed to
             // the next candidate on failover. Starts as the HTTP plain-proxy
@@ -1036,15 +1117,8 @@ async fn handle_connection(
                 {
                     Ok(o) => o,
                     Err(e) => {
-                        cooldown.record_failure(cand_name);
-                        if cooldown.is_cooled_down(cand_name) && !cooldown.is_sidelined(cand_name) {
-                            tracing::warn!(
-                                proxy = %cand_name,
-                                "proxy entered timed cooldown ({} consecutive failures)",
-                                crate::retry::COOLDOWN_FAILURE_THRESHOLD
-                            );
-                        }
-                        last_err = Some(e);
+                        cooldown.record_failure_and_warn(cand_name);
+                        last_err = e;
                         continue;
                     }
                 };
@@ -1130,9 +1204,9 @@ async fn handle_connection(
                                 target = %target_host,
                                 "no response after sending data, failing over (replay is safe)"
                             );
-                            last_err = Some(anyhow::anyhow!(
+                            last_err = anyhow::anyhow!(
                                 "no response from remote via {cand_name} (first-byte timeout)"
-                            ));
+                            );
                         } else {
                             // Replaying could duplicate a non-idempotent
                             // request at the origin — the first node may well
@@ -1171,9 +1245,9 @@ async fn handle_connection(
                                 target = %target_host,
                                 "remote closed before responding, failing over (replay is safe)"
                             );
-                            last_err = Some(anyhow::anyhow!(
+                            last_err = anyhow::anyhow!(
                                 "remote closed connection via {cand_name} before responding"
-                            ));
+                            );
                         } else {
                             tracing::warn!(
                                 proxy = %cand_name,
@@ -1206,37 +1280,22 @@ async fn handle_connection(
                     Err(FirstByteError::Outbound(e)) => {
                         // The tunnel to the node itself broke — this *is*
                         // node-attributable.
-                        cooldown.record_failure(cand_name);
-                        if cooldown.is_cooled_down(cand_name) && !cooldown.is_sidelined(cand_name) {
-                            tracing::warn!(
-                                proxy = %cand_name,
-                                "proxy entered timed cooldown ({} consecutive failures)",
-                                crate::retry::COOLDOWN_FAILURE_THRESHOLD
-                            );
-                        }
-                        last_err = Some(e);
+                        cooldown.record_failure_and_warn(cand_name);
+                        last_err = e;
                     }
                 }
             }
 
             let group_label = group_name.as_deref().unwrap_or(&proxy_name);
-            let error_text = last_err
-                .as_ref()
-                .map_or_else(|| "unknown".to_string(), |error| format!("{error:#}"));
             tracing::error!(
                 target = %target_host,
                 group = %group_label,
                 candidates = candidates.len(),
                 last_proxy = %last_attempted,
-                error = %error_text,
+                error = %format!("{last_err:#}"),
                 "all proxies failed"
             );
-            match last_err {
-                Some(err) => Err(err),
-                None => Err(anyhow::anyhow!(
-                    "no usable proxy candidate for {target_host}"
-                )),
-            }
+            Err(last_err)
         }
     }
 }
@@ -1317,7 +1376,7 @@ where
     Fut: std::future::Future<Output = Result<OutboundStream>>,
 {
     let max_attempts = crate::retry::MAX_RETRIES + 1;
-    let mut last_err = None;
+    let mut last_err = anyhow::anyhow!("no connection attempt was made for {label}");
 
     for attempt in 0..max_attempts {
         if attempt > 0 {
@@ -1344,7 +1403,7 @@ where
                     error = %e,
                     "connect attempt failed"
                 );
-                last_err = Some(e);
+                last_err = e;
                 if is_timeout {
                     tracing::debug!(
                         proxy = %label,
@@ -1357,7 +1416,7 @@ where
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no connection attempt was made for {label}")))
+    Err(last_err)
 }
 
 /// Failure modes of the post-connect first-byte window.
@@ -1450,9 +1509,6 @@ async fn first_byte_window(
         OutboundStream::Tls(s) => {
             first_byte_window_io(&mut **s, inbound, replay, timeout, idle, replay_truncated).await
         }
-        OutboundStream::Rejected => Err(FirstByteError::Outbound(anyhow::anyhow!(
-            "outbound rejected"
-        ))),
     }
 }
 
@@ -1633,9 +1689,6 @@ async fn relay_streams(
                 }
             };
             log_relay(&stats, slot.class(), &context);
-        }
-        OutboundStream::Rejected => {
-            drop(inbound);
         }
     }
     Ok(())
@@ -1829,15 +1882,33 @@ async fn control_rules(state: &Arc<RwLock<DaemonState>>) -> ControlResponse {
 }
 
 async fn control_test(state: &Arc<RwLock<DaemonState>>, domain: String) -> ControlResponse {
+    let parsed_ip: Option<IpAddr> = domain.parse().ok();
+    let (rule_engine, resolver, mode) = {
+        let st = state.read().await;
+        (
+            Arc::clone(&st.rule_engine),
+            Arc::clone(&st.resolver),
+            st.config.mode,
+        )
+    };
+
+    let (matched, process_rules_skipped) = if mode == Mode::Rule {
+        let rule_match =
+            evaluate_rules_lazily(&rule_engine, &resolver, &domain, parsed_ip, None).await;
+        (rule_match.matched, rule_match.process_rules_skipped)
+    } else {
+        (None, false)
+    };
+
     let st = state.read().await;
-    let input = match_input_from_host(&domain);
-    let (group, resolved_name, matched_rule) = st.resolve_routing_with_group(&input);
+    let (group, resolved_name, matched_rule) = st.resolve_route_for_match(matched);
     ControlResponse::success(json!({
         "domain": domain,
-        "mode": format!("{:?}", st.config.mode),
+        "mode": format!("{mode:?}"),
         "matched_rule": matched_rule,
         "resolved_proxy": resolved_name,
         "group": group,
+        "process_rules_skipped": process_rules_skipped,
     }))
 }
 
@@ -1909,21 +1980,26 @@ async fn subscription_auto_update(state: Arc<RwLock<DaemonState>>) {
 /// within `COOLDOWN_FAILURE_THRESHOLD` connections, and the probe supervisor
 /// re-reads the new tracker on its next tick.
 async fn reload_state(state: &Arc<RwLock<DaemonState>>) -> Result<()> {
-    let (path, mmdb_path, overrides) = {
+    let (path, mmdb_path, overrides, port_override) = {
         let st = state.read().await;
         (
             st.config_path.clone(),
             st.mmdb_path.clone(),
             st.startup_overrides.clone(),
+            st.port_override,
         )
     };
 
     let path_for_state = path.clone();
-    let new_config = tokio::task::spawn_blocking(move || load_config(&path))
+    let mut new_config = tokio::task::spawn_blocking(move || load_config(&path))
         .await
         .map_err(|e| anyhow::anyhow!("config load task panicked: {e}"))??;
+    if let Some(port) = port_override {
+        new_config.mixed_port = Some(port);
+    }
 
     let mut new_state = DaemonState::from_config(new_config, path_for_state, mmdb_path);
+    new_state.port_override = port_override;
     new_state
         .reapply_overrides(overrides)
         .map_err(|e| anyhow::anyhow!("--select overrides failed: {e}"))?;
@@ -2008,9 +2084,7 @@ fn compute_sleep_secs(config: Option<&clashx_rs_subscribe::SubscriptionConfig>) 
         return IDLE_CHECK_SECS;
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let now = clashx_rs_subscribe::manager::now_unix();
 
     // `None` => no enabled subscriptions to track; idle until one is added/re-enabled.
     config
@@ -2032,13 +2106,6 @@ fn compute_sleep_secs(config: Option<&clashx_rs_subscribe::SubscriptionConfig>) 
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     #[test]
     fn bypassed_rule_detection() {
         use std::net::IpAddr;
@@ -2098,7 +2165,7 @@ mod tests {
         );
     }
     use super::*;
-    use clashx_rs_config::types::{GroupType, Proxy, ProxyGroup, Socks5Proxy};
+    use clashx_rs_config::types::{DnsConfig, GroupType, Proxy, ProxyGroup, Socks5Proxy};
     use clashx_rs_rule::MatchInput;
 
     use crate::retry::CooldownTracker;
@@ -2286,6 +2353,56 @@ mod tests {
         let (group, proxy, _rule) = state.resolve_routing_with_group(&input);
         assert_eq!(group, Some("🚀 节点选择"));
         assert_eq!(proxy, "🇭🇰 香港 01"); // first proxy = default selection
+    }
+
+    #[tokio::test]
+    async fn test_command_resolves_dns_rules_and_reports_skipped_process_rules() {
+        let mut config = test_config();
+        config.mode = Mode::Rule;
+        config
+            .hosts
+            .insert("hosts-only.example".to_string(), "127.0.0.1".to_string());
+        config.dns = Some(DnsConfig {
+            enable: true,
+            ..DnsConfig::default()
+        });
+        config.rules = vec![
+            "PROCESS-NAME,someapp,🚀 节点选择".to_string(),
+            "IP-CIDR,127.0.0.1/32,🚀 节点选择".to_string(),
+            "MATCH,DIRECT".to_string(),
+        ];
+        let state = Arc::new(RwLock::new(DaemonState::from_config(
+            config,
+            PathBuf::from("/tmp/test.yaml"),
+            PathBuf::from("/tmp/nonexistent.mmdb"),
+        )));
+
+        let response = control_test(&state, "hosts-only.example".to_string()).await;
+        assert!(response.ok);
+        let data = response.data.expect("status payload");
+        assert_eq!(data["resolved_proxy"], "🇭🇰 香港 01");
+        assert!(
+            data["matched_rule"]
+                .as_str()
+                .expect("matched rule")
+                .contains("IP-CIDR,127.0.0.1/32"),
+            "unexpected matched rule: {data}"
+        );
+        assert_eq!(data["process_rules_skipped"], true);
+    }
+
+    #[test]
+    fn background_mode_fails_instead_of_silently_succeeding() {
+        let err = start_background(
+            Path::new("/tmp/config.yaml"),
+            &[],
+            PathBuf::from("/tmp/mmdb"),
+            false,
+            false,
+            None,
+        )
+        .expect_err("background mode must fail until implemented");
+        assert!(err.to_string().contains("not yet implemented"));
     }
 
     #[test]

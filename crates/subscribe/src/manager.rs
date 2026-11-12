@@ -162,13 +162,6 @@ fn find_subscription_mut<'a>(
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
 
     fn sample(last_updated: u64, interval: u64) -> Subscription {

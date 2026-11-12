@@ -102,10 +102,12 @@ pub trait RelayPromotion {
     fn on_half_closed(&mut self, _half_closed: bool) {}
 }
 
-/// No-op promotion for callers that do not need lifetime classification.
+/// No-op promotion used by the relay tests.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct NoPromotion;
 
+#[cfg(test)]
 impl RelayPromotion for NoPromotion {
     fn promote(&mut self) -> Option<Duration> {
         None
@@ -389,39 +391,8 @@ where
     }
 }
 
-/// Bidirectional copy with no lifetime limits.
-///
-/// Kept for callers that only need byte forwarding; daemon traffic uses
-/// [`relay_with_policy`].
-///
-/// # Errors
-///
-/// Returns an error when a copy fails with an I/O error other than a
-/// peer-driven close; peer resets and aborts end the relay normally and yield
-/// the byte counts recorded so far.
-pub async fn relay<A, B>(a: A, b: B) -> Result<(u64, u64)>
-where
-    A: AsyncRead + AsyncWrite + Unpin + Send,
-    B: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    let policy = RelayPolicy {
-        idle: Duration::ZERO,
-        half_close_idle: Duration::ZERO,
-        promote_after: None,
-    };
-    let stats = relay_with_policy(a, b, policy, &mut NoPromotion).await?;
-    Ok((stats.a_to_b, stats.b_to_a))
-}
-
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unchecked_time_subtraction
-    )]
-
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
