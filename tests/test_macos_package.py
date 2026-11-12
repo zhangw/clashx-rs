@@ -159,10 +159,11 @@ state_path.write_text(json.dumps(data))
     def test_machine_readable_status_is_used_for_json_snapshots(self):
         installer = (ROOT / 'scripts/macos-pkg/install-user.sh').read_text()
         deployer = (ROOT / 'scripts/deploy-local-macos.sh').read_text()
-        self.assertIn('status --json > "$transaction/status.json"', installer)
-        self.assertIn('status --json > "$transaction/restored.json"', installer)
-        self.assertIn('status --json > "$deploy_tmp/status.json"', deployer)
-        self.assertIn("['status', '--json']", deployer)
+        self.assertIn('status_snapshot "$transaction/status.json"', installer)
+        self.assertIn('status_snapshot "$transaction/restored.json"', installer)
+        self.assertIn('status --json > "$output"', installer)
+        self.assertIn('capture_status "$deploy_tmp/status.json"', deployer)
+        self.assertIn('status --json > "$output"', deployer)
 
     def test_machine_readable_status_disables_log_and_ansi_pollution(self):
         source = (ROOT / 'src/main.rs').read_text()
