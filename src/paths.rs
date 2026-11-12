@@ -1,10 +1,26 @@
 use std::path::PathBuf;
 
 pub const DEFAULT_MIXED_PORT: u16 = 7890;
+/// Daily runtime log files kept before the oldest is removed.
+pub const LOG_RETENTION_FILES: usize = 7;
 
 pub fn runtime_dir() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     home.join(".config/clashx-rs")
+}
+
+/// Runtime log directory. On macOS this matches the LaunchAgent's existing
+/// log directory; other platforms keep logs beside the runtime state.
+pub fn log_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+        home.join("Library/Logs/clashx-rs")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        runtime_dir().join("logs")
+    }
 }
 
 pub fn socket_path(port: u16) -> PathBuf {

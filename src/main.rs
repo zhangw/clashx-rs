@@ -13,6 +13,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clashx_rs_config::LogLevel;
 use clashx_rs_sysproxy::SysProxy;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
 
 use control::ControlRequest;
@@ -218,38 +220,80 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-/// Install the log filter.
+/// Build the log filter.
 ///
 /// `RUST_LOG` wins when it is set — an explicit override should not be
 /// second-guessed. Otherwise the config file's `log-level` decides, so the
 /// setting is not silently inert.
-fn init_logging(config_path: &Path, quiet: bool) {
-    let filter = if quiet {
-        EnvFilter::new("off")
-    } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            let directive = match clashx_rs_config::load_log_level(config_path) {
-                LogLevel::Silent => "off",
-                LogLevel::Error => "error",
-                LogLevel::Warning => "warn",
-                LogLevel::Info => "info",
-                LogLevel::Debug => "debug",
-            };
-            EnvFilter::new(directive)
-        })
-    };
+fn log_filter(config_path: &Path, quiet: bool) -> EnvFilter {
+    if quiet {
+        return EnvFilter::new("off");
+    }
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let directive = match clashx_rs_config::load_log_level(config_path) {
+            LogLevel::Silent => "off",
+            LogLevel::Error => "error",
+            LogLevel::Warning => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+        };
+        EnvFilter::new(directive)
+    })
+}
+
+/// Install logging. Daemon runs write daily rolling files under
+/// [`paths::log_dir`] (7 retained); CLI commands keep using stderr.
+fn init_logging(config_path: &Path, quiet: bool, file_logging: bool) -> Option<WorkerGuard> {
+    if file_logging {
+        let log_dir = paths::log_dir();
+        if let Err(error) = std::fs::create_dir_all(&log_dir) {
+            eprintln!(
+                "warning: cannot create log directory {}: {error}; logging to stderr",
+                log_dir.display()
+            );
+        } else {
+            // `max_log_files` is enforced by the appender on every runtime
+            // rotation (and when opening): no separate startup scan.
+            match RollingFileAppender::builder()
+                .rotation(Rotation::DAILY)
+                .filename_prefix("clashx-rs")
+                .filename_suffix("log")
+                .max_log_files(paths::LOG_RETENTION_FILES)
+                .build(&log_dir)
+            {
+                Ok(appender) => {
+                    let (writer, guard) = tracing_appender::non_blocking(appender);
+                    tracing_subscriber::fmt()
+                        .with_env_filter(log_filter(config_path, quiet))
+                        .with_ansi(false)
+                        .with_writer(writer)
+                        .init();
+                    return Some(guard);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: cannot open rolling log in {}: {error}; logging to stderr",
+                        log_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(log_filter(config_path, quiet))
         .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
+    None
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = expand_tilde(&cli.config);
     let machine_status = matches!(&cli.command, Command::Status { json: true });
-    init_logging(&config_path, machine_status);
+    let daemon_mode = matches!(&cli.command, Command::Run { .. });
+    let _log_guard = init_logging(&config_path, machine_status, daemon_mode);
     let ctrl_port = resolve_port(&cli);
 
     match cli.command {

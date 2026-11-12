@@ -98,6 +98,10 @@ not a live enumeration of all process descriptors.
   occupancy, so a headless daemon has a heartbeat without per-connection logs.
 - Per-connection routing and relay-end lines are DEBUG and include peer,
   target, proxy, duration and bytes read.
+- Daemon runtime logs roll daily to
+  `~/Library/Logs/clashx-rs/clashx-rs.<date>.log`; the appender removes files
+  beyond 7 on each rotation. `stdout.log`/`stderr.log` only carry launchd
+  startup/early output.
 
 Local deployment and package installation set the LaunchAgent soft limit to
 8192, preserve higher existing values and respect lower explicit hard limits.

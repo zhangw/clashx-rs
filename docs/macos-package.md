@@ -78,7 +78,7 @@ curl --proxy http://127.0.0.1:7890 --max-time 20 -o /dev/null -w '%{http_code}\n
 "$HOME/Library/Application Support/clashx-rs/local-service.sh" start
 ```
 
-日志位于 `~/Library/Logs/clashx-rs/`，安装记录位于 `~/Library/Application Support/clashx-rs/package-info.txt`。永久禁用/重新启用自启动见 [服务管理](local-macos-deployment.md)。
+日志位于 `~/Library/Logs/clashx-rs/`：运行时日志为 `clashx-rs.<日期>.log`，按天轮转并自动保留最近 7 份；`stdout.log` / `stderr.log` 仅用于启动打印和早期/panic 输出。安装记录位于 `~/Library/Application Support/clashx-rs/package-info.txt`。永久禁用/重新启用自启动见 [服务管理](local-macos-deployment.md)。
 
 安装失败时查看安装器日志（“窗口 → 安装器日志”）及服务日志。普通失败会自动尝试回滚。首次安装回滚使用 `sysproxy restore` 恢复原代理设置；无快照或 daemon 已恢复时不修改设置，恢复失败则保留快照及程序以便重试。若提示回滚不完整，备份保留在 `~/Library/Application Support/clashx-rs/.pkg-install/`，检查恢复前不要删除该目录或强行重装。断电或强制终止安装也可能留下此目录。
 
