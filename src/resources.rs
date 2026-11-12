@@ -636,7 +636,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // test child lowers its own RLIMIT_NOFILE
     fn exhausted_accept_recovers_in_child() {
         const CHILD: &str = "CLASHX_FD_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {

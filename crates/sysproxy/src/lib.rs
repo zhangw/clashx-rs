@@ -38,6 +38,7 @@ pub struct SysProxy {
     port: u16,
     /// Where the pre-enable settings are recorded so `disable` can restore
     /// them. Only macOS mutates persistent state, so only macOS reads it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     snapshot_path: PathBuf,
 }
 
@@ -90,7 +91,8 @@ impl SysProxy {
             if !bypass.is_empty() {
                 tracing::warn!("proxy bypass list is not yet supported on Linux");
             }
-            linux::enable(self.port)
+            linux::enable(self.port);
+            Ok(())
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
@@ -121,7 +123,10 @@ impl SysProxy {
         #[cfg(target_os = "macos")]
         return macos::disable(self.port, &self.snapshot_path);
         #[cfg(target_os = "linux")]
-        return linux::disable();
+        return {
+            linux::disable();
+            Ok(())
+        };
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Ok(())
     }
@@ -143,7 +148,10 @@ impl SysProxy {
         #[cfg(target_os = "macos")]
         return macos::turn_off(&self.snapshot_path);
         #[cfg(target_os = "linux")]
-        return linux::disable();
+        return {
+            linux::disable();
+            Ok(())
+        };
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Ok(())
     }
@@ -164,7 +172,7 @@ impl SysProxy {
         #[cfg(target_os = "macos")]
         return macos::status();
         #[cfg(target_os = "linux")]
-        return linux::status(self.port);
+        return Ok(linux::status(self.port));
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Ok("unsupported platform".to_string())
     }

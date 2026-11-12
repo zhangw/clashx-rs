@@ -1768,7 +1768,10 @@ async fn control_stop(state: &Arc<RwLock<DaemonState>>) -> ControlResponse {
         if sysproxy_enabled {
             let sysproxy = clashx_rs_sysproxy::SysProxy::new(port, paths::sysproxy_snapshot_path());
             if let Err(e) = sysproxy.disable() {
-                tracing::error!(error = %e, "failed to disable system proxy during shutdown");
+                // Printed, not logged: the log filter may be silent, and the
+                // non-blocking log writer is not flushed before exit(0). This
+                // mirrors the SIGTERM path above for the same failure.
+                eprintln!("error: {e}");
             }
         }
         // Best-effort cleanup: the process is about to exit.

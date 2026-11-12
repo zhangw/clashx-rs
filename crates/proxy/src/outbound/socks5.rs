@@ -413,6 +413,43 @@ mod tests {
         );
     }
 
+    /// Server that selects USERNAME/PASSWORD even though the client offered
+    /// only NO_AUTH (no credentials configured).
+    async fn run_unexpected_auth_server(listener: TcpListener) {
+        let (mut conn, _) = listener.accept().await.unwrap();
+
+        let _ver = conn.read_u8().await.unwrap();
+        let nmethods = conn.read_u8().await.unwrap();
+        let mut methods = vec![0u8; nmethods as usize];
+        conn.read_exact(&mut methods).await.unwrap();
+        assert_eq!(
+            methods,
+            vec![NO_AUTH],
+            "client must not offer USERNAME/PASSWORD without credentials"
+        );
+        conn.write_all(&[SOCKS5_VERSION, USERNAME_PASSWORD_AUTH])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_auth_selected_without_creds_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(run_unexpected_auth_server(listener));
+
+        let target = TargetAddr::Domain("example.com".to_string(), 443);
+        let err = connect("127.0.0.1", server_addr.port(), &target, None, None, None)
+            .await
+            .expect_err("expected a clean failure when the server demands credentials");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("requested username/password"),
+            "unexpected error: {msg}"
+        );
+    }
+
     /// Server that selects `NO_AUTH` even though the client offered both methods.
     async fn run_no_auth_preferred_server(listener: TcpListener) {
         let (mut conn, _) = listener.accept().await.unwrap();

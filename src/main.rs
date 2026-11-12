@@ -80,8 +80,9 @@ enum Command {
         /// Override the selected proxy in a group at startup (GROUP=PROXY)
         #[arg(long = "select", value_name = "GROUP=PROXY")]
         selections: Vec<String>,
-        /// Path to the `GeoIP` mmdb database file
-        #[arg(long = "mmdb")]
+        // Path to the GeoIP mmdb database file. The explicit `help` keeps
+        // clap's output free of doc-comment backticks.
+        #[arg(long = "mmdb", help = "Path to the GeoIP mmdb database file")]
         mmdb: Option<String>,
         /// If mmdb is missing, download it in the background after proxy starts
         #[arg(long = "mmdb-auto-download")]
@@ -124,7 +125,8 @@ enum Command {
         #[command(subcommand)]
         action: SysproxyAction,
     },
-    /// Download the `GeoIP` mmdb database
+    // Download the GeoIP mmdb database.
+    #[command(about = "Download the GeoIP mmdb database")]
     MmdbDownload {
         /// SOCKS5 or HTTP proxy URL for the download
         #[arg(long)]
@@ -715,6 +717,28 @@ mod cli_tests {
 
     use super::{redact_url_for_display, Cli, Command};
     use clap::Parser;
+
+    #[test]
+    fn clap_help_keeps_the_original_mmdb_wording() {
+        use clap::CommandFactory;
+
+        let mut cmd = Cli::command();
+        let run = cmd.find_subcommand_mut("run").expect("run subcommand");
+        let run_help = run.render_long_help().to_string();
+        assert!(
+            run_help.contains("Path to the GeoIP mmdb database file"),
+            "unexpected run help: {run_help}"
+        );
+
+        let mmdb = cmd
+            .find_subcommand_mut("mmdb-download")
+            .expect("mmdb-download subcommand");
+        let mmdb_help = mmdb.render_long_help().to_string();
+        assert!(
+            mmdb_help.contains("Download the GeoIP mmdb database"),
+            "unexpected mmdb-download help: {mmdb_help}"
+        );
+    }
 
     #[test]
     fn machine_status_flag_is_parsed() {

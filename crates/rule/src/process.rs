@@ -260,18 +260,13 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
 }
 
 #[cfg(target_os = "linux")]
-#[expect(
-    unsafe_code,
-    reason = "libproc socket union fields are read after checking soi_kind; SAFETY inline"
-)]
 fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
     let mut map: HashMap<u16, String> = HashMap::new();
 
     let mut inode_to_port: HashMap<String, u16> = HashMap::new();
     for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Ok(content) = std::fs::read_to_string(file) else {
+            continue;
         };
         for line in content.lines().skip(1) {
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -283,9 +278,8 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
             if inode == "0" {
                 continue;
             }
-            let port_hex = match local.rsplit_once(':') {
-                Some((_, p)) => p,
-                None => continue,
+            let Some((_, port_hex)) = local.rsplit_once(':') else {
+                continue;
             };
             if let Ok(port) = u16::from_str_radix(port_hex, 16) {
                 inode_to_port.insert(inode.to_string(), port);
@@ -297,25 +291,26 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
         return map;
     }
 
-    let proc_dir = match std::fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return map,
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return map;
     };
 
     for entry in proc_dir.flatten() {
         let pid_name = entry.file_name();
-        let pid_str = match pid_name.to_str() {
-            Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
-            _ => continue,
+        let Some(pid_str) = pid_name.to_str() else {
+            continue;
         };
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
 
         // Read comm first so we can skip non-matching processes before the
         // expensive fd walk. Reading /proc/{pid}/comm is a single small file.
         let comm_path = format!("/proc/{pid_str}/comm");
-        let proc_name = match std::fs::read_to_string(&comm_path) {
-            Ok(s) => s.trim().to_string(),
-            Err(_) => continue,
+        let Ok(proc_name) = std::fs::read_to_string(&comm_path) else {
+            continue;
         };
+        let proc_name = proc_name.trim().to_string();
         if let Some(targets) = targets {
             if !targets.contains(&proc_name) {
                 continue;
@@ -323,22 +318,19 @@ fn scan_tcp_sockets(targets: Option<&HashSet<String>>) -> HashMap<u16, String> {
         }
 
         let fd_dir = format!("/proc/{pid_str}/fd");
-        let fds = match std::fs::read_dir(&fd_dir) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
         };
         for fd_entry in fds.flatten() {
-            let link = match std::fs::read_link(fd_entry.path()) {
-                Ok(l) => l,
-                Err(_) => continue,
+            let Ok(link) = std::fs::read_link(fd_entry.path()) else {
+                continue;
             };
             let link_str = link.to_string_lossy();
-            let inode = match link_str
+            let Some(inode) = link_str
                 .strip_prefix("socket:[")
                 .and_then(|s| s.strip_suffix(']'))
-            {
-                Some(i) => i,
-                None => continue,
+            else {
+                continue;
             };
             if let Some(&port) = inode_to_port.get(inode) {
                 map.entry(port).or_insert_with(|| proc_name.clone());
