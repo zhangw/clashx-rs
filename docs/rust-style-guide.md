@@ -10,7 +10,8 @@ silent, the rule below is the project decision.
 
 Keywords **MUST**, **SHOULD**, and **MAY** follow RFC 2119. A rule may be
 waived only with a local `#[expect(lint, reason = "...")]` or an explicit note
-in the review document; blanket `#![allow(...)]` is reserved for test modules.
+in the commit message or change description; blanket `#![allow(...)]` is
+reserved for test builds.
 
 ## How to use this guide
 
@@ -62,9 +63,10 @@ in the review document; blanket `#![allow(...)]` is reserved for test modules.
 - **NAME-7 (SHOULD)** Avoid repeating the module name in a type name when the
   type is re-exported at the crate root (`relay::Policy`, not
   `relay::RelayPolicy`, if `Policy` is unambiguous there).
-- **NAME-8 (MUST)** Durations in constant names carry their unit
-  (`_SECS`, `_MS`, `_TIMEOUT`); sizes carry `_BYTES`. A bare number in a
-  timeout calculation is a review finding.
+- **NAME-8 (MUST)** Numeric constants carry their unit in the name (`_SECS`,
+  `_MS`, `_BYTES`); constants whose type is `Duration` are exempt because the
+  type carries the unit. A bare number in a timeout calculation is a review
+  finding.
 - **NAME-9 (MUST)** Single-letter names are limited to loop indices (`i`,
   `j`) and coordinate-style tuples. `e` is acceptable for an error binding in
   `map_err(|e| ...)`; nothing else.
@@ -85,11 +87,16 @@ in the review document; blanket `#![allow(...)]` is reserved for test modules.
   roughly 80 lines. Split by responsibility, not by line count. A cohesive
   state machine that is longer is acceptable with
   `#[expect(clippy::too_many_lines, reason = "...")]` and a comment explaining
-  the invariant that keeps it together.
+  the invariant that keeps it together. The binary's orchestration entry
+  points (for example `src/daemon.rs`) may exceed the file budget when the
+  startup/shutdown ordering invariant is only visible as one sequence; note
+  the invariant and keep protocol/transport out (see ORG-8).
 - **ORG-6 (MUST)** Platform code lives in `macos.rs`/`linux.rs` modules behind
   `#[cfg(target_os = ...)]`; `lib.rs` exposes one portable facade.
 - **ORG-7 (MUST)** `lib.rs` re-exports the minimum public API and keeps
-  implementation modules private or `pub(crate)`. A new `pub mod` is an API
+  implementation modules private or `pub(crate)`. A `pub mod` is allowed when
+  the module is part of the crate's documented public API (the crate root docs
+  or the module docs explain its role); any new `pub mod` is still an API
   commitment.
 - **ORG-8 (SHOULD)** The binary's `daemon.rs` stays orchestration-only.
   Protocol parsing and transport belong to `crates/proxy`, DNS to
@@ -148,8 +155,9 @@ in the review document; blanket `#![allow(...)]` is reserved for test modules.
   `tokio::sync` locks when the guard must live across an await point, and keep
   the critical section short.
 - **ASYNC-3 (MUST)** Bound every external I/O with a timeout: connect, TLS
-  handshake, first byte, and relay idle have explicit budgets in
-  `src/retry.rs`.
+  handshake, and inbound protocol handshake budgets live in
+  `crates/proxy/src/timeout.rs`; first-byte, relay-idle, and half-close
+  budgets live in `src/retry.rs`.
 - **ASYNC-4 (MUST)** `select!` branches must be cancellation-safe or document
   why they are not. Dropping a future must not lose buffered protocol bytes.
 - **ASYNC-5 (MUST)** Spawned tasks are `Send + 'static`, handle their own
@@ -162,14 +170,20 @@ in the review document; blanket `#![allow(...)]` is reserved for test modules.
 
 ## 7. Logging and CLI output (`LOG`)
 
-- **LOG-1 (MUST)** Libraries and the daemon use `tracing` only. `println!` /
-  `eprintln!` are allowed only for user-facing CLI output in `src/main.rs` and
-  `src/client.rs`, the Linux sysproxy helper whose documented contract is to
-  print shell `export` lines, and fatal shutdown diagnostics that must reach
-  stderr even when the log filter is silent (print, do not log).
-- **LOG-2 (MUST)** Use structured fields (`host = %host`, `err = %e`) and a
-  lowercase message without a trailing period. Do not interpolate values into
-  the message string.
+- **LOG-1 (MUST)** Libraries use `tracing` only; the daemon uses `tracing`
+  except for its foreground lifecycle messages. `println!` / `eprintln!` are
+  allowed only for user-facing CLI output in `src/main.rs`, `src/client.rs`,
+  and `src/latency.rs`; the Linux sysproxy helper whose documented contract is
+  to print shell `export`/`unset` lines; the daemon's foreground lifecycle
+  messages (startup readiness, shutdown, and startup warnings that must reach
+  the interactive console because daemon logs go to the rolling file); and
+  fatal shutdown diagnostics that must reach stderr even when the log filter
+  is silent (print, do not log).
+- **LOG-2 (MUST)** Use structured fields for key values (`host = %host`,
+  `err = %e`) and a lowercase message without a trailing period. A
+  human-readable error chain may be interpolated into the message
+  (`failed to set system proxy: {e}`); never interpolate secrets or hide key
+  identifiers inside the format string.
 - **LOG-3 (MUST)** Levels: `error` = a human must act; `warn` = degraded but
   working; `info` = lifecycle; `debug` = per-connection detail; `trace` =
   per-byte detail. Startup and shutdown are `info`.
@@ -209,9 +223,10 @@ in the review document; blanket `#![allow(...)]` is reserved for test modules.
   paused time or explicit timeouts, and keep tests deterministic on a loaded
   machine.
 - **TEST-5 (MUST)** Tests may `unwrap`/`expect`/`panic`; production code may
-  not. Test modules opt out with
-  `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic,
-  clippy::unchecked_time_subtraction)]`.
+  not. Test builds opt out at the crate root with
+  `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used,
+  clippy::panic, clippy::unchecked_time_subtraction))]`; integration-test
+  crates keep the same list at the file root.
 - **TEST-6 (SHOULD)** Cover error paths and boundaries, not just the happy
   path: empty input, truncated frames, peer reset, timeout.
 - **TEST-7 (MUST)** Integration tests use only the crate's public API.
@@ -277,7 +292,7 @@ Required before commit:
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test
 ```
 
@@ -291,9 +306,8 @@ cargo deny check advisories
 ### Exceptions
 
 - Use `#[expect(lint, reason = "...")]` on the smallest item that needs it.
-- Test modules may opt out of panic-on-failure lints with a module-level
-  `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic,
-  clippy::unchecked_time_subtraction)]`.
+- Test builds opt out of panic-on-failure lints at the crate root (see
+  TEST-5); integration-test crates put the same list at the file root.
 - Any exception that survives two review rounds is either promoted to a rule
   amendment or removed; do not accumulate permanent ignores.
 
@@ -309,13 +323,13 @@ When reviewing a change, check in this order:
 5. Any lock held across an await, unbounded I/O, or unthrottled log? (`ASYNC-2`,
    `ASYNC-3`, `LOG-5`)
 6. Are tests deterministic and named for behavior? (`TEST-2`, `TEST-4`)
-7. Does `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`
-   pass?
+7. Does `cargo fmt --check` and
+   `cargo clippy --workspace --all-targets -- -D warnings` pass?
 
 ## Review outputs
 
-Style review findings are reported with the change (commit message or review
-thread) and are not retained as dated style reports. Durable architecture,
-security, and performance reviews continue to live in `docs/reviews/`
-according to `AGENTS.md`. Rule changes are made in this guide, not in a
-review report.
+Style review findings are reported with the change (commit message or change
+description) and are not retained as dated style review documents. Durable
+architecture, security, and performance reviews continue to live in
+`docs/reviews/` according to `AGENTS.md`. Rule changes are made in this guide,
+not in a review report.

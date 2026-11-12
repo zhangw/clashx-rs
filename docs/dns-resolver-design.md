@@ -1,7 +1,7 @@
 # DNS Resolver Design (mihomo-compatible semantics)
 
-Status: implemented on `feat/dns-resolver`. This document describes the
-as-built design; deviations from the original plan are called out inline.
+Status: implemented and merged. This document describes the as-built design;
+deviations from the original plan are called out inline.
 
 ## Goal
 

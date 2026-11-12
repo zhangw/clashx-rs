@@ -34,7 +34,7 @@ A pure Rust, headless Clash-compatible proxy CLI for macOS and Linux.
 - mihomo-compatible DNS policy — UDP/DoH/DoT nameserver race, `hosts:`, `proxy-server-nameserver`, fail-open system fallback (see docs/dns-resolver-design.md)
 - Lazy two-phase rule evaluation — DNS/process lookups only run when a rule needs them
 - Per-proxy cooldown + failover across candidate proxies
-- Parallel-instance support — socket/pid files are keyed by mixed-port
+- Parallel-instance support — socket/pid files are keyed by the resolved port
 - Config subscriptions — download Clash YAML from URLs and auto-refresh
 - GeoIP mmdb download (optionally through the running proxy)
 - Local control socket and CLI commands for status, reload, rules, groups, and switching
@@ -60,7 +60,7 @@ This project is usable as a local CLI proxy, but it is still early-stage softwar
 
 Known caveats:
 
-- `clashx-rs run -d` (background daemon mode) is not implemented yet
+- `clashx-rs run -d` (background daemon mode) is not implemented; it exits non-zero with an error and the help text says so
 - DNS honors the mihomo `dns:` block (UDP/DoH/DoT race with system fallback); fake-ip mode and IPv6/AAAA are deferred — see docs/dns-resolver-design.md
 - `PROCESS-NAME` lookup is best-effort and platform-dependent
 - `GEOIP` requires a MaxMind Country mmdb at `~/.config/clashx-rs/Country.mmdb` (or provide `--mmdb <path>`)
@@ -138,7 +138,7 @@ cargo test
 Lint:
 
 ```bash
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 For a native macOS installer, see [macOS package installation and upgrades](docs/macos-package.md). For source-based updates to an existing LaunchAgent, see [local deployment and service management](docs/local-macos-deployment.md).
@@ -174,6 +174,17 @@ Switch a proxy inside a group:
 ```bash
 cargo run -- switch Proxy sg-trojan
 ```
+
+Test how a domain would be routed:
+
+```bash
+cargo run -- test example.com
+```
+
+In rule mode, the daemon resolves the domain through its configured resolver
+and evaluates `IP-CIDR`/`GEOIP` rules lazily. `PROCESS-NAME` rules are skipped
+because a control request carries no client source address; the JSON response
+reports `process_rules_skipped`.
 
 Reload config:
 
@@ -246,8 +257,10 @@ Commands:
   dns flush [--host <domain>]
 ```
 
-`--port` overrides the mixed-port so multiple daemons can run in parallel —
-socket and pid files are keyed by port.
+`--port` overrides the daemon mixed-port for the run listener, control
+socket/PID, and system-proxy port, and the override survives config reloads;
+without it the config `mixed-port` is used (default `7890`). This lets multiple
+daemons run in parallel — socket and pid files are keyed by the resolved port.
 
 ## Configuration
 
@@ -320,7 +333,7 @@ Unknown fields are ignored so existing Clash configs are easier to reuse.
 ~/.config/clashx-rs/
 ```
 
-Important paths (port defaults to 7890; change via `--port` or `mixed-port`):
+Important paths (the port resolves from `--port`, then config `mixed-port`, then the `7890` default):
 
 - control socket:
   `~/.config/clashx-rs/clashx-rs-<port>.sock`
@@ -337,6 +350,7 @@ macOS:
 
 - uses `networksetup`
 - can enable or disable local web / secure web / SOCKS proxy settings
+- `sysproxy status` prints the web proxy block first (byte-compatible with the previous output, for scripts that parse it), followed by the secure web and SOCKS blocks
 
 Linux:
 
@@ -357,7 +371,7 @@ Useful commands:
 
 ```bash
 cargo test
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo audit
 ```
 

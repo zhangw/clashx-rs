@@ -18,14 +18,20 @@ Current implemented shape:
   - DIRECT
   - REJECT
 - rule types:
+  - `DOMAIN`
   - `DOMAIN-SUFFIX`
+  - `DOMAIN-KEYWORD`
   - `IP-CIDR`
+  - `GEOIP`
   - `PROCESS-NAME`
   - `MATCH`
 - config modes:
   - `rule`
   - `global`
   - `direct`
+- port selection:
+  - `--port` overrides the run listener, control socket/PID, and system-proxy port; the override survives config reload
+  - without `--port`, the config `mixed-port` is used, then the default `7890`
 - DNS as a first-class data-plane subsystem (mihomo-compatible keys):
   - `dns.nameserver` supports plain UDP (bare IP / `udp://`), DoH (`https://`), DoT (`tls://`); unknown schemes are warned about and skipped
   - all nameservers failing falls back to the system resolver (fail-open)
@@ -35,6 +41,9 @@ Current implemented shape:
   - `dns flush [--host]` clears both resolver caches (see docs/dns-resolver-design.md)
 - startup proxy-group selection overrides:
   - `clashx-rs run --select GROUP=PROXY`
+- routing diagnostics:
+  - `clashx-rs test <domain>` (rule mode) resolves the domain through the daemon resolver and evaluates `IP-CIDR`/`GEOIP` rules lazily
+  - `PROCESS-NAME` rules are skipped because a control request has no client source address; the control response reports `process_rules_skipped`
 - active node-liveness probes:
   - per-group `health-check` block (mihomo-compatible keys: `enable`, `url`, `interval`, `expected-status`)
   - absent block = enabled with defaults (`http://www.gstatic.com/generate_204`, 300s, expect 204)
@@ -46,20 +55,19 @@ Current implemented shape:
   - proxy-node connect timeout 5s (DIRECT stays 10s)
   - timeout errors skip same-node retries and fail over immediately
   - first-byte window: phase 1 is bounded by the 1h relay idle budget; after client data is sent the remote must answer within 8s (re-armed per chunk). On timeout, safely replayable bytes (TLS handshake / bodiless idempotent HTTP) fail over; non-replayable requests keep the connection and fall back to plain relay. If even the last candidate times out, the connection relays on instead of failing (all nodes answering alike implies a slow origin)
-  - connection lifetime: 1h with no bytes in either direction; after the first EOF, 60s (general) / 10m (streaming) inactivity. Connections still open in both directions after 30s are promoted to the streaming class; connections already half-closed stay general and use the 60s drain. Global 2048, general/streaming 1536 each (512 floor each)
-  - first-byte failures never feed cooldown; they only degrade the node in candidate ordering for 120s (ordering-only, never excluded)
-  - passive cooldown: 2 consecutive connect/tunnel failures → 60s timed cooldown; reload resets the tracker
+  - connection lifetime: 1h with no bytes in either direction; after the first EOF, 60s (general) / 10m (streaming) inactivity. Connections still open in both directions after 30s are promoted to the streaming class; connections already half-closed stay general and use the 60s drain. Global cap is fd-derived (at most 2048); class caps are `min(1536, global)`, with a 512-permit guarantee each at the full budget
+  - first-byte timeout and remote close are not node-attributable: they never feed cooldown, only a 120s ordering-only degradation (never excluded)
+  - an upstream stall or a tunnel error to the node feeds passive cooldown; passive cooldown is 2 consecutive failures → 60s timed cooldown, and reload resets the tracker
 
 ## Current Caveats
 
-- `clashx-rs run -d` is not implemented
+- `clashx-rs run -d` is not implemented; it exits non-zero with an error and the help text says so
 - `dns.enable=false` → system resolver for everything, `hosts:` ignored
 - `ipv6: true` behaves as `false` (AAAA never queried); pure-IPv6 system results are discarded
 - `enhanced-mode: fake-ip` parses but degrades to plain mode with a one-time warning
-- health-probe reachability pre-check (`server_is_probeable`) and `latency --tcp` still use the system resolver, so they can disagree with the configured DNS policy
+- health-probe reachability pre-check (`server_is_probeable`) and the `latency` default TCP mode still use the system resolver, so they can disagree with the configured DNS policy
 - `PROCESS-NAME` lookup is best-effort and relatively expensive
 - `allow-lan` exposes an unauthenticated proxy on the configured bind address
-- `sysproxy` CLI currently hardcodes the default port `7890` instead of resolving the daemon’s configured port
 
 ## Repo Layout
 
@@ -73,8 +81,12 @@ Current implemented shape:
   control request/response types
 - `src/paths.rs`
   runtime paths and default port
+- `src/latency.rs`
+  latency probes and table rendering for `latency`
 - `src/probe.rs`
   active node-liveness probes (per-node HTTP status check through the node itself)
+- `src/resources.rs`
+  fd budget, admission control, and the connection class pools
 - `src/retry.rs`
   retry/backoff/failover constants and the cooldown tracker
 
@@ -84,19 +96,23 @@ Current implemented shape:
   rule parsing/evaluation and process lookup helpers
 - `crates/dns`
   mihomo-compatible resolver: UDP/DoH/DoT upstreams, bootstrap, hosts, caches (see docs/dns-resolver-design.md)
+- `crates/geoip`
+  MaxMind mmdb loading and download for `GEOIP` rules
+- `crates/subscribe`
+  subscription download/refresh and on-disk state
 - `crates/proxy`
   inbound protocol handling, outbound connectors, relay, timeouts
 - `crates/sysproxy`
   macOS/Linux system proxy helpers
 
 - `tests/`
-  integration-style config/rule coverage
+  integration-style config/rule coverage plus fd-budget and packaging scripts
 - `docs/reviews/`
-  dated review outputs
+  dated architecture, security, and performance reviews (style findings go in the commit message or change description)
 
 ## Working Rules
 
-- Follow `docs/rust-style-guide.md`; report style review findings with the change.
+- Follow `docs/rust-style-guide.md`; record style review findings in the commit message or change description (dated style review docs are not retained).
 - Prefer small, reviewable changes.
 - Do not add dependencies unless clearly justified.
 - Reuse existing crate boundaries and patterns before inventing new abstractions.
@@ -110,7 +126,7 @@ For code changes, run at least:
 ```bash
 cargo fmt --check
 cargo test
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Useful extra checks:
@@ -147,4 +163,3 @@ Typical review outputs should be written to:
 - Do not assume GUI, TUN, REST API, or fake-IP support exists.
 - Do not assume `dns.ipv6` issues AAAA queries — it currently behaves as `false`; see docs/dns-resolver-design.md for the resolver design.
 - Do not assume background daemon mode works.
-- Do not assume `sysproxy` follows the daemon’s configured port unless that behavior has been explicitly changed and verified.

@@ -20,11 +20,13 @@ listener. Freed capacity automatically admits new connections. This is not a
 guarantee that an exhausted system can serve control requests; it prevents
 normal admitted data traffic from consuming the control reserve.
 
-Admission always starts in the `general` class: at most 1536 connections
-younger than 30 seconds can be admitted at once. The remaining 512 global
-permits are reserved for the `streaming` class and only become reachable via
-promotion. `general_overload_count` is the signal for this pre-promotion
-ceiling; the overall `connection_limit` in `status.resources` remains 2048.
+Admission always starts in the `general` class: with the full budget, at most
+1536 connections younger than 30 seconds can be admitted at once, and the
+remaining 512 global permits are reachable only by promoting a connection to
+`streaming`. Both class caps are `min(1536, connection_limit)`, and the global
+limit itself is fd-derived (`min(2048, (soft_limit - 128) / 3)`), so a smaller
+fd budget shrinks the class caps and the reserved headroom with it.
+`general_overload_count` is the signal for this pre-promotion ceiling.
 
 Control clients have a ten-second idle read/write deadline; executing a
 command is not subject to that deadline.
@@ -32,28 +34,29 @@ command is not subject to that deadline.
 ## Connection classes and lifetime
 
 Every data connection starts in the `general` class. The two class pools
-(1536 permits each) sit under the 2048 global cap, so each class is always
-guaranteed at least 512 permits. A class cannot exceed 1536 even when the
-other is idle; the remaining headroom is the other class's guarantee. A
+(`min(1536, connection_limit)` permits each) sit under the fd-derived global
+cap (at most 2048), so at the full 2048 budget each class is guaranteed at
+least 512 permits. A class cannot exceed its cap even when the other is idle;
+at the full budget the remaining headroom is the other class's guarantee. A
 connection still open in both directions after 30 seconds is promoted to the
-`streaming` class: the class permit is swapped and the half-close inactivity
-timeout changes from 60 seconds to 10 minutes. A connection that has already
-half-closed is not promoted; it stays in the general class and is reclaimed
-by the 60-second general drain. Promotion is attempted once; if the streaming
-pool is full the connection keeps its general permit but still receives the
-streaming timeout, and `promotion_failure_count` records the sticky failure
-(it is not retried in this version). Promotion is based on observed
-lifetime, not on the destination host, so short and long requests to the same
-API domain land in different classes. If the streaming pool is full, the
-connection keeps its general permit but still receives the long timeout; the
-failed upgrade is counted in `status.resources`.
+`streaming` class: when a
+streaming permit is available the class permit is swapped, and every promotion
+attempt changes the half-close inactivity timeout from 60 seconds to 10
+minutes. A connection that has already half-closed is not promoted; it stays
+in the general class and is reclaimed by the 60-second general drain.
+Promotion is attempted once; if the streaming pool is full the connection
+keeps its general permit but still receives the streaming timeout, and
+`promotion_failure_count` records the sticky failure (it is not retried in
+this version). Promotion is based on observed lifetime, not on the destination
+host, so short and long requests to the same API domain land in different
+classes.
 
 Relay lifetime is activity-based, never a total-duration cap:
 
 - no bytes in either direction for 1 hour → close (idle);
 - after the first EOF, no bytes for 60s while general (including connections
-  that half-closed before promotion) or 10m after promotion → close
-  (half-closed);
+  that half-closed before promotion) or 10m once promotion has been attempted
+  (even if the permit swap failed) → close (half-closed);
 - an immediate RST is surfaced by the copy error and closes both sides;
   a FIN-only cancellation is reclaimed by the half-close timer.
 
@@ -99,7 +102,8 @@ not a live enumeration of all process descriptors.
 - Per-connection routing and relay-end lines are DEBUG and include peer,
   target, proxy, duration and bytes read.
 - Daemon runtime logs roll daily to
-  `~/Library/Logs/clashx-rs/clashx-rs.<date>.log`; the appender removes files
+  `~/Library/Logs/clashx-rs/clashx-rs.<date>.log` on macOS; other platforms
+  keep them under `~/.config/clashx-rs/logs/`. The appender removes files
   beyond 7 on each rotation. `stdout.log`/`stderr.log` only carry launchd
   startup/early output.
 
@@ -112,7 +116,7 @@ Validation:
 
 ```sh
 cargo test --workspace
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo build
 python3 -m unittest discover -s tests -p 'test_fd_budget.py'
 python3 -m unittest discover -s tests -p 'test_macos_package.py'
